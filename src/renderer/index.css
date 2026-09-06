@@ -1,0 +1,318 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 0 0% 100%;
+    --foreground: 220 20% 12%;
+    --card: 0 0% 100%;
+    --card-foreground: 220 20% 12%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 220 20% 12%;
+    --primary: 221 83% 45%;
+    --primary-foreground: 210 40% 98%;
+    --secondary: 220 14% 96%;
+    --secondary-foreground: 220 20% 20%;
+    --muted: 220 14% 96%;
+    --muted-foreground: 220 9% 46%;
+    --accent: 220 14% 95%;
+    --accent-foreground: 220 20% 20%;
+    --destructive: 0 72% 51%;
+    --destructive-foreground: 210 40% 98%;
+    --success: 152 60% 40%;
+    --warning: 38 92% 50%;
+    --border: 220 13% 90%;
+    --input: 220 13% 88%;
+    --ring: 221 83% 45%;
+    --radius: 0.5rem;
+    --sidebar-bg: 220 20% 98%;
+    --sidebar-fg: 220 9% 40%;
+    --sidebar-active: 221 83% 45%;
+    --sidebar-hover: 220 14% 94%;
+    --sidebar-border: 220 13% 90%;
+    --brand-gradient-from: 221 83% 45%;
+    --brand-gradient-to: 262 80% 50%;
+  }
+
+  .dark {
+    --background: 220 20% 8%;
+    --foreground: 220 14% 92%;
+    --card: 220 20% 10%;
+    --card-foreground: 220 14% 92%;
+    --popover: 220 20% 10%;
+    --popover-foreground: 220 14% 92%;
+    --primary: 217 91% 60%;
+    --primary-foreground: 220 20% 8%;
+    --secondary: 220 14% 15%;
+    --secondary-foreground: 220 14% 92%;
+    --muted: 220 14% 15%;
+    --muted-foreground: 220 10% 60%;
+    --accent: 220 14% 16%;
+    --accent-foreground: 220 14% 92%;
+    --destructive: 0 72% 55%;
+    --destructive-foreground: 220 20% 8%;
+    --success: 152 60% 50%;
+    --warning: 38 92% 55%;
+    --border: 220 14% 18%;
+    --input: 220 14% 20%;
+    --ring: 217 91% 60%;
+    --sidebar-bg: 220 20% 9%;
+    --sidebar-fg: 220 10% 62%;
+    --sidebar-active: 217 91% 60%;
+    --sidebar-hover: 220 14% 14%;
+    --sidebar-border: 220 14% 18%;
+    --brand-gradient-from: 217 91% 60%;
+    --brand-gradient-to: 271 76% 58%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground antialiased;
+    font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    font-size: 13px;
+  }
+}
+
+/* Scrollbar */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: hsl(var(--muted-foreground) / 0.25);
+  border-radius: 8px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: hsl(var(--muted-foreground) / 0.45);
+  background-clip: content-box;
+}
+
+/* Title bar drag region */
+.drag-region {
+  -webkit-app-region: drag;
+}
+.no-drag {
+  -webkit-app-region: no-drag;
+}
+
+/* Chat message markdown */
+.chat-message pre {
+  @apply bg-muted/60 rounded-lg p-3 overflow-x-auto text-sm my-2;
+  border: 1px solid hsl(var(--border));
+}
+.chat-message code {
+  @apply bg-muted/60 px-1.5 py-0.5 rounded text-[12px] font-mono;
+}
+.chat-message pre code {
+  @apply bg-transparent p-0 border-0;
+}
+.chat-message p {
+  @apply mb-2 last:mb-0;
+}
+.chat-message ul, .chat-message ol {
+  @apply pl-6 mb-2;
+}
+.chat-message ul {
+  @apply list-disc;
+}
+.chat-message ol {
+  @apply list-decimal;
+}
+.chat-message h1 {
+  @apply text-xl font-bold mb-2 mt-4;
+}
+.chat-message h2 {
+  @apply text-lg font-bold mb-2 mt-3;
+}
+.chat-message h3 {
+  @apply text-base font-semibold mb-1 mt-2;
+}
+.chat-message blockquote {
+  @apply border-l-4 border-primary/30 pl-4 italic text-muted-foreground my-2;
+}
+.chat-message table {
+  @apply w-full border-collapse my-2;
+}
+.chat-message th, .chat-message td {
+  @apply border border-border px-3 py-1.5 text-sm text-left;
+}
+.chat-message th {
+  @apply bg-muted/50 font-medium;
+}
+.chat-message a {
+  @apply text-primary hover:underline;
+}
+
+/* Smooth transitions */
+.sidebar-transition {
+  transition: width 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/* Gradient brand */
+.brand-gradient {
+  background: linear-gradient(135deg, hsl(var(--brand-gradient-from)), hsl(var(--brand-gradient-to)));
+}
+
+/* ─── Swarm mode: rotating light border ─────────────────────────── */
+@property --swarm-angle {
+  syntax: '<angle>';
+  inherits: false;
+  initial-value: 0deg;
+}
+
+@keyframes swarm-angle-spin {
+  to {
+    --swarm-angle: 360deg;
+  }
+}
+
+/* Amber glow sweeping around the input card border */
+.swarm-flow-border {
+  border: 1px solid transparent;
+  background:
+    linear-gradient(hsl(var(--card)), hsl(var(--card))) padding-box,
+    conic-gradient(
+      from var(--swarm-angle) at 50% 50%,
+      hsl(38 92% 55% / 0.2) 0deg,
+      hsl(38 92% 55% / 0.2) 240deg,
+      hsl(38 92% 58% / 0.95) 258deg,
+      hsl(28 96% 62% / 1) 270deg,
+      hsl(10 96% 66% / 1) 282deg,
+      hsl(330 94% 68% / 1) 294deg,
+      hsl(285 94% 74% / 1) 306deg,
+      hsl(45 100% 82% / 1) 318deg,
+      hsl(38 92% 70% / 1) 330deg,
+      hsl(38 92% 55% / 0.45) 345deg,
+      hsl(38 92% 55% / 0.2) 360deg
+    ) border-box;
+  animation:
+    swarm-angle-spin 2.4s linear infinite,
+    swarm-glow-pulse 1.2s ease-in-out infinite;
+}
+
+/* Speed up the sweep while the input is focused */
+.swarm-flow-border:focus-within {
+  animation-duration: 1.2s, 0.7s;
+}
+
+@keyframes swarm-glow-pulse {
+  0%,
+  100% {
+    box-shadow:
+      0 0 3px hsl(38 92% 60% / 0.35),
+      0 0 10px hsl(38 92% 55% / 0.2),
+      0 0 18px hsl(330 92% 60% / 0.12);
+  }
+  50% {
+    box-shadow:
+      0 0 5px hsl(45 100% 72% / 0.6),
+      0 0 16px hsl(28 96% 60% / 0.4),
+      0 0 30px hsl(300 92% 65% / 0.28);
+  }
+}
+
+/* Subtle glow effect for active items */
+.sidebar-active-glow {
+  box-shadow: 0 0 12px hsl(var(--sidebar-active) / 0.15);
+}
+
+/* Message appear animation */
+@keyframes message-appear {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+.message-appear {
+  animation: message-appear 0.25s ease-out;
+}
+
+/* Typing indicator animation */
+@keyframes typing-dot {
+  0%, 60%, 100% { opacity: 0.3; transform: translateY(0); }
+  30% { opacity: 1; transform: translateY(-4px); }
+}
+
+/* Pulse animation for status */
+@keyframes status-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+.status-pulse {
+  animation: status-pulse 2s ease-in-out infinite;
+}
+
+/* Professional utility classes */
+@layer components {
+  /* Module header - consistent across all modules */
+  .module-header {
+    @apply flex h-12 shrink-0 items-center justify-between px-5;
+    -webkit-app-region: drag;
+  }
+  .module-header button,
+  .module-header a,
+  .module-header input,
+  .module-header select,
+  .module-header textarea {
+    -webkit-app-region: no-drag;
+  }
+  .module-title {
+    @apply text-[13px] font-semibold tracking-tight;
+  }
+  .module-subtitle {
+    @apply text-[11px] text-muted-foreground mt-0.5;
+  }
+
+  /* Toolbar button */
+  .toolbar-btn {
+    @apply inline-flex h-7 items-center gap-1.5 rounded-md border border-border bg-background px-2.5 text-[11px] font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground;
+  }
+
+  /* Data card */
+  .data-card {
+    @apply rounded-lg border border-border bg-card;
+  }
+
+  /* Metric label */
+  .metric-label {
+    @apply text-[10px] font-medium uppercase tracking-wider text-muted-foreground;
+  }
+  .metric-value {
+    @apply text-lg font-semibold tabular-nums;
+  }
+
+  /* Status dot */
+  .status-dot {
+    @apply inline-block h-1.5 w-1.5 rounded-full;
+  }
+}
+
+/* ─── LaTeX 语法高亮（编辑器覆盖层用色）────────────────────────── */
+.tok-comment { color: hsl(130 55% 34%); }
+.tok-command { color: hsl(265 58% 44%); }
+.tok-env { color: hsl(195 85% 36%); font-weight: 600; }
+.tok-math { color: hsl(22 90% 42%); }
+.tok-brace,
+.tok-bracket { color: hsl(220 10% 48%); }
+.dark .tok-comment { color: hsl(130 42% 60%); }
+.dark .tok-command { color: hsl(265 60% 74%); }
+.dark .tok-env { color: hsl(195 85% 66%); }
+.dark .tok-math { color: hsl(24 95% 68%); }
+.dark .tok-brace,
+.dark .tok-bracket { color: hsl(220 12% 62%); }

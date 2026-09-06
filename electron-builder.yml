@@ -1,0 +1,51 @@
+appId: com.mimir.desktop
+productName: Mimir Desktop
+directories:
+  buildResources: build
+  output: dist
+
+files:
+  - '!**/.vscode/*'
+  - '!src/*'
+  - '!electron/*'
+  - '!electron.vite.config.*'
+  - '!{.eslintignore,.eslintrc.cjs,.prettierignore,.prettierrc.yaml}'
+  - '!dev-app-update.yml'
+  - '!{.gitignore,.git}'
+  - '!{tsconfig.json,tsconfig.node.json,tsconfig.web.json}'
+  - '!pnpm-lock.yaml'
+  - '!components.json'
+  - '!tailwind.config.js'
+  - '!postcss.config.js'
+
+publish:
+  provider: github
+  owner: hxhy
+  repo: Mimir-Desktop
+
+mac:
+  category: public.app-category.developer-tools
+  target:
+    - dmg
+    - zip
+
+win:
+  target:
+    - nsis
+    - portable
+
+asarUnpack:
+  - node_modules/node-pty/**
+  - node_modules/sherpa-onnx/**
+  - node_modules/ffmpeg-static/**
+
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  deleteAppDataOnUninstall: false
+
+linux:
+  category: Development
+  target:
+    - AppImage
+    - deb

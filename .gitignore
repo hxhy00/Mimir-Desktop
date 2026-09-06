@@ -1,0 +1,40 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Build
+dist/
+out/
+*.tsbuildinfo
+
+# Electron
+*.dmg
+*.app
+*.exe
+*.snap
+*.deb
+*.rpm
+*.msi
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# Local
+.userdata/
