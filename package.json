@@ -1,9 +1,12 @@
 {
   "name": "mimir-desktop",
-  "version": "0.1.0",
+  "version": "0.0.1",
   "description": "Mimir Desktop - 以 Agent 为核心的科研工作台",
   "main": "out/main/index.js",
-  "author": "Mimir",
+  "author": {
+    "name": "Mimir",
+    "email": "hxhy@users.noreply.github.com"
+  },
   "license": "MIT",
   "type": "module",
   "scripts": {
