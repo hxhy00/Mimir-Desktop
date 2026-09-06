@@ -32,6 +32,8 @@ protocol.registerSchemesAsPrivileged([
 ])
 
 let mainWindow: BrowserWindow | null = null
+/** 供 IPC 层读取当前窗口的可变引用：窗口重建/关闭后始终指向最新实例。 */
+const windowRef: { current: BrowserWindow | null } = { current: null }
 
 /** 从全局设置（~/.mimir/store.json 的 settings，见 library/store.ts）取出当前选中模型并初始化 Agent。 */
 async function initAgentFromSettings(): Promise<void> {
@@ -74,6 +76,13 @@ function createWindow(): void {
     }
   })
 
+  windowRef.current = mainWindow
+
+  mainWindow.on('closed', () => {
+    if (windowRef.current === mainWindow) windowRef.current = null
+    mainWindow = null
+  })
+
   mainWindow.on('ready-to-show', () => {
     mainWindow?.show()
   })
@@ -82,9 +91,6 @@ function createWindow(): void {
     shell.openExternal(details.url)
     return { action: 'deny' }
   })
-
-  // Setup IPC handlers
-  setupIpcHandlers(mainWindow)
 
   // Load the app
   if (is.dev && process.env['ELECTRON_RENDERER_URL']) {
@@ -166,9 +172,9 @@ app.whenReady().then(async () => {
   // Auto-initialize agent from saved settings
   await initAgentFromSettings()
 
-  createWindow()
+  // IPC handler 只在进程启动时注册一次；渲染层窗口重建（macOS dock 重新激活）
+  // 时通过 windowRef 指向最新窗口，避免 ipcMain.handle 重复注册崩溃。
+  setupIpcHandlers(windowRef)
 
-  app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow()
-  })
+  createWindow()
 })

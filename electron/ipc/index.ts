@@ -109,14 +109,20 @@ const ARXIV_PDF_DOWNLOAD_TIMEOUT_MS = 60_000
 /** 蜂群过程事件信封前缀（与渲染层 ChatView 保持一致），经文本 chunk 通道随流发送。 */
 const SWARM_EVENT_PREFIX = '\u0002MIMIR_SWARM_EVENT\u0002'
 
-export function setupIpcHandlers(mainWindow: BrowserWindow): void {
+export function setupIpcHandlers(winRef: { current: BrowserWindow | null }): void {
   loadStore()
+
+  /** 安全地把消息发给当前窗口（窗口可能已关闭/重建，做空值与销毁检查）。 */
+  const winSend = (channel: string, ...args: unknown[]): void => {
+    const win = winRef.current
+    if (win !== null && !win.isDestroyed()) {
+      win.webContents.send(channel, ...args)
+    }
+  }
 
   // ── Agent 副作用确认握手 ──────────────────────────────────────
   setApprovalSender((request) => {
-    if (!mainWindow.isDestroyed()) {
-      mainWindow.webContents.send('agent:approval-request', request)
-    }
+    winSend('agent:approval-request', request)
   })
   ipcMain.handle('agent:approval-respond', (_event, id: string, allow: boolean) => {
     settleApproval(id, allow === true)
@@ -204,11 +210,13 @@ export function setupIpcHandlers(mainWindow: BrowserWindow): void {
 
   // Dialog
   ipcMain.handle('dialog:open', async (_event, options) => {
-    return dialog.showOpenDialog(mainWindow, options)
+    const win = winRef.current
+    return win === null ? dialog.showOpenDialog(options) : dialog.showOpenDialog(win, options)
   })
 
   ipcMain.handle('dialog:save', async (_event, options) => {
-    return dialog.showSaveDialog(mainWindow, options)
+    const win = winRef.current
+    return win === null ? dialog.showSaveDialog(options) : dialog.showSaveDialog(win, options)
   })
 
   // Shell
@@ -407,7 +415,7 @@ export function setupIpcHandlers(mainWindow: BrowserWindow): void {
       status: string
       message?: string
     }): void => {
-      mainWindow.webContents.send('resources:progress', { resourceId, ...payload })
+      winSend('resources:progress', { resourceId, ...payload })
     }
     try {
       if (resourceId === TECTONIC_RESOURCE_ID) {
@@ -443,7 +451,7 @@ export function setupIpcHandlers(mainWindow: BrowserWindow): void {
       try {
         if (!agentService.isInitialized()) {
           const response = '请先在设置中配置 API Key 和模型，然后重新启动应用。'
-          mainWindow.webContents.send(chunkChannel, response)
+          winSend(chunkChannel, response)
           return response
         }
 
@@ -451,19 +459,19 @@ export function setupIpcHandlers(mainWindow: BrowserWindow): void {
           message,
           conversationId,
           (chunk) => {
-            mainWindow.webContents.send(chunkChannel, chunk)
+            winSend(chunkChannel, chunk)
           },
           mode,
           (event) => {
             // 过程事件与文本走同一条 chunk 通道：用前缀信封包裹，渲染层拆包后喂给
-            // 过程日志面板。不依赖额外 IPC 通道，避免 preload 版本不一致导致事件丢。
-            mainWindow.webContents.send(chunkChannel, `${SWARM_EVENT_PREFIX}${JSON.stringify(event)}`)
+            // 过程事件树。不依赖额外 IPC 通道，避免 preload 版本不一致导致事件丢。
+            winSend(chunkChannel, `${SWARM_EVENT_PREFIX}${JSON.stringify(event)}`)
           }
         )
         return response
       } catch (error) {
         const errorMessage = `Agent 错误: ${error instanceof Error ? error.message : '未知错误'}`
-        mainWindow.webContents.send(chunkChannel, errorMessage)
+        winSend(chunkChannel, errorMessage)
         return errorMessage
       }
     }
@@ -518,11 +526,11 @@ export function setupIpcHandlers(mainWindow: BrowserWindow): void {
       ptyInstances.set(id, term)
 
       term.onData((data: string) => {
-        mainWindow.webContents.send(`terminal:data:${id}`, data)
+        winSend(`terminal:data:${id}`, data)
       })
 
       term.onExit(({ exitCode }: { exitCode: number }) => {
-        mainWindow.webContents.send(`terminal:exit:${id}`, exitCode)
+        winSend(`terminal:exit:${id}`, exitCode)
         ptyInstances.delete(id)
       })
 
