@@ -24,38 +24,12 @@ import {
  * - 思考与工具返回等叶子文本可点击标题展开/收起全文。
  */
 
-const ROLE_LABEL: Record<string, string> = {
-  researcher: '搜索 Agent',
-  analyst: '分析 Agent',
-  writer: '写作 Agent'
-}
-
-const ROLE_COLOR: Record<string, string> = {
-  researcher: 'bg-sky-500/10 text-sky-600 dark:text-sky-400',
-  analyst: 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400',
-  writer: 'bg-violet-500/10 text-violet-600 dark:text-violet-400'
-}
-
 /** 毫秒 → 人读耗时（<1s 显示毫秒，否则秒/分钟）。 */
 function formatDur(ms?: number): string {
   if (ms === undefined || !Number.isFinite(ms)) return ''
   if (ms < 1000) return `${ms}ms`
   if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`
   return `${Math.floor(ms / 60_000)}m ${Math.round((ms % 60_000) / 1000)}s`
-}
-
-function RoleBadge({ role }: { role?: string }) {
-  if (role === undefined || ROLE_LABEL[role] === undefined) return null
-  return (
-    <span
-      className={cn(
-        'shrink-0 rounded px-1 py-px text-[9px] font-medium',
-        ROLE_COLOR[role] ?? 'bg-muted text-muted-foreground'
-      )}
-    >
-      {ROLE_LABEL[role]}
-    </span>
-  )
 }
 
 type NodeStatus = 'running' | 'done' | 'error' | 'canceled'
@@ -127,7 +101,6 @@ function NodeRow({ item, depth, collapsedKeys, onToggle }: NodeRowProps) {
             {duration}
           </span>
         )}
-        <RoleBadge role={node.role} />
       </button>
 
       {!collapsed && (

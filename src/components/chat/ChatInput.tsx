@@ -1,11 +1,83 @@
-import { useState, useRef, useCallback, useEffect } from 'react'
+import { useState, useRef, useCallback, useEffect, useMemo } from 'react'
 import { Button } from '@/components/ui/button'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Square, Plus, Mic, MicOff, Bot, ArrowUp, X, Paperclip, Loader2, Command } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { filterSlashEntries, SLASH_ENTRIES } from '@/lib/slash'
 import type { SlashEntry } from '@/lib/slash/types'
-import type { AgentMode } from './ChatView'
+
+// ─── Ultra 星屑粒子（方案 C）：开启时输入卡四周散布微光粒子，发送瞬间爆发 ──
+interface UltraStar {
+  key: string
+  x: number
+  y: number
+  size: number
+  color: string
+  kind: 'tw' | 'fl' | 'burst'
+  dur: number
+  delay: number
+  dx: number
+  dy: number
+}
+
+/** 深色主题粒子色：亮紫/白，发光感强。 */
+const ULTRA_COLORS_DARK = ['#c4b5fd', '#e9d5ff', '#f0abfc', '#ffffff']
+/** 浅色主题粒子色：深紫罗兰系，保证在浅色 card 上的对比度。 */
+const ULTRA_COLORS_LIGHT = ['#7c3aed', '#6d28d9', '#9333ea', '#a21caf']
+
+function makeUltraStar(index: number, burst: boolean, colors: string[]): UltraStar {
+  const r = Math.random()
+  const kind: UltraStar['kind'] = burst ? 'burst' : r < 0.7 ? 'tw' : 'fl'
+  const x = burst
+    ? 42 + Math.random() * 54
+    : r < 0.5
+      ? 2 + Math.random() * 96 // 上沿带
+      : r < 0.85
+        ? 58 + Math.random() * 40 // 右侧带
+        : 2 + Math.random() * 94 // 底部带
+  const y = burst
+    ? 28 + Math.random() * 55
+    : r < 0.5
+      ? 0.5 + Math.random() * 17
+      : r < 0.85
+        ? 6 + Math.random() * 78
+        : 72 + Math.random() * 24
+  const dur = burst ? 0.55 + Math.random() * 0.25 : kind === 'tw' ? 1.6 + Math.random() * 1.6 : 3 + Math.random() * 2
+  const delay = burst ? Math.random() * 0.08 : -(Math.random() * dur)
+  return {
+    key: `${burst ? 'b' : 'a'}-${index}-${Math.random().toString(36).slice(2, 6)}`,
+    x,
+    y,
+    size: burst ? 3.5 + Math.random() * 2.5 : 2 + Math.random() * 2.2,
+    color: colors[Math.floor(Math.random() * colors.length)],
+    kind,
+    dur,
+    delay,
+    dx: (Math.random() - 0.5) * 46,
+    dy: burst ? -(16 + Math.random() * 34) : (Math.random() - 0.5) * 10
+  }
+}
+
+function ultraStarStyle(s: UltraStar): React.CSSProperties {
+  const anim =
+    s.kind === 'burst'
+      ? `ultra-burst ${s.dur}s cubic-bezier(0.2,0.7,0.3,1) ${s.delay}s forwards`
+      : s.kind === 'tw'
+        ? `ultra-twinkle ${s.dur}s ease-in-out ${s.delay}s infinite`
+        : `ultra-float ${s.dur}s ease-in-out ${s.delay}s infinite`
+  return {
+    left: `${s.x}%`,
+    top: `${s.y}%`,
+    width: `${s.size}px`,
+    height: `${s.size}px`,
+    backgroundColor: s.color,
+    // 彩色辉光 + 白色内芯：浅色主题下“深色点+亮点核”对比清晰，深色下保持发光感
+    boxShadow: `0 0 ${Math.round(s.size * 2.5)}px ${s.color}59, inset 0 0 1.5px rgba(255, 255, 255, 0.95)`,
+    animation: anim,
+    ['--bx' as string]: `${s.dx}px`,
+    ['--by' as string]: `${s.dy}px`
+  } as React.CSSProperties
+}
 
 export interface Attachment {
   id: string
@@ -23,7 +95,10 @@ interface ChatInputProps {
   entries?: readonly SlashEntry[]
   disabled?: boolean
   isStreaming?: boolean
-  agentMode?: AgentMode
+  /** Ultra 增强开启：输入框显示星屑粒子特效，发送时轻微爆发。 */
+  ultraEnabled?: boolean
+  /** Ultra 当前选中的增强策略（开启时展示在底部提示语中）。 */
+  ultraStrategyLabel?: string
 }
 
 interface ModelConfig {
@@ -33,6 +108,12 @@ interface ModelConfig {
   apiKey: string
   supportsImages: boolean
 }
+
+// ─── Attachments ────────────────────────────────────────────────────────
+// TODO: 图片附件（非文本文件）的 size 为 -1（未知），因为当前无 fs:stat IPC。
+// 后续需在 preload / ipc 中新增 fs:getFileSize 桥接，或在导入时读取文件头获取大小。
+// 图片附件的 base64 内容通道也尚未接入：非文本文件只存储 path，不读取内容——
+// 消息发送时需通过 mimir-img:// 协议或 readImageDataUrl 将图片内联进消息。
 
 // Text-like file extensions we can read
 const TEXT_EXTENSIONS = new Set([
@@ -53,12 +134,36 @@ function formatFileSize(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
 }
 
-export function ChatInput({ onSend, onModelChange, onStop, entries, disabled, isStreaming, agentMode = 'normal' }: ChatInputProps) {
+export function ChatInput({ onSend, onModelChange, onStop, entries, disabled, isStreaming, ultraEnabled = false, ultraStrategyLabel }: ChatInputProps) {
   const [value, setValue] = useState('')
   const [models, setModels] = useState<ModelConfig[]>([])
   const [selectedModelId, setSelectedModelId] = useState<string>('')
   const [attachments, setAttachments] = useState<Attachment[]>([])
   const [listening, setListening] = useState(false)
+  /** Ultra 星屑：常驻微光粒子（开启时渲染）+ 发送瞬间的爆发粒子。 */
+  // 跟随 <html class="dark"> 主题切换，浅色用深紫粒子、深色用亮紫/白
+  const [isDark, setIsDark] = useState(() =>
+    typeof document === 'undefined' ? true : document.documentElement.classList.contains('dark')
+  )
+  useEffect(() => {
+    const root = document.documentElement
+    const update = () => setIsDark(root.classList.contains('dark'))
+    update()
+    const observer = new MutationObserver(update)
+    observer.observe(root, { attributes: true, attributeFilter: ['class'] })
+    return () => observer.disconnect()
+  }, [])
+  const starColors = isDark ? ULTRA_COLORS_DARK : ULTRA_COLORS_LIGHT
+  const ambientStars = useMemo(
+    () => Array.from({ length: 18 }, (_, i) => makeUltraStar(i, false, starColors)),
+    [starColors]
+  )
+  const [burstStars, setBurstStars] = useState<UltraStar[]>([])
+  const fireBurst = useCallback(() => {
+    if (!ultraEnabled) return
+    setBurstStars(Array.from({ length: 10 }, (_, i) => makeUltraStar(i, true, starColors)))
+    window.setTimeout(() => setBurstStars([]), 800)
+  }, [ultraEnabled, starColors])
   const [transcribing, setTranscribing] = useState(false)
   const [speechEngine, setSpeechEngine] = useState<'local' | 'web'>('web')
   const textareaRef = useRef<HTMLTextAreaElement>(null)
@@ -147,27 +252,35 @@ export function ChatInput({ onSend, onModelChange, onStop, entries, disabled, is
     [value],
   )
 
-  // Load models & research space path from settings
-  useEffect(() => {
-    const load = async () => {
-      let settings: Record<string, unknown> = {}
-      if (window.electronAPI) {
-        settings = (await window.electronAPI.getSettings()) as Record<string, unknown>
-      } else {
-        try {
-          const cached = localStorage.getItem('mimir-settings')
-          if (cached) settings = JSON.parse(cached)
-        } catch {
-          // ignore
-        }
+  // 加载/同步「模型列表 + 当前选中」：与设置页「模型管理」共用 settings.selectedModelId，
+  // 通过跨模块事件保持一致——任一端变更后都会广播，本端监听后重新读取最新配置。
+  const reloadModels = useCallback(async () => {
+    let settings: Record<string, unknown> = {}
+    if (window.electronAPI) {
+      settings = (await window.electronAPI.getSettings()) as Record<string, unknown>
+    } else {
+      try {
+        const cached = localStorage.getItem('mimir-settings')
+        if (cached) settings = JSON.parse(cached)
+      } catch {
+        // ignore
       }
-      const modelList = (settings.models as ModelConfig[] | undefined) || []
-      setModels(modelList)
-      setSelectedModelId((settings.selectedModelId as string) || modelList[0]?.id || '')
-      setSpeechEngine((settings.speechEngine as 'local' | 'web') || 'web')
     }
-    load()
+    const modelList = (settings.models as ModelConfig[] | undefined) || []
+    setModels(modelList)
+    setSelectedModelId((settings.selectedModelId as string) || modelList[0]?.id || '')
+    setSpeechEngine((settings.speechEngine as 'local' | 'web') || 'web')
   }, [])
+
+  useEffect(() => {
+    void reloadModels()
+    // 设置页模型管理增删改/切换后，即时同步本下拉的列表与选中项
+    const onModelsChanged = (): void => {
+      void reloadModels()
+    }
+    window.addEventListener('mimir:models-config-changed', onModelsChanged)
+    return () => window.removeEventListener('mimir:models-config-changed', onModelsChanged)
+  }, [reloadModels])
 
   // Save model selection to settings
   const handleModelChange = useCallback(
@@ -191,6 +304,8 @@ export function ChatInput({ onSend, onModelChange, onStop, entries, disabled, is
         localStorage.setItem('mimir-settings', JSON.stringify(settings))
       }
       onModelChange?.(modelId)
+      // 通知其它模型选择入口（设置 → 模型管理）即时同步当前模型
+      window.dispatchEvent(new Event('mimir:models-config-changed'))
     },
     [onModelChange]
   )
@@ -217,14 +332,15 @@ export function ChatInput({ onSend, onModelChange, onStop, entries, disabled, is
         id: `att-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
         name,
         path: filePath,
-        size: 0
+        size: -1 // unknown until populated below
       }
 
-      // Read text content for text-like files
+      // Read text content for text-like files; use content length as approximate size
       if (isTextFile(name)) {
         try {
           const content = await window.electronAPI.readFile(filePath)
           attachment.content = content.slice(0, 30000) // cap at 30k chars
+          attachment.size = content.length
         } catch {
           // file read failed, attach without content
         }
@@ -356,6 +472,7 @@ export function ChatInput({ onSend, onModelChange, onStop, entries, disabled, is
     (e?: React.FormEvent) => {
       e?.preventDefault()
       if (!value.trim() || disabled) return
+      fireBurst()
       onSend(value, attachments.length > 0 ? attachments : undefined)
       setValue('')
       setAttachments([])
@@ -365,7 +482,7 @@ export function ChatInput({ onSend, onModelChange, onStop, entries, disabled, is
         textareaRef.current.style.height = 'auto'
       }
     },
-    [value, disabled, onSend, attachments]
+    [value, disabled, onSend, attachments, fireBurst]
   )
 
   const handleKeyDown = useCallback(
@@ -425,20 +542,10 @@ export function ChatInput({ onSend, onModelChange, onStop, entries, disabled, is
   )
 
   return (
-    <div className={cn(
-      'bg-background px-4 py-3',
-      agentMode === 'swarm' && 'border-t-amber-500/30'
-    )}>
+    <div className="relative bg-background px-4 py-3">
       <form onSubmit={handleSubmit} className="mx-auto max-w-3xl">
         {/* Large rounded input card */}
-        <div
-          className={cn(
-            'rounded-2xl border bg-card shadow-sm transition-all',
-            agentMode === 'swarm'
-              ? 'swarm-flow-border'
-              : 'border-border focus-within:border-primary/40 focus-within:ring-2 focus-within:ring-primary/10'
-          )}
-        >
+        <div className="relative rounded-2xl border border-border bg-card shadow-sm transition-all focus-within:border-primary/40 focus-within:ring-2 focus-within:ring-primary/10">
           {/* Textarea area */}
           <div className="px-4 pt-3.5">
             <div className="relative" ref={slashWrapRef}>
@@ -601,12 +708,7 @@ export function ChatInput({ onSend, onModelChange, onStop, entries, disabled, is
                   type="submit"
                   size="icon"
                   disabled={disabled || !value.trim()}
-                  className={cn(
-                    'h-7 w-7 shrink-0 rounded-full hover:opacity-90',
-                    agentMode === 'swarm'
-                      ? 'bg-amber-500 hover:bg-amber-600 text-white'
-                      : 'brand-gradient'
-                  )}
+                  className="h-7 w-7 shrink-0 rounded-full brand-gradient hover:opacity-90"
                   title="发送"
                 >
                   <ArrowUp className="h-4 w-4" />
@@ -615,14 +717,50 @@ export function ChatInput({ onSend, onModelChange, onStop, entries, disabled, is
             </div>
           </div>
 
+          {/* Ultra 特效层（开启时）：绕圈灯带 + 外围光晕 + 星屑粒子 + 发送瞬间爆发 */}
+          {ultraEnabled && (
+            <>
+              <div
+                className="pointer-events-none absolute inset-0 z-10 overflow-hidden rounded-2xl"
+                aria-hidden="true"
+              >
+                {/* 开启瞬间“点亮”过渡（挂载时播放一次） */}
+                <span className="ultra-power-on" />
+                {/* 常驻星屑粒子 */}
+                {ambientStars.map((s) => (
+                  <span key={s.key} className="ultra-particle" style={ultraStarStyle(s)} />
+                ))}
+                {/* 发送瞬间爆发粒子 */}
+                {burstStars.map((s) => (
+                  <span key={s.key} className="ultra-particle" style={ultraStarStyle(s)} />
+                ))}
+              </div>
+              {/* 输入框外围金色光晕（不被圆角裁切） */}
+              <span className="ultra-halo" aria-hidden="true" />
+            </>
+          )}
+
         </div>
 
         <p className="mt-1.5 text-center text-[10px] text-muted-foreground/60">
-          {agentMode === 'swarm'
-            ? '蜂群模式：多个 Agent 并行协作 · Mimir 可能出错，请核查重要信息'
-            : 'Mimir 可能出错，请核查重要信息'}
+          {ultraEnabled
+            ? `Ultra 增强已开启 · 策略：${ultraStrategyLabel ?? '自动选择'} · Mimir 可能出错，请核查重要信息`
+            : 'Supervisor 编排 · Mimir 可能出错，请核查重要信息'}
         </p>
       </form>
+
+      {/* 任务执行中：输入区薄幕锁定（视觉提示；文本区已 disabled，停止按钮仍可点） */}
+      {isStreaming && (
+        <div
+          className="chat-input-busy pointer-events-none absolute inset-0 z-20 flex items-center justify-center rounded-2xl"
+          aria-hidden="true"
+        >
+          <span className="busy-chip">
+            <span className="busy-dot" />
+            任务执行中… 输入已锁定
+          </span>
+        </div>
+      )}
     </div>
   )
 }

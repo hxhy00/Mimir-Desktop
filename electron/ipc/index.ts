@@ -106,8 +106,8 @@ function parseArxivXml(xml: string): ArxivPaper[] {
 const ARXIV_PDF_MAX_BYTES = 64 * 1024 * 1024
 const ARXIV_PDF_DOWNLOAD_TIMEOUT_MS = 60_000
 
-/** 蜂群过程事件信封前缀（与渲染层 ChatView 保持一致），经文本 chunk 通道随流发送。 */
-const SWARM_EVENT_PREFIX = '\u0002MIMIR_SWARM_EVENT\u0002'
+/** Agent 过程事件信封前缀（与渲染层 ChatView 保持一致），经文本 chunk 通道随流发送。 */
+const AGENT_EVENT_PREFIX = '\u0002MIMIR_AGENT_EVENT\u0002'
 
 export function setupIpcHandlers(winRef: { current: BrowserWindow | null }): void {
   loadStore()
@@ -443,9 +443,37 @@ export function setupIpcHandlers(winRef: { current: BrowserWindow | null }): voi
     return true
   })
 
+  // 会话历史摘要压缩（治理 Phase 1：渲染层发送前对超出滑动窗口的旧轮做结构化摘要）
+  ipcMain.handle(
+    'agent:compress',
+    async (_event, history: { role: 'user' | 'assistant'; content: string }[]) => {
+      try {
+        if (!agentService.isInitialized()) {
+          return { ok: false, message: 'Agent 未初始化，请先在设置中配置 API Key 和模型。' }
+        }
+        const summary = await agentService.compressHistory(history)
+        return { ok: true, summary }
+      } catch (error) {
+        return {
+          ok: false,
+          message: error instanceof Error ? error.message : '摘要压缩失败'
+        }
+      }
+    }
+  )
+
   ipcMain.handle(
     'agent:sendMessage',
-    async (_event, message: string, conversationId: string, mode: 'normal' | 'swarm' = 'normal') => {
+    async (
+      _event,
+      message: string,
+      conversationId: string,
+      options?: {
+        ultra?: { enabled: boolean; strategy?: 'auto' | 'plain' | 'multi_expert' | 'critique_reflect' | 'hybrid_mix' | 'self_consistency_vote' }
+        history?: { role: 'user' | 'assistant'; content: string }[]
+        manual?: boolean
+      }
+    ) => {
       const chunkChannel = `agent:chunk:${conversationId}`
 
       try {
@@ -461,12 +489,12 @@ export function setupIpcHandlers(winRef: { current: BrowserWindow | null }): voi
           (chunk) => {
             winSend(chunkChannel, chunk)
           },
-          mode,
           (event) => {
             // 过程事件与文本走同一条 chunk 通道：用前缀信封包裹，渲染层拆包后喂给
             // 过程事件树。不依赖额外 IPC 通道，避免 preload 版本不一致导致事件丢。
-            winSend(chunkChannel, `${SWARM_EVENT_PREFIX}${JSON.stringify(event)}`)
-          }
+            winSend(chunkChannel, `${AGENT_EVENT_PREFIX}${JSON.stringify(event)}`)
+          },
+          options
         )
         return response
       } catch (error) {
@@ -476,6 +504,22 @@ export function setupIpcHandlers(winRef: { current: BrowserWindow | null }): voi
       }
     }
   )
+
+  ipcMain.handle('agent:subagentCatalog', () => agentService.getSubagentCatalog())
+
+  ipcMain.handle('agent:subagentGenerate', async (_event, prompt: string, takenNames: string[]) => {
+    if (!agentService.isInitialized()) {
+      return { ok: false, message: 'Agent 尚未初始化，请先在设置中配置 API Key。' }
+    }
+    return agentService.generateSubagentFromPrompt(prompt, takenNames)
+  })
+
+  ipcMain.handle('agent:reload', async () => {
+    if (!agentService.isInitialized()) {
+      return { ok: false, message: 'Agent 尚未初始化，请先在设置中配置 API Key。' }
+    }
+    return agentService.reload()
+  })
 
   // ─── GPU Server Management ────────────────────────────────────────
   // 探测实现见 electron/servers/probe.ts（IPC 与 Agent 工具共用同一实现）。
@@ -925,7 +969,14 @@ Write your abstract here.
 - relevanceScore: 0-10 的整数
 - relevanceReason: 一句话简要理由`
         const response = await agentService.sendMessage(prompt, `score-${p.arxivId}-${projectId}`)
-        return { ok: true, message: response }
+        // 启发式校验：Agent 响应过短（<10 字）或不包含评分关键词时，标记为可能未实际写入
+        const isSuspicious = response.length < 10 || !/\d/.test(response)
+        return {
+          ok: true,
+          message: isSuspicious
+            ? `[警告] Agent 响应可能未包含评分，请手动检查项目「${projectTitle}」中 arxiv:${p.arxivId} 的评分。\n${response}`
+            : response,
+        }
       } catch (error) {
         return { ok: false, message: error instanceof Error ? error.message : 'AI 评分失败' }
       }

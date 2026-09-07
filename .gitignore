@@ -38,3 +38,6 @@ pnpm-debug.log*
 
 # Local
 .userdata/
+
+# Local plans / docs (not tracked)
+docs/

@@ -25,6 +25,7 @@ import { Venues } from '@/components/modules/Venues'
 import { Servers } from '@/components/modules/Servers'
 import { Ledger } from '@/components/modules/Ledger'
 import { Settings } from '@/components/modules/Settings'
+import { Plugins } from '@/components/modules/Plugins'
 
 interface SpaceView {
   id: string
@@ -355,6 +356,8 @@ export default function App() {
         return <Servers />
       case 'ledger':
         return <Ledger />
+      case 'plugins':
+        return <Plugins />
       case 'settings':
         return (
           <Settings

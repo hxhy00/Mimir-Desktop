@@ -92,22 +92,50 @@ export interface ElectronAPI {
   getPlatform: () => string
 
   // Agent
-  sendMessage: (message: string, conversationId: string, mode?: 'normal' | 'swarm') => Promise<string>
+  sendMessage: (message: string, conversationId: string) => Promise<string>
   streamMessage: (
     message: string,
     conversationId: string,
     onChunk: (chunk: string) => void,
-    mode?: 'normal' | 'swarm',
-    onSwarmStatus?: (event: {
+    onWorkerEvent?: (event: {
       taskId: string
       title: string
       status: 'running' | 'done' | 'error'
       text?: string
-      kind?: 'phase' | 'task' | 'tool' | 'think'
-      detail?: { id: string; title: string; role: 'researcher' | 'analyst' | 'writer'; dependsOn: string[] }[]
-    }) => void
+      kind?: 'phase' | 'task' | 'tool' | 'think' | 'think-token'
+    }) => void,
+    options?: {
+      ultra?: {
+        enabled: boolean
+        strategy?: 'auto' | 'plain' | 'multi_expert' | 'critique_reflect' | 'hybrid_mix' | 'self_consistency_vote'
+      }
+      history?: { role: 'user' | 'assistant'; content: string }[]
+      manual?: boolean
+    }
   ) => Promise<string>
+  /** 对较早对话历史做结构化摘要压缩（治理 Phase 1）。 */
+  compressConversation: (history: { role: 'user' | 'assistant'; content: string }[]) => Promise<{
+    ok: boolean
+    summary?: string
+    message?: string
+  }>
   stopMessage: () => Promise<boolean>
+  /** 「插件 → 子代理」只读目录：工具白名单 + 内置子代理元数据（展示 / 克隆用）。 */
+  getSubagentCatalog: () => Promise<{
+    tools: { id: string; label: string; description: string }[]
+    builtin: { id: string; label: string; description: string; systemPrompt: string; toolIds: string[] }[]
+  }>
+  /** 按最新子代理注册重新初始化 Agent（增删改查后免重启生效）。 */
+  reloadAgent: () => Promise<{ ok: boolean; message: string }>
+  /** 一句话职责描述 → AI 生成自定义子代理草稿（name/说明/提示词/工具白名单）。 */
+  generateSubagent: (
+    prompt: string,
+    takenNames: string[]
+  ) => Promise<{
+    ok: boolean
+    draft?: { name: string; label: string; description: string; systemPrompt: string; toolIds: string[] }
+    message?: string
+  }>
 
   // Speech-to-text
   transcribeAudio: (options: {
@@ -325,49 +353,26 @@ const electronAPI: ElectronAPI = {
   getAppVersion: () => ipcRenderer.invoke('app:getVersion'),
   getPlatform: () => process.platform,
 
-  sendMessage: (message, conversationId, mode = 'normal') =>
-    ipcRenderer.invoke('agent:sendMessage', message, conversationId, mode),
+  sendMessage: (message, conversationId) =>
+    ipcRenderer.invoke('agent:sendMessage', message, conversationId),
 
-  streamMessage: (message, conversationId, onChunk, mode = 'normal', onSwarmStatus) => {
+  streamMessage: (message, conversationId, onChunk, onWorkerEvent, options) => {
     const channel = `agent:chunk:${conversationId}`
-    const statusChannel = 'agent:swarm-status'
     // 先移除同会话旧监听，避免每次发送叠加监听导致后续同会话重复回调
     ipcRenderer.removeAllListeners(channel)
     const chunkListener = (_event: unknown, chunk: string): void => {
       onChunk(chunk)
     }
     ipcRenderer.on(channel, chunkListener)
-    const statusListener = (
-      _event: unknown,
-      payload: {
-        conversationId: string
-        taskId: string
-        title: string
-        status: string
-        text?: string
-        kind?: string
-        detail?: { id: string; title: string; role: string; dependsOn: string[] }[]
-      }
-    ): void => {
-      if (payload.conversationId !== conversationId) return
-      onSwarmStatus?.({
-        taskId: payload.taskId,
-        title: payload.title,
-        status: payload.status as 'running' | 'done' | 'error',
-        text: payload.text,
-        kind: payload.kind as 'phase' | 'task' | 'tool' | 'think' | undefined,
-        detail: payload.detail as
-          | { id: string; title: string; role: 'researcher' | 'analyst' | 'writer'; dependsOn: string[] }[]
-          | undefined
-      })
-    }
-    ipcRenderer.on(statusChannel, statusListener)
-    return ipcRenderer.invoke('agent:sendMessage', message, conversationId, mode).finally(() => {
+    return ipcRenderer.invoke('agent:sendMessage', message, conversationId, options).finally(() => {
       ipcRenderer.removeListener(channel, chunkListener)
-      ipcRenderer.removeListener(statusChannel, statusListener)
     })
   },
+  compressConversation: (history) => ipcRenderer.invoke('agent:compress', history),
   stopMessage: () => ipcRenderer.invoke('agent:stop'),
+  getSubagentCatalog: () => ipcRenderer.invoke('agent:subagentCatalog'),
+  reloadAgent: () => ipcRenderer.invoke('agent:reload'),
+  generateSubagent: (prompt, takenNames) => ipcRenderer.invoke('agent:subagentGenerate', prompt, takenNames),
 
   transcribeAudio: (options) => ipcRenderer.invoke('speech:transcribe', options),
 

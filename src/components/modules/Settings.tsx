@@ -32,11 +32,17 @@ import {
   RotateCw,
   FolderKanban,
   FolderOpen,
-  Command,
-  Code2
+  Code2,
+  Palette,
+  Pencil,
+  Sparkles,
+  Settings2
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { Textarea } from '@/components/ui/textarea'
+import { SettingsMemoryCard } from './SettingsMemory'
+import { SettingsIdentityCard } from './SettingsIdentity'
+import { SettingsSkillRoutingCard } from './SettingsSkillRouting'
 import {
   COMMAND_ENTRIES,
   SKILL_ENTRIES,
@@ -204,7 +210,20 @@ interface SettingsProps {
   onThemeSaved?: ((theme: string) => void) | undefined
 }
 
+// ─── 设置分页 ────────────────────────────────────────────────────────────────
+type SettingsTab = 'models' | 'appearance' | 'agent' | 'image' | 'spaces' | 'resources' | 'about'
+const SETTINGS_TABS: { id: SettingsTab; label: string; icon: React.ElementType; desc: string }[] = [
+  { id: 'models', label: '模型', icon: Bot, desc: '管理可用的 LLM 模型配置，点击选择当前使用的模型。' },
+  { id: 'appearance', label: '外观', icon: Palette, desc: '选择应用主题与工作台背景。' },
+  { id: 'agent', label: 'Agent', icon: Sparkles, desc: '技能路由、身份与默认值、长期记忆等 Agent 行为设置。' },
+  { id: 'image', label: '图像生成', icon: Image, desc: '配置 OpenAI 兼容的图片生成端点，组会生成可开启「AI 配图」。' },
+  { id: 'spaces', label: '科研空间', icon: FolderKanban, desc: '每个科研空间是一个独立目录，承载论文、实验、图表、组会与对话等数据。' },
+  { id: 'resources', label: '语音与资源', icon: Mic, desc: '语音识别引擎与本地组件资源下载。' },
+  { id: 'about', label: '关于', icon: Info, desc: '应用信息。' }
+]
+
 export function Settings({ autoOpenModelDialog = 0, guided = false, onModelStepDone, onThemeSaved }: SettingsProps) {
+  const [tab, setTab] = useState<SettingsTab>('models')
   const [models, setModels] = useState<ModelConfig[]>([])
   const [selectedModelId, setSelectedModelId] = useState<string>('')
   const [theme, setTheme] = useState('system')
@@ -213,6 +232,8 @@ export function Settings({ autoOpenModelDialog = 0, guided = false, onModelStepD
   /** 已保存设置的快照（加载完成后写入）；null 表示尚未完成加载。 */
   const [baselineKey, setBaselineKey] = useState<string | null>(null)
   const [dialogOpen, setDialogOpen] = useState(false)
+  /** 正在编辑的模型 id；null 表示「添加模型」（弹窗共用）。 */
+  const [editingModelId, setEditingModelId] = useState<string | null>(null)
   const [form, setForm] = useState(EMPTY_MODEL_FORM)
   const [showApiKeyInList, setShowApiKeyInList] = useState<Record<string, boolean>>({})
   const [showApiKeyInForm, setShowApiKeyInForm] = useState(false)
@@ -267,11 +288,6 @@ export function Settings({ autoOpenModelDialog = 0, guided = false, onModelStepD
       setUserSkills([])
     }
   }, [])
-
-  const openSkillManager = useCallback(() => {
-    setSkillsOpen(true)
-    void refreshUserSkills()
-  }, [refreshUserSkills])
 
   const openSkillImport = useCallback(() => {
     setImportForm(EMPTY_SKILL_DRAFT)
@@ -545,36 +561,43 @@ export function Settings({ autoOpenModelDialog = 0, guided = false, onModelStepD
 
   const handleSave = useCallback(async () => {
     setSaving(true)
-    const imageGen = { baseUrl: imgGenBaseUrl.trim(), modelId: imgGenModelId.trim(), apiKey: imgGenApiKey.trim() }
-    // 合并写回：仅覆盖本页管理的字段，保留 zotero 等其它模块写入 settings 的配置，
-    // 避免「保存设置」把 Zotero 等配置悄悄抹掉。
-    let stored: Record<string, unknown> = {}
-    if (window.electronAPI) {
-      stored = ((await window.electronAPI.getSettings()) ?? {}) as Record<string, unknown>
-    } else {
-      try {
-        const cached = localStorage.getItem('mimir-settings')
-        if (cached) stored = JSON.parse(cached) as Record<string, unknown>
-      } catch {
-        // ignore
+    try {
+      const imageGen = { baseUrl: imgGenBaseUrl.trim(), modelId: imgGenModelId.trim(), apiKey: imgGenApiKey.trim() }
+      // 合并写回：仅覆盖本页管理的字段，保留 zotero 等其它模块写入 settings 的配置，
+      // 避免「保存设置」把 Zotero 等配置悄悄抹掉。
+      let stored: Record<string, unknown> = {}
+      if (window.electronAPI) {
+        stored = ((await window.electronAPI.getSettings()) ?? {}) as Record<string, unknown>
+      } else {
+        try {
+          const cached = localStorage.getItem('mimir-settings')
+          if (cached) stored = JSON.parse(cached) as Record<string, unknown>
+        } catch {
+          // ignore
+        }
       }
+      const wallpaper = { path: wallpaperPath, dim: wallpaperDim }
+      const settings = { ...stored, models, selectedModelId, theme, speechEngine, imageGen, wallpaper }
+      if (window.electronAPI) {
+        await window.electronAPI.setSettings(settings)
+      } else {
+        // 浏览器降级：写入 localStorage
+        localStorage.setItem('mimir-settings', JSON.stringify(settings))
+      }
+      setSaved(true)
+      // 落盘成功后同步基线，避免保存完仍被判定为未保存
+      setBaselineKey(JSON.stringify({ models, selectedModelId, theme, speechEngine, imageGen, wallpaper }))
+      onThemeSaved?.(theme)
+      // 通知 App 立即刷新工作台背景（无需切模块）
+      window.dispatchEvent(new Event('mimir:settings-saved'))
+      // 通知对话 Tab 模型下拉同步选中（保存设置同样会落盘 models/selectedModelId）
+      window.dispatchEvent(new Event('mimir:models-config-changed'))
+      setTimeout(() => setSaved(false), 2000)
+    } catch (error) {
+      console.error('handleSave failed:', error)
+    } finally {
+      setSaving(false)
     }
-    const wallpaper = { path: wallpaperPath, dim: wallpaperDim }
-    const settings = { ...stored, models, selectedModelId, theme, speechEngine, imageGen, wallpaper }
-    if (window.electronAPI) {
-      await window.electronAPI.setSettings(settings)
-    } else {
-      // 浏览器降级：写入 localStorage
-      localStorage.setItem('mimir-settings', JSON.stringify(settings))
-    }
-    setSaving(false)
-    setSaved(true)
-    // 落盘成功后同步基线，避免保存完仍被判定为未保存
-    setBaselineKey(JSON.stringify({ models, selectedModelId, theme, speechEngine, imageGen, wallpaper }))
-    onThemeSaved?.(theme)
-    // 通知 App 立即刷新工作台背景（无需切模块）
-    window.dispatchEvent(new Event('mimir:settings-saved'))
-    setTimeout(() => setSaved(false), 2000)
   }, [models, selectedModelId, theme, speechEngine, imgGenBaseUrl, imgGenModelId, imgGenApiKey, wallpaperPath, wallpaperDim, onThemeSaved])
 
   /**
@@ -601,6 +624,8 @@ export function Settings({ autoOpenModelDialog = 0, guided = false, onModelStepD
         localStorage.setItem('mimir-settings', JSON.stringify(next))
         setBaselineKey(JSON.stringify(settingsSnapshotOf(next)))
       }
+      // 通知对话 Tab 等其它模型选择入口即时同步（增删改/切换都会落盘 models/selectedModelId）
+      window.dispatchEvent(new Event('mimir:models-config-changed'))
     } catch {
       // 持久化失败忽略：下次点「保存设置」仍可兜底
     }
@@ -636,11 +661,30 @@ export function Settings({ autoOpenModelDialog = 0, guided = false, onModelStepD
     return () => registerSettingsSession(null)
   }, [])
 
+  // 与对话 Tab 的模型下拉保持双向一致：对话里切换模型后，刷新本页「当前模型」高亮。
+  // 自身变更也广播同事件，此处按 settings 已落盘值同步，重复收到为幂等 no-op。
+  useEffect(() => {
+    const onModelsChanged = (): void => {
+      void (async () => {
+        try {
+          const s = ((await window.electronAPI?.getSettings?.()) ?? {}) as Record<string, unknown>
+          const sid = s.selectedModelId
+          if (typeof sid === 'string' && sid !== '') {
+            setSelectedModelId((prev) => (sid !== prev ? sid : prev))
+          }
+        } catch {
+          // ignore
+        }
+      })()
+    }
+    window.addEventListener('mimir:models-config-changed', onModelsChanged)
+    return () => window.removeEventListener('mimir:models-config-changed', onModelsChanged)
+  }, [])
+
   // 首次引导第二步：外部请求自动打开「添加模型」弹窗
   useEffect(() => {
     if (autoOpenModelDialog > 0) {
-      setForm(EMPTY_MODEL_FORM)
-      setTestResult(null)
+      resetModelDialog()
       setDialogOpen(true)
     }
   }, [autoOpenModelDialog])
@@ -655,7 +699,28 @@ export function Settings({ autoOpenModelDialog = 0, guided = false, onModelStepD
     }
   }, [dialogOpen, guided, onModelStepDone])
 
-  const handleAddModel = useCallback(async () => {
+  /** 重置模型弹窗（新增/编辑共用；不影响 dialog 开关本身）。 */
+  const resetModelDialog = useCallback(() => {
+    setEditingModelId(null)
+    setForm(EMPTY_MODEL_FORM)
+    setTestResult(null)
+  }, [])
+
+  /** 进入「编辑模型」：预填现有字段并保留 id，复用同一弹窗。 */
+  const openEditModel = useCallback((model: ModelConfig) => {
+    setEditingModelId(model.id)
+    setForm({
+      baseUrl: model.baseUrl,
+      modelId: model.modelId,
+      apiKey: model.apiKey,
+      supportsImages: model.supportsImages === true
+    })
+    setTestResult(null)
+    setDialogOpen(true)
+  }, [])
+
+  /** 新增或编辑模型的统一保存：先连通测试，成功后按 id 覆盖（编辑）或追加（新增）并立即落盘。 */
+  const handleSaveModel = useCallback(async () => {
     if (!form.baseUrl || !form.modelId || !form.apiKey) return
     setTesting(true)
     setTestResult(null)
@@ -699,6 +764,27 @@ export function Settings({ autoOpenModelDialog = 0, guided = false, onModelStepD
       setTestResult(result)
       if (!result.ok) return
 
+      if (editingModelId !== null) {
+        // 编辑：保留原 id 覆盖字段，当前选中不受影响
+        const updated = models.map((m) =>
+          m.id === editingModelId
+            ? {
+                ...m,
+                baseUrl: form.baseUrl,
+                modelId: form.modelId,
+                apiKey: form.apiKey,
+                supportsImages: form.supportsImages === true
+              }
+            : m
+        )
+        setModels(updated)
+        setDialogOpen(false)
+        resetModelDialog()
+        // 立即落盘，让主进程 Agent 使用新配置（模型行重新初始化）
+        await persistModelsNow(updated, selectedModelId)
+        return
+      }
+
       const newModel: ModelConfig = {
         id: `model-${Date.now()}`,
         baseUrl: form.baseUrl,
@@ -710,9 +796,8 @@ export function Settings({ autoOpenModelDialog = 0, guided = false, onModelStepD
       const updated = [...models, newModel]
       const selectedAfter = selectedModelId === '' ? newModel.id : selectedModelId
       setModels(updated)
-      setForm(EMPTY_MODEL_FORM)
       setDialogOpen(false)
-      setTestResult(null)
+      resetModelDialog()
 
       if (selectedModelId === '') {
         setSelectedModelId(newModel.id)
@@ -727,7 +812,7 @@ export function Settings({ autoOpenModelDialog = 0, guided = false, onModelStepD
     } finally {
       setTesting(false)
     }
-  }, [form, models, selectedModelId, persistModelsNow])
+  }, [form, models, selectedModelId, persistModelsNow, editingModelId, resetModelDialog])
 
   const handleDeleteModel = useCallback(
     (id: string) => {
@@ -900,43 +985,36 @@ export function Settings({ autoOpenModelDialog = 0, guided = false, onModelStepD
 
   return (
     <div className="flex h-full flex-col">
-      <div className="module-header">
+      <div className="drag-region flex h-12 shrink-0 items-center justify-between px-5">
         <span className="module-title">设置</span>
+        <span className="text-[11px] text-muted-foreground">模型 · 外观 · Agent · 图像生成 · 科研空间 · 语音与资源 · 关于</span>
+      </div>
+      <div className="no-drag flex flex-wrap items-center gap-1.5 border-b border-border px-5 py-2">
+        {SETTINGS_TABS.map((t) => {
+          const Icon = t.icon
+          return (
+            <button
+              key={t.id}
+              type="button"
+              onClick={() => setTab(t.id)}
+              className={cn(
+                'flex h-7 items-center gap-1.5 rounded-full px-3 text-[11px] font-medium transition-colors',
+                tab === t.id ? 'bg-primary text-primary-foreground' : 'text-muted-foreground hover:bg-accent hover:text-foreground'
+              )}
+            >
+              <Icon className="h-3.5 w-3.5" />
+              {t.label}
+            </button>
+          )
+        })}
       </div>
 
-      <div className="flex-1 overflow-y-auto">
-        <div className="mx-auto max-w-2xl px-5 py-5 space-y-5">
-          {/* 分区快速导航：长页内容较多，便于直达模型/语音/资源下载等区块 */}
-          <div className="sticky top-0 z-10 -mx-5 mb-3 flex flex-wrap items-center gap-1.5 border-b border-border bg-background/95 px-5 py-2 backdrop-blur">
-            {(
-              [
-                ['settings-models', '模型管理', null],
-                ['settings-workspaces', '科研空间', null],
-                ['settings-images', '图像生成', null],
-                ['settings-speech', '语音识别', null],
-                ['settings-skills', '技能管理', Command],
-                ['settings-resources', '资源下载', HardDrive],
-                ['settings-about', '关于', null]
-              ] as const
-            ).map(([id, label, Icon]) => (
-              <button
-                key={id}
-                onClick={() => document.getElementById(id)?.scrollIntoView({ behavior: 'smooth', block: 'start' })}
-                className={cn(
-                  'flex h-6 items-center gap-1 rounded-full px-2.5 text-[11px] font-medium transition-colors',
-                  label === '资源下载'
-                    ? 'bg-primary/10 text-primary hover:bg-primary/15'
-                    : 'bg-muted/70 text-muted-foreground hover:bg-accent hover:text-foreground'
-                )}
-              >
-                {Icon !== null && <Icon className="h-3 w-3" />}
-                {label}
-              </button>
-            ))}
-          </div>
+      <div className="flex-1 overflow-y-auto px-5 py-4">
+        <div className="mx-auto max-w-3xl space-y-3">
+          <p className="text-[10px] text-muted-foreground">{SETTINGS_TABS.find((t) => t.id === tab)?.desc}</p>
 
           {/* Model Management Section */}
-          <section id="settings-models" className="scroll-mt-10 space-y-3">
+          {tab === 'models' && (<section className="space-y-3">
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2">
                 <Bot className="h-4 w-4 text-primary" />
@@ -946,7 +1024,10 @@ export function Settings({ autoOpenModelDialog = 0, guided = false, onModelStepD
                 size="sm"
                 variant="outline"
                 className="h-7"
-                onClick={() => { setTestResult(null); setDialogOpen(true) }}
+                onClick={() => {
+                  resetModelDialog()
+                  setDialogOpen(true)
+                }}
               >
                 <Plus className="h-3.5 w-3.5 mr-1" />
                 添加模型
@@ -1030,16 +1111,28 @@ export function Settings({ autoOpenModelDialog = 0, guided = false, onModelStepD
                             </button>
                           </div>
                         </div>
-                        <button
-                          onClick={(e) => {
-                            e.stopPropagation()
-                            handleDeleteModel(model.id)
-                          }}
-                          className="flex h-6 w-6 items-center justify-center rounded text-muted-foreground hover:bg-destructive/10 hover:text-destructive transition-colors shrink-0"
-                          title="删除模型"
-                        >
-                          <Trash2 className="h-3.5 w-3.5" />
-                        </button>
+                        <div className="flex items-center gap-0.5 shrink-0">
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation()
+                              openEditModel(model)
+                            }}
+                            className="flex h-6 w-6 items-center justify-center rounded text-muted-foreground hover:bg-accent hover:text-foreground transition-colors"
+                            title="编辑模型"
+                          >
+                            <Pencil className="h-3.5 w-3.5" />
+                          </button>
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation()
+                              handleDeleteModel(model.id)
+                            }}
+                            className="flex h-6 w-6 items-center justify-center rounded text-muted-foreground hover:bg-destructive/10 hover:text-destructive transition-colors"
+                            title="删除模型"
+                          >
+                            <Trash2 className="h-3.5 w-3.5" />
+                          </button>
+                        </div>
                       </div>
                     </div>
                   )
@@ -1047,9 +1140,10 @@ export function Settings({ autoOpenModelDialog = 0, guided = false, onModelStepD
               </div>
             )}
           </section>
+          )}
 
           {/* Appearance Section */}
-          <section className="space-y-3">
+          {tab === 'appearance' && (<section className="space-y-3">
             <div className="flex items-center gap-2">
               <Globe className="h-4 w-4 text-primary" />
               <h2 className="text-sm font-semibold text-foreground">外观</h2>
@@ -1160,9 +1254,17 @@ export function Settings({ autoOpenModelDialog = 0, guided = false, onModelStepD
               </div>
             </div>
           </section>
+          )}
+
+          {/* Agent Section：技能路由 + 身份 + 长期记忆 */}
+          {tab === 'agent' && (<>
+            <SettingsSkillRoutingCard />
+            <SettingsIdentityCard />
+            <SettingsMemoryCard />
+          </>)}
 
           {/* 图像生成（AI 配图）Section */}
-          <section id="settings-images" className="scroll-mt-10 space-y-3">
+          {tab === 'image' && (<section className="space-y-3">
             <div className="flex items-center gap-2">
               <Image className="h-4 w-4 text-primary" />
               <h2 className="text-sm font-semibold text-foreground">图像生成</h2>
@@ -1211,9 +1313,10 @@ export function Settings({ autoOpenModelDialog = 0, guided = false, onModelStepD
               </div>
             </div>
           </section>
+          )}
 
           {/* Research Space Section */}
-          <section id="settings-workspaces" className="scroll-mt-10 space-y-3">
+          {tab === 'spaces' && (<section className="space-y-3">
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2">
                 <FolderKanban className="h-4 w-4 text-primary" />
@@ -1409,43 +1512,10 @@ export function Settings({ autoOpenModelDialog = 0, guided = false, onModelStepD
               </DialogContent>
             </Dialog>
           </section>
+          )}
 
-          {/* 技能管理（自定义技能导入/删除/详情）Section */}
-          <section id="settings-skills" className="scroll-mt-10 space-y-3">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-2">
-                <Command className="h-4 w-4 text-primary" />
-                <h2 className="text-sm font-semibold text-foreground">技能管理</h2>
-              </div>
-              <Button size="sm" variant="outline" className="h-7" onClick={openSkillManager}>
-                <Command className="h-3.5 w-3.5 mr-1" />
-                管理技能
-              </Button>
-            </div>
-            <p className="text-[11px] text-muted-foreground">
-              聊天输入框输入 <code className="rounded bg-muted px-1 text-primary">/</code> 会弹出「技能与指令」菜单。
-              内置 research-* 技能只读；可导入自己的技能（正文支持{' '}
-              <code className="rounded bg-muted px-1 text-primary">{USER_SKILL_ARGS_PLACEHOLDER}</code>{' '}
-              参数占位符），导入后立即在聊天中生效。
-            </p>
-            <div className="rounded-lg border border-border bg-card p-4">
-              <div className="flex items-center justify-between">
-                <div>
-                  <p className="text-[12px] font-medium text-foreground">当前可用技能</p>
-                  <p className="mt-0.5 text-[10px] text-muted-foreground">
-                    内置 {SKILL_ENTRIES.length} 个（只读） · 我的 {userSkills.length} 个
-                  </p>
-                </div>
-                <Button size="sm" className="h-7" onClick={openSkillImport}>
-                  <Plus className="h-3.5 w-3.5 mr-1" />
-                  导入技能
-                </Button>
-              </div>
-            </div>
-          </section>
-
-          {/* Speech Recognition Section */}
-          <section id="settings-speech" className="scroll-mt-10 space-y-3">
+          {/* Speech Recognition Section（语音与资源 标签） */}
+          {tab === 'resources' && (<section className="space-y-3">
             <div className="flex items-center gap-2">
               <Mic className="h-4 w-4 text-primary" />
               <h2 className="text-sm font-semibold text-foreground">语音识别</h2>
@@ -1558,9 +1628,10 @@ export function Settings({ autoOpenModelDialog = 0, guided = false, onModelStepD
               )}
             </div>
           </section>
+          )}
 
-          {/* Resource Download Section */}
-          <section id="settings-resources" className="scroll-mt-10 space-y-3">
+          {/* Resource Download Section（同属「语音与资源」标签） */}
+          {tab === 'resources' && (<section className="space-y-3">
             <div className="flex items-center gap-2">
               <HardDrive className="h-4 w-4 text-primary" />
               <h2 className="text-sm font-semibold text-foreground">资源下载</h2>
@@ -1680,9 +1751,10 @@ export function Settings({ autoOpenModelDialog = 0, guided = false, onModelStepD
               )}
             </div>
           </section>
+          )}
 
           {/* About */}
-          <section id="settings-about" className="scroll-mt-10 space-y-3">
+          {tab === 'about' && (<section className="space-y-3">
             <div className="flex items-center gap-2">
               <Info className="h-4 w-4 text-primary" />
               <h2 className="text-sm font-semibold text-foreground">关于</h2>
@@ -1697,21 +1769,26 @@ export function Settings({ autoOpenModelDialog = 0, guided = false, onModelStepD
               </div>
             </div>
           </section>
-
-          {/* Save Button */}
-          <div className="flex justify-end pt-2 pb-6">
-            <Button onClick={handleSave} disabled={saving} size="sm" className="h-8 px-4">
-              {saving ? (
-                <Loader2 className="h-3.5 w-3.5 mr-1.5 animate-spin" />
-              ) : saved ? (
-                <Check className="h-3.5 w-3.5 mr-1.5" />
-              ) : (
-                <Save className="h-3.5 w-3.5 mr-1.5" />
-              )}
-              {saving ? '保存中...' : saved ? '已保存' : '保存设置'}
-            </Button>
-          </div>
+          )}
         </div>
+      </div>
+
+      {/* 底部保存栏：与插件页一致的通栏布局 */}
+      <div className="no-drag flex shrink-0 items-center justify-end gap-3 border-t border-border px-5 py-2.5">
+        {saved && !saving && (
+          <span className="flex items-center gap-1 text-[11px] text-green-600">
+            <Check className="h-3.5 w-3.5" />
+            已保存
+          </span>
+        )}
+        <Button onClick={handleSave} disabled={saving} size="sm" className="h-8 px-4">
+          {saving ? (
+            <Loader2 className="h-3.5 w-3.5 mr-1.5 animate-spin" />
+          ) : (
+            <Save className="h-3.5 w-3.5 mr-1.5" />
+          )}
+          {saving ? '保存中...' : '保存设置'}
+        </Button>
       </div>
 
       {/* 技能管理（列表 + 导入 / 查看详情 / 删除） */}
@@ -2026,7 +2103,7 @@ export function Settings({ autoOpenModelDialog = 0, guided = false, onModelStepD
       <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
         <DialogContent className="sm:max-w-md">
           <DialogHeader>
-            <DialogTitle>添加模型</DialogTitle>
+            <DialogTitle>{editingModelId !== null ? '编辑模型' : '添加模型'}</DialogTitle>
             <DialogDescription>
               填写 LLM 模型的连接信息和配置。
             </DialogDescription>
@@ -2110,8 +2187,7 @@ export function Settings({ autoOpenModelDialog = 0, guided = false, onModelStepD
               className="h-7"
               onClick={() => {
                 setDialogOpen(false)
-                setForm(EMPTY_MODEL_FORM)
-                setTestResult(null)
+                resetModelDialog()
               }}
             >
               取消
@@ -2119,15 +2195,17 @@ export function Settings({ autoOpenModelDialog = 0, guided = false, onModelStepD
             <Button
               size="sm"
               className="h-7"
-              onClick={handleAddModel}
+              onClick={handleSaveModel}
               disabled={!form.baseUrl || !form.modelId || !form.apiKey || testing}
             >
               {testing ? (
                 <Loader2 className="h-3.5 w-3.5 mr-1 animate-spin" />
+              ) : editingModelId !== null ? (
+                <Check className="h-3.5 w-3.5 mr-1" />
               ) : (
                 <Plus className="h-3.5 w-3.5 mr-1" />
               )}
-              {testing ? '测试中...' : '测试并添加'}
+              {testing ? '测试中...' : editingModelId !== null ? '测试并保存' : '测试并添加'}
             </Button>
           </DialogFooter>
           {testResult && (

@@ -6,7 +6,7 @@
  * paper-compile / research-review），在本应用以 L0 形态落地：输入
  * `/trigger 参数` 时展开为一段结构化任务提示注入 Agent，不产生本地文件副作用。
  */
-import type { SlashEntry, SlashKind, SlashMatch } from './types'
+import type { ClientAction, SlashEntry, SlashKind, SlashMatch } from './types'
 import {
   researchPipelineContent,
   researchLitReviewContent,
@@ -48,8 +48,11 @@ function entry(
   usage: string,
   requiresArg: boolean,
   compose: (args: string) => string,
+  clientAction?: ClientAction,
 ): SlashEntry {
-  return { trigger, kind, title, description, whenToUse, argsHint, usage, requiresArg, compose }
+  const e: SlashEntry = { trigger, kind, title, description, whenToUse, argsHint, usage, requiresArg, compose }
+  if (clientAction) (e as { clientAction: ClientAction }).clientAction = clientAction
+  return e
 }
 
 // ─── 指令（commands，照搬 Mimir）────────────────────────────────────────
@@ -226,19 +229,47 @@ const SKILL_METAS: SkillMeta[] = [
 // ─── 导出注册表与解析 ───────────────────────────────────────────────────
 
 /** 全部指令条目（带 compose）。 */
-export const COMMAND_ENTRIES: SlashEntry[] = COMMAND_METAS.map((meta) =>
+export const COMMAND_ENTRIES: SlashEntry[] = [
+  // /help：客户端展示帮助信息，不走 Agent
   entry(
     'command',
-    meta.trigger,
-    meta.title,
-    meta.description,
-    meta.whenToUse,
-    meta.argsHint,
-    meta.usage,
-    meta.requiresArg,
-    commandCompose(meta.steps, meta.requiresArg),
+    'help',
+    '帮助（/help）',
+    '显示所有可用指令与技能，附用法说明',
+    '不确定有哪些命令、或想快速查阅用法时。',
+    '',
+    '/help',
+    false,
+    () => '',
+    'help',
   ),
-)
+  // /clear：客户端清空会话，不走 Agent
+  entry(
+    'command',
+    'clear',
+    '清空会话（/clear）',
+    '清空当前对话上下文，回到新对话欢迎态',
+    '对话内容过长影响质量、或想重新开始一个话题时。',
+    '',
+    '/clear',
+    false,
+    () => '',
+    'clear',
+  ),
+  ...COMMAND_METAS.map((meta) =>
+    entry(
+      'command',
+      meta.trigger,
+      meta.title,
+      meta.description,
+      meta.whenToUse,
+      meta.argsHint,
+      meta.usage,
+      meta.requiresArg,
+      commandCompose(meta.steps, meta.requiresArg),
+    ),
+  ),
+]
 
 /** 全部技能条目。 */
 export const SKILL_ENTRIES: SlashEntry[] = SKILL_METAS.map((meta) =>

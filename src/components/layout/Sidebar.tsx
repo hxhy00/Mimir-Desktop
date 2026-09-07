@@ -16,7 +16,8 @@ import {
   FolderKanban,
   ChevronsUpDown,
   Check,
-  CalendarClock
+  CalendarClock,
+  Puzzle
 } from 'lucide-react'
 
 export type ModuleId =
@@ -30,6 +31,7 @@ export type ModuleId =
   | 'venues'
   | 'servers'
   | 'ledger'
+  | 'plugins'
   | 'settings'
 
 interface NavItem {
@@ -143,7 +145,12 @@ export function Sidebar({
       </div>
 
       {/* Bottom */}
-      <div className="px-2 py-2">
+      <div className="space-y-0.5 px-2 py-2">
+        <NavItemComponent
+          item={{ id: 'plugins', label: '插件', icon: Puzzle }}
+          active={activeModule === 'plugins'}
+          onClick={() => onNavigate('plugins')}
+        />
         <NavItemComponent
           item={{ id: 'settings', label: '设置', icon: Settings }}
           active={activeModule === 'settings'}

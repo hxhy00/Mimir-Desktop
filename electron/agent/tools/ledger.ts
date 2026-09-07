@@ -4,7 +4,7 @@
  */
 import { tool } from 'langchain/tools'
 import { z } from 'zod'
-import { getStoreValue, setStoreValue } from '../../library/store'
+import { getStoreValue, setStoreValue, currentSpaceEpoch, assertSpaceUnchanged } from '../../library/store'
 import { requireUserApproval } from '../approval'
 
 const LEDGER_KEY = 'ledger:entries'
@@ -47,6 +47,7 @@ function describe(list: LedgerEntry[]): string {
 export const ledgerTool = tool(
   async ({ action, id, title, content, type, date }) => {
     try {
+      const epoch = currentSpaceEpoch()
       const list = load()
       if (action === 'list') return describe(list)
 
@@ -71,6 +72,7 @@ export const ledgerTool = tool(
           type: type ?? 'progress',
           date: date ?? (() => new Date().toISOString().slice(0, 10))(),
         }
+        assertSpaceUnchanged(epoch)
         saveList([entry, ...list])
         return `已添加记录 ${entry.id}「${entry.title}」[${TYPE_LABEL[entry.type]}] ${entry.date}。`
       }
@@ -78,6 +80,7 @@ export const ledgerTool = tool(
       if (action === 'delete') {
         const target = list.find((entry) => entry.id === id)
         if (target === undefined) return `删除失败：找不到记录 id「${id}」。先用 action=list 查看可用 id。`
+        assertSpaceUnchanged(epoch)
         saveList(list.filter((entry) => entry.id !== id))
         return `已删除记录 ${target.id}「${target.title}」。`
       }

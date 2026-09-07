@@ -1,11 +1,11 @@
 /**
  * 组会演示文稿域服务：从文献库与实验模块收集素材 → buildDeckModel →
- * renderDeck 渲染 .pptx → 落盘 userData/meetings/（文件系统为真相）。
+ * renderDeck 渲染 .pptx → 落盘空间根 meetings/（文件系统为真相）。
  * 元信息（标题/页数/创建时间）记录在 store key `meetings:index`。
  */
 import { mkdir, readdir, stat, unlink } from 'fs/promises'
 import { basename, extname, join } from 'path'
-import { getStoreValue, setStoreValue, spaceRoot } from '../library/store'
+import { getStoreValue, setStoreValue, spaceRoot, currentSpaceEpoch, assertSpaceUnchanged } from '../library/store'
 import { buildDeckModel, renderDeck } from './deck'
 import { enhanceDeck } from './enhance'
 import { coverPrompt, figureAbsPath, generateDeckImage, paperArtPrompt, readImageGenConfig } from '../figures/imageGen'
@@ -128,6 +128,7 @@ function loadExperiments(): ExperimentRecord[] {
 
 /** 生成一份组会演示文稿并返回其视图。 */
 export async function generateMeetingDeck(request: GenerateDeckRequest): Promise<MeetingDeckView> {
+  const epoch = currentSpaceEpoch()
   const title = request.title.trim()
   if (title === '') throw new Error('汇报主题不能为空')
 
@@ -186,6 +187,7 @@ export async function generateMeetingDeck(request: GenerateDeckRequest): Promise
         experimentsNote = enhancement.experimentsNote
         if (Object.keys(enhancement.paperPoints).length > 0) paperPoints = enhancement.paperPoints
       }
+      assertSpaceUnchanged(epoch)
     }
   }
 
@@ -215,6 +217,7 @@ export async function generateMeetingDeck(request: GenerateDeckRequest): Promise
         }
       }
       if (Object.keys(artMap).length > 0) paperImages = artMap
+      assertSpaceUnchanged(epoch)
     }
   }
 
@@ -240,6 +243,7 @@ export async function generateMeetingDeck(request: GenerateDeckRequest): Promise
   await mkdir(dir, { recursive: true })
   const outPath = await uniquePptxPath(title, stamp)
   await renderDeck(slides, outPath, { title })
+  assertSpaceUnchanged(epoch)
 
   const file = basename(outPath)
   const meta = { title, slides: slides.length, createdAt: new Date().toISOString() }
@@ -289,9 +293,11 @@ export async function listMeetingDecks(): Promise<MeetingDeckView[]> {
 
 /** 删除一份 deck（文件名需为 basename 且 .pptx）。 */
 export async function deleteMeetingDeck(file: string): Promise<void> {
+  const epoch = currentSpaceEpoch()
   const path = meetingDeckPath(file)
   if (path === null) throw new Error('非法文件名')
   await unlink(path)
+  assertSpaceUnchanged(epoch)
   const index = readIndex()
   if (file in index) {
     const next = { ...index }

@@ -1,7 +1,7 @@
 import { cn } from '@/lib/utils'
 import type { Message } from './ChatView'
 import { AgentTraceCard } from './SwarmPanel'
-import { Bot, User, Copy, Check, RefreshCw, ChevronRight } from 'lucide-react'
+import { Bot, User, Copy, Check, RefreshCw } from 'lucide-react'
 import { useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
@@ -50,28 +50,6 @@ export function MessageBubble({ message, onRetry }: MessageBubbleProps) {
           {!isUser && message.trace !== undefined && message.trace.children.length > 0 && (
             <div className="mb-2">
               <AgentTraceCard trace={message.trace} isStreaming={message.isStreaming} />
-            </div>
-          )}
-
-          {/* 蜂群：各并行子 Agent 的产出折叠区 */}
-          {!isUser && message.swarmSections !== undefined && message.swarmSections.length > 0 && (
-            <div className="mb-2 space-y-1">
-              <p className="text-[10px] font-medium text-muted-foreground">并行子 Agent 产出</p>
-              {message.swarmSections.map((section) => (
-                <details
-                  key={section.label}
-                  className="group rounded-md border border-border/70 bg-muted/30 open:pb-0"
-                >
-                  <summary className="flex cursor-pointer select-none items-center gap-1.5 px-2 py-1 text-[11px] font-medium text-foreground/90">
-                    <ChevronRight className="h-3 w-3 shrink-0 text-muted-foreground transition-transform group-open:rotate-90" />
-                    <span>{section.label}</span>
-                    <span className="ml-auto text-[9px] text-muted-foreground tabular-nums">{section.text.length} 字</span>
-                  </summary>
-                  <div className="max-h-56 overflow-y-auto border-t border-border/60 px-2.5 py-2 text-[11px] leading-relaxed text-foreground/90">
-                    <p className="whitespace-pre-wrap">{section.text}</p>
-                  </div>
-                </details>
-              ))}
             </div>
           )}
 

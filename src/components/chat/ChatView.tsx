@@ -9,16 +9,15 @@ import {
   Plus,
   Trash2,
   MessageSquare,
-  Hexagon,
-  Zap,
-  ChevronDown,
   Pin,
   PinOff,
   Pencil,
   Check,
   X,
   PanelLeftOpen,
-  ShieldQuestion
+  ShieldQuestion,
+  Sparkles,
+  ChevronDown
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import {
@@ -26,7 +25,9 @@ import {
   SKILL_ENTRIES,
   resolveSlashInput,
   loadUserSkills,
-  userSkillToEntry
+  userSkillToEntry,
+  loadUserCommands,
+  userCommandToEntry
 } from '@/lib/slash'
 import type { SlashEntry } from '@/lib/slash/types'
 
@@ -36,23 +37,6 @@ interface PendingApproval {
   tool: string
   summary: string
   detail?: string
-}
-
-/** 蜂群产物收集里的一行（调度阶段或单个任务的最终产出，供气泡折叠区用）。 */
-type SwarmRowStatus = 'running' | 'done' | 'error'
-interface SwarmRow {
-  id: string
-  title: string
-  status: SwarmRowStatus
-  text?: string
-}
-
-/** 蜂王拆解后的任务计划（角色信息经 ref 供事件树标注用）。 */
-interface SwarmPlanTask {
-  id: string
-  title: string
-  role: 'researcher' | 'analyst' | 'writer'
-  dependsOn: string[]
 }
 
 /** Agent 执行事件树节点（run 根 / 阶段 / 任务 / 思考 / 工具行）。 */
@@ -65,7 +49,6 @@ export interface SwarmEventNode {
   text?: string
   /** 工具执行耗时（毫秒，由主进程在返回/出错时填充）。 */
   durationMs?: number
-  role?: 'researcher' | 'analyst' | 'writer'
 }
 
 export interface SwarmTreeNodeItem {
@@ -73,8 +56,8 @@ export interface SwarmTreeNodeItem {
   children: SwarmTreeNodeItem[]
 }
 
-/** 蜂群过程事件信封前缀（与主进程 ipc/index.ts 保持一致）。 */
-const SWARM_EVENT_PREFIX = '\u0002MIMIR_SWARM_EVENT\u0002'
+/** Agent 过程事件信封前缀（与主进程 ipc/index.ts 保持一致）。 */
+const AGENT_EVENT_PREFIX = '\u0002MIMIR_AGENT_EVENT\u0002'
 
 export interface Message {
   id: string
@@ -82,9 +65,7 @@ export interface Message {
   content: string
   timestamp: Date
   isStreaming?: boolean
-  /** 蜂群模式：并行子 Agent 的产出分区（气泡内折叠展示）。 */
-  swarmSections?: { label: string; text: string }[]
-  /** 生成本条回复时的事件树（标准 Agent 与蜂群统一；气泡内折叠展示，历史可回看）。 */
+  /** 生成本条回复时的事件树（Supervisor 与模块子 Agent 统一；气泡内折叠展示，历史可回看）。 */
   trace?: SwarmTreeNodeItem
 }
 
@@ -96,14 +77,9 @@ interface Conversation {
   pinned?: boolean
 }
 
-export type AgentMode = 'normal' | 'swarm'
-
-const MODE_CONFIG = {
-  normal: { label: '标准模式', icon: Zap, description: '单 Agent 对话' },
-  swarm: { label: '蜂群模式', icon: Hexagon, description: '多 Agent 协作' }
-}
-
 const WELCOME_MESSAGE = `你好，我是 **Mimir**，你的科研助手。
+
+我采用 **Supervisor 编排**：主管 Agent 会把文献检索、论文编译、实验、组会 PPT、GPU 服务器等专业任务自动委派给相应的模块专家协作完成。
 
 我可以帮你：
 
@@ -115,16 +91,20 @@ const WELCOME_MESSAGE = `你好，我是 **Mimir**，你的科研助手。
 
 有什么需要帮忙的？`
 
-const SWARM_WELCOME = `🐝 **蜂群模式已激活**
-
-多个 Agent 协同工作：
-
-- **搜索 Agent** — 并行检索文献与数据
-- **分析 Agent** — 解析论文方法与实验
-- **写作 Agent** — 撰写和润色论文内容
-- **编排 Agent** — 协调各 Agent 的工作流
-
-描述你的需求，蜂群将自动分配任务。`
+// ── Ultra 增强策略（UI 层枚举；与主进程 electron/agent/agentService.ts 保持一致）─────
+type UltraStrategy = 'plain' | 'multi_expert' | 'critique_reflect' | 'hybrid_mix' | 'self_consistency_vote'
+type UltraPick = 'auto' | UltraStrategy
+const ULTRA_OPTIONS: { value: UltraPick; label: string; desc: string; badge?: string }[] = [
+  { value: 'auto', label: '自动选择', desc: 'Ultra 分析任务类型与复杂度自动挑选策略', badge: '推荐' },
+  { value: 'plain', label: '普通增强', desc: '长程规划约束，不启用多专家合议' },
+  { value: 'multi_expert', label: '多专家合议', desc: '多视角对抗：K 路并行推演 + 共识/分歧输出' },
+  { value: 'critique_reflect', label: '批判迭代', desc: '方案 → 批判挑错 → 修订，循环 N 轮' },
+  { value: 'hybrid_mix', label: '混合增强', desc: '关键判断点触发合议，其余走批判反思' },
+  { value: 'self_consistency_vote', label: '一致性投票', desc: '轻量 SC：少路数投票选最优，不出完整评审报告' }
+]
+const ULTRA_LABEL: Record<UltraPick, string> = Object.fromEntries(
+  ULTRA_OPTIONS.map((o) => [o.value, o.label])
+) as Record<UltraPick, string>
 
 interface ChatViewProps {
   rightSidebarCollapsed: boolean
@@ -135,10 +115,151 @@ interface ChatViewProps {
 
 // ── 会话持久化（优先 Electron store，浏览器降级 localStorage）──────────
 const CONVERSATIONS_KEY = 'chat:conversations'
+/** 当前激活会话 id 的持久化 key：切模块重挂载后恢复到切走前的对话。 */
+const ACTIVE_CONV_KEY = 'chat:activeConvId'
 
-function makeWelcomeConversation(mode: AgentMode): Conversation {
+// ── 上下文治理（M2/M3）：发给 Agent 的历史滑动窗口 + 超限摘要压缩 + 失效对象提醒 ──
+type HistoryMsg = { role: 'user' | 'assistant'; content: string }
+/** 历史总字符阈值：超过则对最旧部分压缩（SS 估算，避免把长会话整包塞进 prompt）。 */
+const MAX_CONTEXT_CHARS = 60_000
+/** 压缩后仍保留的「最近原文窗口」字符数。 */
+const KEEP_TAIL_CHARS = 32_000
+/** 归档 store key 前缀：被压缩掉的旧轮原文，key = chat:archive:<convId>。 */
+const HISTORY_ARCHIVE_PREFIX = 'chat:archive:'
+/** 失效对象提醒 store key 前缀：key = chat:reminders:<convId>（治理 M3）。 */
+const REMINDER_STORE_PREFIX = 'chat:reminders:'
+/** 破坏性动作特征词：命中则认为会话内对象可能已失效（删除/改名/覆盖等）。 */
+const DESTRUCTIVE_ACTION_RE = /(删除|移除|改名|重命名|覆盖|清除|回退)/
+
+/** 只取 user/assistant 的正文历史；剔除空消息/流式中消息（不携带 trace、附件全文等）。 */
+function toHistoryMessages(list: Message[]): HistoryMsg[] {
+  const out: HistoryMsg[] = []
+  for (const m of list) {
+    if (m.role !== 'user' && m.role !== 'assistant') continue
+    if (m.isStreaming === true) continue
+    if (m.id.startsWith('welcome-')) continue // 欢迎语不进入上下文
+    const content = m.content.trim()
+    if (content === '') continue
+    out.push({ role: m.role, content: m.content })
+  }
+  return out
+}
+
+/** 从一次工具事件中抽取「对象已失效」提醒文本；非破坏性完成事件返回 null（治理 M3）。 */
+function reminderTextFromEvent(event: {
+  taskId: string
+  title: string
+  status: string
+  text?: string
+  kind?: string
+}): string | null {
+  if (event.kind !== 'tool' || event.status !== 'done') return null
+  const raw = event.text ?? ''
+  const sep = ' 返回：'
+  const at = raw.indexOf(sep)
+  if (at === -1) return null
+  const toolName = raw.slice(0, at).trim()
+  const out = raw.slice(at + sep.length).replace(/\s+/g, ' ').trim()
+  if (!DESTRUCTIVE_ACTION_RE.test(out)) return null
+  const note = out.length > 60 ? `${out.slice(0, 60)}…` : out
+  return `${toolName} 于 ${new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })} 执行后：${note}（若相关对象已被删除/改名/覆盖，后续请忽略其旧描述）`
+}
+
+/** 读取该会话已累积的失效提醒（最新在前，至多 N 条）。 */
+async function loadConversationReminders(convId: string): Promise<string[]> {
+  const api = window.electronAPI
+  if (!api?.getStoreValue) return []
+  try {
+    const list = (await api.getStoreValue<string[]>(`${REMINDER_STORE_PREFIX}${convId}`)) ?? []
+    return list.slice(-8).reverse()
+  } catch {
+    return []
+  }
+}
+
+/** 把一条失效提醒异步写入该会话（去重、上限 20 条；尽力而为）。 */
+async function addConversationReminder(convId: string, text: string): Promise<void> {
+  const api = window.electronAPI
+  if (!api?.getStoreValue || !api.setStoreValue) return
+  try {
+    const key = `${REMINDER_STORE_PREFIX}${convId}`
+    const prev = (await api.getStoreValue<string[]>(key)) ?? []
+    if (prev.length > 0 && prev[prev.length - 1] === text) return // 去重连续同款
+    const next = [...prev, text]
+    await api.setStoreValue(key, next.length > 20 ? next.slice(next.length - 20) : next)
+  } catch {
+    // ignore
+  }
+}
+
+/**
+ * 组装发送给 Agent 的对话历史：
+ * 0) 前置本会话的「失效对象提醒」（M3：删除/改名/覆盖后防止跨轮复述旧描述）；
+ * 1) 总长 ≤ 阈值 → 直接原样返回（滑动窗口无需触发）；
+ * 2) 超过阈值 → 保留最近 KEEP_TAIL_CHARS 原文，更早部分先做 LLM 结构化摘要，
+ *    摘要以一条 assistant 消息置于队首；压缩失败则降级为截断窗口。
+ * 被压缩原文异步归档到 store（chat:archive:<convId>）供回看，不回灌模型。
+ */
+async function buildOutgoingHistory(conv: Conversation): Promise<HistoryMsg[]> {
+  const api = window.electronAPI
+  // M3：本会话失效对象提醒（删除/改名/覆盖）作为轻量 assistant 消息前置，防止跨轮复述旧描述
+  const reminders = await loadConversationReminders(conv.id)
+  const reminderMsgs: HistoryMsg[] = reminders.map((text) => ({ role: 'assistant', content: text }))
+  const all = [...reminderMsgs, ...toHistoryMessages(conv.messages)]
+  if (all.length === 0) return all
+  if (!api?.compressConversation) return all
+  const total = all.reduce((sum, m) => sum + m.content.length, 0)
+  if (total <= MAX_CONTEXT_CHARS) return all
+
+  // 找到「最近 KEEP_TAIL_CHARS」对应的起始索引，之前部分进入压缩
+  let start = all.length
+  let acc = 0
+  while (start > 0) {
+    const len = all[start - 1].content.length
+    if (acc + len > KEEP_TAIL_CHARS) break
+    acc += len
+    start -= 1
+  }
+  if (start === 0) return all // 单条消息就超长：不循环压缩同一条，原样返回
+  const head = all.slice(0, start)
+  const tail = all.slice(start)
+
+  let res: { ok: boolean; summary?: string; message?: string }
+  try {
+    res = await api.compressConversation(head)
+  } catch {
+    res = { ok: false }
+  }
+  if (res.ok && res.summary !== undefined && res.summary.trim() !== '') {
+    // 归档最旧原文（尽力而为，失败不阻塞主流程）
+    try {
+      const key = `${HISTORY_ARCHIVE_PREFIX}${conv.id}`
+      const prev = (await api.getStoreValue<unknown[]>(key)) ?? []
+      await api.setStoreValue(key, [...prev, { at: new Date().toISOString(), head }])
+    } catch {
+      // ignore archive error
+    }
+    return [{ role: 'assistant', content: `【更早对话摘要（已压缩）】\n${res.summary}` }, ...tail]
+  }
+  // 压缩失败降级：仅保留最近窗口
+  const cut: HistoryMsg[] = []
+  let budget = KEEP_TAIL_CHARS
+  for (let i = tail.length - 1; i >= 0; i--) {
+    if (budget <= 0) break
+    const content = tail[i].content
+    if (content.length > budget) {
+      cut.unshift({ ...tail[i], content: content.slice(-budget) })
+      break
+    }
+    budget -= content.length
+    cut.unshift(tail[i])
+  }
+  return cut
+}
+
+function makeWelcomeConversation(): Conversation {
   const now = new Date()
-  const welcome = mode === 'swarm' ? SWARM_WELCOME : WELCOME_MESSAGE
+  const welcome = WELCOME_MESSAGE
   return {
     id: `conv-${now.getTime()}`,
     title: '新对话',
@@ -180,7 +301,8 @@ async function persistConversations(list: Conversation[]): Promise<void> {
         id: m.id,
         role: m.role,
         content: m.content,
-        timestamp: m.timestamp.toISOString()
+        timestamp: m.timestamp.toISOString(),
+        ...(m.trace !== undefined ? { trace: m.trace } : {})
       }))
     }))
     if (window.electronAPI?.setStoreValue) {
@@ -190,6 +312,31 @@ async function persistConversations(list: Conversation[]): Promise<void> {
     }
   } catch {
     // ignore
+  }
+}
+
+/** 持久化当前激活会话 id（切模块重挂载后恢复到切走前的对话）。 */
+async function persistActiveConvId(id: string): Promise<void> {
+  try {
+    if (window.electronAPI?.setStoreValue) {
+      await window.electronAPI.setStoreValue(ACTIVE_CONV_KEY, id)
+    } else {
+      localStorage.setItem('mimir-chat-active-conv', id)
+    }
+  } catch {
+    // ignore
+  }
+}
+
+/** 读取上次激活的会话 id；无则返回 null。 */
+async function readActiveConvId(): Promise<string | null> {
+  try {
+    if (window.electronAPI?.getStoreValue) {
+      return (await window.electronAPI.getStoreValue<string>(ACTIVE_CONV_KEY)) ?? null
+    }
+    return localStorage.getItem('mimir-chat-active-conv')
+  } catch {
+    return null
   }
 }
 
@@ -212,7 +359,8 @@ function reviveConversations(raw: unknown): Conversation[] | null {
           id: m.id,
           role,
           content: typeof m.content === 'string' ? m.content : '',
-          timestamp: toDate(m.timestamp)
+          timestamp: toDate(m.timestamp),
+          ...(m.trace !== undefined && typeof m.trace === 'object' ? { trace: m.trace as SwarmTreeNodeItem } : {})
         })
       }
     }
@@ -228,38 +376,37 @@ function reviveConversations(raw: unknown): Conversation[] | null {
 }
 
 export function ChatView({ rightSidebarCollapsed, onToggleRightSidebar, sidebarCollapsed, onToggleSidebar }: ChatViewProps) {
-  const [conversations, setConversations] = useState<Conversation[]>(() => [makeWelcomeConversation('normal')])
+  const [conversations, setConversations] = useState<Conversation[]>(() => [makeWelcomeConversation()])
   const [activeConvId, setActiveConvId] = useState<string>(() => conversations[0]?.id ?? '')
   const [isStreaming, setIsStreaming] = useState(false)
-  const [agentMode, setAgentMode] = useState<AgentMode>('normal')
-  const [showModeMenu, setShowModeMenu] = useState(false)
+  /** Ultra 增强控制器（Supervisor 之上的可选增强层）：开启后本条及后续请求先经增强，成本更高，默认关。 */
+  const [ultraEnabled, setUltraEnabled] = useState(false)
+  /** Ultra 增强策略：auto = Ultra 按任务自动选；其余为用户手动指定。 */
+  const [ultraStrategy, setUltraStrategy] = useState<UltraPick>('auto')
+  const [showUltraMenu, setShowUltraMenu] = useState(false)
+  const ultraMenuRef = useRef<HTMLDivElement>(null)
   const [renamingId, setRenamingId] = useState<string | null>(null)
   const [renameValue, setRenameValue] = useState('')
   const [hydrated, setHydrated] = useState(false)
   const [pendingApproval, setPendingApproval] = useState<PendingApproval | null>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
-  const modeMenuRef = useRef<HTMLDivElement>(null)
-  const messageRefs = useRef<Record<string, HTMLDivElement | null>>({})
   /** 发送纪元：每次发送自增取号。停止即 +1，让旧回复的所有 chunk/事件/看门狗失效；
-   *  新发送再取新号，二者互不干扰，杜绝“停后再发导致旧流复活”。 */
+   *  新发送再取新号，二者互不干扰，杜绝"停后再发导致旧流复活"。 */
   const sendEpochRef = useRef(0)
+  /** 发送锁：防止快速双击等场景下并发调用 streamMessage（React setState 异步，isStreaming 守卫不可靠）。 */
+  const sendingRef = useRef(false)
 
-  // ── 斜杠「技能与指令」：内置注册表 + 设置里导入的自定义技能 ──
+  // ── 斜杠「技能与指令」：内置注册表 + 自定义技能 / 指令 ──
   const [customSkillEntries, setCustomSkillEntries] = useState<readonly SlashEntry[]>([])
+  const [customCommandEntries, setCustomCommandEntries] = useState<readonly SlashEntry[]>([])
   const slashEntries = useMemo(
-    () => [...COMMAND_ENTRIES, ...SKILL_ENTRIES, ...customSkillEntries],
-    [customSkillEntries]
+    () => [...COMMAND_ENTRIES, ...SKILL_ENTRIES, ...customCommandEntries, ...customSkillEntries],
+    [customSkillEntries, customCommandEntries]
   )
 
   // ── Agent 执行 trace：事件树挂在生成中的助手消息上（message.trace），历史可回看 ──
-  /** 蜂王拆解出的任务计划（仅写；角色经 swarmPlanRef 消费）。 */
-  const [, setSwarmPlan] = useState<SwarmPlanTask[] | null>(null)
-  /** 计划镜像（ref），供 apply 的事件回调读取角色信息而不引入闭包过期。 */
-  const swarmPlanRef = useRef<SwarmPlanTask[] | null>(null)
   /** 事件树内行节点序号（同一消息树内保证 key 唯一；每次发送归零）。 */
   const swarmEventSeq = useRef(0)
-  /** 收集任务产物（按 taskId），供气泡折叠区使用（ref 避免异步闭包过期）。 */
-  const swarmCollectRef = useRef<Record<string, SwarmRow>>({})
 
   type SwarmEvent = {
     taskId: string
@@ -268,17 +415,10 @@ export function ChatView({ rightSidebarCollapsed, onToggleRightSidebar, sidebarC
     text?: string
     durationMs?: number
     kind?: 'phase' | 'task' | 'tool' | 'think' | 'think-token'
-    detail?: SwarmPlanTask[]
   }
 
-  /** 事件应用：不可变更新该助手消息上挂的事件树（标准 Agent 与蜂群统一）。 */
+  /** 事件应用：不可变更新该助手消息上挂的事件树（Supervisor 与模块子 Agent 统一）。 */
   const applyTraceEvent = useCallback((convId: string, messageId: string, event: SwarmEvent): void => {
-    // 计划镜像：蜂王拆解完成时保存角色信息（供任务徽标等消费）
-    if (event.taskId === 'scheduler' && event.status === 'done' && event.detail !== undefined) {
-      setSwarmPlan(event.detail)
-      swarmPlanRef.current = event.detail
-    }
-
     setConversations((prev) =>
       prev.map((c) => {
         if (c.id !== convId) return c
@@ -291,17 +431,6 @@ export function ChatView({ rightSidebarCollapsed, onToggleRightSidebar, sidebarC
         }
       })
     )
-
-    // 产物收集：供蜂群气泡折叠区 / 普通模式无需展示，过滤无产物阶段
-    const current = swarmCollectRef.current
-    if (event.taskId !== 'main') {
-      current[event.taskId] = {
-        id: event.taskId,
-        title: event.title,
-        status: event.status,
-        text: event.text ?? current[event.taskId]?.text
-      }
-    }
   }, [])
 
   /** 单个事件对一棵事件树的不可变应用（纯树更新，key 生成引用外部序号）。 */
@@ -349,7 +478,7 @@ export function ChatView({ rightSidebarCollapsed, onToggleRightSidebar, sidebarC
       }
     }
 
-    // 2) 工具行（调用/返回/出错）→ 追加到该任务下；容器缺失（普通模式“主 Agent”）先补建
+    // 2) 工具行（调用/返回/出错）→ 追加到该任务下；容器缺失（普通模式"主 Agent"）先补建
     if (event.kind === 'tool') {
       const container: SwarmTreeNodeItem = {
         node: {
@@ -409,12 +538,6 @@ export function ChatView({ rightSidebarCollapsed, onToggleRightSidebar, sidebarC
       node: { ...base.node, title: event.title, status: event.status, text: piece || base.node.text }
     }
 
-    // 角色信息（任务节点）
-    if (node.node.kind === 'task' && node.node.role === undefined) {
-      const planMeta = (swarmPlanRef.current ?? []).find((t) => t.id === event.taskId)
-      if (planMeta !== undefined) node = { ...node, node: { ...node.node, role: planMeta.role } }
-    }
-
     // 任务收尾：把最后一条思考置为完成态（文本保留可展开）
     if (
       node.node.kind === 'task' &&
@@ -436,19 +559,23 @@ export function ChatView({ rightSidebarCollapsed, onToggleRightSidebar, sidebarC
   }
 
   const activeConv = conversations.find((c) => c.id === activeConvId) || conversations[0]
+  /** 活跃会话镜像（ref）：handleSend 内读最新消息构建历史，避免 useCallback 闭包过期。 */
+  const activeConvRef = useRef<Conversation>(activeConv)
+  activeConvRef.current = activeConv
   const displayMessages = activeConv.messages.filter((m) => m.role !== 'system')
 
-  // 启动时从 store 恢复会话历史
+  // 启动时从 store 恢复会话历史（并恢复到切走前激活的对话）
   useEffect(() => {
     let alive = true
-    readConversations()
-      .then((list) => {
-        if (!alive) return
-        if (list !== null) {
-          setConversations(list)
-          setActiveConvId(list[0]?.id ?? '')
-        }
-      })
+    ;(async () => {
+      const list = await readConversations()
+      if (!alive || list === null) return
+      setConversations(list)
+      const savedId = await readActiveConvId()
+      if (!alive) return
+      const target = savedId !== null && list.some((c) => c.id === savedId) ? savedId : (list[0]?.id ?? '')
+      setActiveConvId(target)
+    })()
       .catch(() => {})
       .finally(() => {
         if (alive) setHydrated(true)
@@ -458,13 +585,38 @@ export function ChatView({ rightSidebarCollapsed, onToggleRightSidebar, sidebarC
     }
   }, [])
 
-  // 会话变化时持久化（流式过程中跳过，避免每个 chunk 都写盘）
-  useEffect(() => {
-    if (!hydrated || isStreaming) return
-    void persistConversations(conversations)
-  }, [conversations, isStreaming, hydrated])
+  /** 最新会话与激活 id 镜像（ref）：供卸载 flush 时读到最新值，避免闭包过期。 */
+  const latestPersistRef = useRef<{ conversations: Conversation[]; activeConvId: string; hydrated: boolean }>({
+    conversations,
+    activeConvId,
+    hydrated
+  })
+  latestPersistRef.current = { conversations, activeConvId, hydrated }
+  /** 防抖持久化计时器。 */
+  const persistTimer = useRef<number | undefined>(undefined)
 
-  // 加载自定义技能（设置页导入/删除后重新进入本模块即刷新）
+  // 会话变化时持久化：防抖写入（流式中也保存，避免切 tab 重挂载读到旧数据）
+  useEffect(() => {
+    if (!hydrated) return
+    window.clearTimeout(persistTimer.current)
+    persistTimer.current = window.setTimeout(() => {
+      void persistConversations(latestPersistRef.current.conversations)
+      void persistActiveConvId(latestPersistRef.current.activeConvId)
+    }, 300)
+  }, [conversations, activeConvId, hydrated])
+
+  // 卸载时立即 flush 当前会话（防止切到别的 tab 后重挂载时数据回滚）
+  useEffect(() => {
+    return () => {
+      const latest = latestPersistRef.current
+      window.clearTimeout(persistTimer.current)
+      if (!latest.hydrated) return
+      void persistConversations(latest.conversations)
+      void persistActiveConvId(latest.activeConvId)
+    }
+  }, [])
+
+  // 加载自定义技能 / 指令（插件页导入/删除后重新进入本模块即刷新）
   useEffect(() => {
     let alive = true
     loadUserSkills()
@@ -472,20 +624,14 @@ export function ChatView({ rightSidebarCollapsed, onToggleRightSidebar, sidebarC
         if (alive) setCustomSkillEntries(skills.map(userSkillToEntry))
       })
       .catch(() => {})
+    loadUserCommands()
+      .then((cmds) => {
+        if (alive) setCustomCommandEntries(cmds.map(userCommandToEntry))
+      })
+      .catch(() => {})
     return () => {
       alive = false
     }
-  }, [])
-
-  // Close mode menu on outside click
-  useEffect(() => {
-    function handleClickOutside(e: MouseEvent) {
-      if (modeMenuRef.current && !modeMenuRef.current.contains(e.target as Node)) {
-        setShowModeMenu(false)
-      }
-    }
-    document.addEventListener('mousedown', handleClickOutside)
-    return () => document.removeEventListener('mousedown', handleClickOutside)
   }, [])
 
   // ── Agent 副作用确认 ────────────────────────────────────────────
@@ -516,6 +662,17 @@ export function ChatView({ rightSidebarCollapsed, onToggleRightSidebar, sidebarC
     [pendingApproval],
   )
 
+  // Close Ultra strategy menu on outside click
+  useEffect(() => {
+    function handleClickOutside(e: MouseEvent) {
+      if (ultraMenuRef.current && !ultraMenuRef.current.contains(e.target as Node)) {
+        setShowUltraMenu(false)
+      }
+    }
+    document.addEventListener('mousedown', handleClickOutside)
+    return () => document.removeEventListener('mousedown', handleClickOutside)
+  }, [])
+
   /** 把树中所有运行中的节点置为「已取消」（用户主动停止时调用）。 */
   const cancelRunningNodes = (tree: SwarmTreeNodeItem): SwarmTreeNodeItem => ({
     ...tree,
@@ -531,26 +688,25 @@ export function ChatView({ rightSidebarCollapsed, onToggleRightSidebar, sidebarC
     // 纪元 +1：本回复后续所有 chunk / 事件 / 看门狗回调全部失效
     sendEpochRef.current += 1
     setIsStreaming(false)
+    // 立即释放发送锁：旧流被 abort 后 finally 因纪元不匹配不会重置，这里主动释放避免卡死
+    sendingRef.current = false
     void window.electronAPI?.stopMessage?.()
+    // 遍历所有会话，终止任何正在流式生成的消息（用户可能在流式过程中切走了会话）
     setConversations((prev) =>
-      prev.map((c) =>
-        c.id === activeConvId
-          ? {
-              ...c,
-              messages: c.messages.map((m) =>
-                m.isStreaming === true
-                  ? {
-                      ...m,
-                      isStreaming: false,
-                      trace: m.trace !== undefined ? cancelRunningNodes(m.trace) : m.trace
-                    }
-                  : m
-              )
-            }
-          : c
-      )
+      prev.map((c) => ({
+        ...c,
+        messages: c.messages.map((m) =>
+          m.isStreaming === true
+            ? {
+                ...m,
+                isStreaming: false,
+                trace: m.trace !== undefined ? cancelRunningNodes(m.trace) : m.trace
+              }
+            : m
+        )
+      }))
     )
-  }, [activeConvId])
+  }, [])
 
   const scrollToBottom = useCallback(() => {
     if (scrollRef.current) {
@@ -564,17 +720,6 @@ export function ChatView({ rightSidebarCollapsed, onToggleRightSidebar, sidebarC
   useEffect(() => {
     scrollToBottom()
   }, [displayMessages, scrollToBottom])
-
-  const scrollToMessage = useCallback((messageId: string) => {
-    const el = messageRefs.current[messageId]
-    if (el && scrollRef.current) {
-      const viewport = scrollRef.current.querySelector('[data-radix-scroll-area-viewport]')
-      if (viewport) {
-        const top = el.offsetTop - viewport.clientHeight / 2 + el.clientHeight / 2
-        viewport.scrollTo({ top, behavior: 'smooth' })
-      }
-    }
-  }, [])
 
   const updateMessage = useCallback((convId: string, messageId: string, updater: (m: Message) => Message) => {
     setConversations((prev) =>
@@ -590,17 +735,84 @@ export function ChatView({ rightSidebarCollapsed, onToggleRightSidebar, sidebarC
     async (content: string, attachments?: Attachment[]) => {
       const trimmed = content.trim()
       if (!trimmed || isStreaming) return
+      if (sendingRef.current) return // 并发发送守卫：防止快速双击等场景下同时发起两次流式请求
+      sendingRef.current = true
+
+      // 最早捕获目标会话 id，防止后续 await（如历史压缩）期间用户切会话导致消息落到错误会话
+      const convId = activeConvId
+
+      // 斜杠「技能与指令」解析（统一在最前面做）
+      const slashMatch = resolveSlashInput(trimmed, slashEntries)
+
+      // 客户端特殊指令：由 clientAction 标记决定前端行为
+      if (slashMatch?.entry.clientAction === 'clear') {
+        const fresh = makeWelcomeConversation()
+        setConversations((prev) =>
+          prev.map((c) =>
+            c.id === convId
+              ? { ...c, title: '新对话', createdAt: fresh.createdAt, messages: fresh.messages }
+              : c
+          )
+        )
+        sendingRef.current = false
+        return
+      }
+
+      if (slashMatch?.entry.clientAction === 'help') {
+        const lines: string[] = ['以下是所有可用的斜杠指令与技能：\n']
+        const commands = slashEntries.filter((e) => e.kind === 'command')
+        const skills = slashEntries.filter((e) => e.kind === 'skill')
+        if (commands.length > 0) {
+          lines.push('**指令（Command）**')
+          for (const c of commands) {
+            lines.push(`- \`/${c.trigger}\` — ${c.description}${c.requiresArg ? '（需参数）' : ''}`)
+          }
+          lines.push('')
+        }
+        if (skills.length > 0) {
+          lines.push('**技能（Skill）**')
+          for (const s of skills) {
+            lines.push(`- \`/${s.trigger}\` — ${s.description}`)
+          }
+          lines.push('')
+        }
+        lines.push('用法：在输入框输入 `/触发词 参数` 即可调用。')
+        const helpText = lines.join('\n')
+        const userMessage: Message = {
+          id: `user-${Date.now()}`,
+          role: 'user',
+          content: trimmed,
+          timestamp: new Date()
+        }
+        const assistantMessage: Message = {
+          id: `assistant-${Date.now()}`,
+          role: 'assistant',
+          content: helpText,
+          timestamp: new Date()
+        }
+        setConversations((prev) =>
+          prev.map((c) =>
+            c.id === convId
+              ? { ...c, messages: [...c.messages, userMessage, assistantMessage] }
+              : c
+          )
+        )
+        sendingRef.current = false
+        return
+      }
+
       // 取本次回复的纪元号（同一时刻只允许一路流式）
       const sendId = ++sendEpochRef.current
 
-      const convId = activeConvId
-
-      // 斜杠「技能与指令」：命中注册表则展开为任务提示发给 Agent（气泡仍保留原文）。
-      const slashMatch = resolveSlashInput(trimmed, slashEntries)
+      // 指令/技能需要参数但用户没给
       if (slashMatch !== null && slashMatch.entry.requiresArg && slashMatch.args === '') {
         window.alert(`「/${slashMatch.entry.trigger}」需要参数。\n用法：${slashMatch.entry.usage}`)
+        sendingRef.current = false
         return
       }
+
+      // 上下文治理（M2）：滑动窗口历史 + 超限时对最旧部分摘要压缩（大会话才触发 LLM 压缩）
+      const outgoingHistory = await buildOutgoingHistory(activeConvRef.current)
 
       // Build full message with attachments
       let fullMessage = slashMatch === null ? trimmed : slashMatch.expanded
@@ -622,7 +834,7 @@ export function ChatView({ rightSidebarCollapsed, onToggleRightSidebar, sidebarC
         content: trimmed + (attachments && attachments.length > 0 ? `\n\n📎 ${attachments.length}个附件` : ''),
         timestamp: new Date()
       }
-      // 每条助手回复都预先挂一棵空事件树：标准 Agent / 蜂群的事件都长在这棵树上，
+      // 每条助手回复都预先挂一棵空事件树：Supervisor / 模块子 Agent 的事件都长在这棵树上，
       // 完成后内嵌在气泡里展示并随会话持久化（历史消息仍可点开复盘）。
       const assistantMessage: Message = {
         id: `assistant-${Date.now()}`,
@@ -634,7 +846,7 @@ export function ChatView({ rightSidebarCollapsed, onToggleRightSidebar, sidebarC
           node: {
             key: `trace:run:${Date.now()}`,
             kind: 'run',
-            title: agentMode === 'swarm' ? '蜂群执行过程' : 'Agent 执行过程'
+            title: 'Agent 执行过程'
           },
           children: []
         }
@@ -652,28 +864,29 @@ export function ChatView({ rightSidebarCollapsed, onToggleRightSidebar, sidebarC
         )
       )
 
-      // 一次新回复：重置产物收集 / 计划镜像 / 行节点序号（执行树在 assistantMessage.trace 上逐条生长）
-      swarmCollectRef.current = {}
-      swarmPlanRef.current = null
-      setSwarmPlan(null)
+      // 一次新回复：重置行节点序号（执行树在 assistantMessage.trace 上逐条生长）
       swarmEventSeq.current = 0
 
       setIsStreaming(true)
 
-      // 看门狗：模型长时间未开始回复时中止并提示。
-      // 蜂群要经历 规划→工蜂(可能限流自动退避重试)→汇总，单次可能远超 60s，单独放宽。
-      const stallMs = agentMode === 'swarm' ? 240_000 : 60_000
-      const stallTimer = window.setTimeout(() => {
+      // 看门狗：滚动超时——收到正文 token 或 Agent 过程事件即重置计时，只有连续 stallMs
+      // 无任何产出才中止。此前为固定 120s 一次性定时：长回复/工具往返一超时即被误杀
+      // （表现为主进程"回复被中止，已收到 N 字符"，正文正常流却被腰斩）。
+      // Supervisor 一次回复要经历 委派→模块子 Agent（可能限流自动退避重试）→汇总，放宽到 120s；
+      // Ultra 增强还要先跑策略子图（合议/批判迭代），正文迟迟未开始，再放宽到 360s。
+      const stallMs = ultraEnabled ? 360_000 : 120_000
+      const stallMsg = ultraEnabled
+        ? '错误: Ultra 增强在 6 分钟内未开始产出正文（增强子图可能较慢或失败）。可能原因：① 接口配额/网络不稳定，策略子图或模块 Agent 委派触发限流/超时；② 模型接口兼容问题。建议：先在「设置 → 模型管理」测试连接，等 1 分钟后再试，或临时关闭 Ultra / 换用「普通增强」。'
+        : '错误: Supervisor 在 2 分钟内未开始回复。可能原因：① 接口配额/网络不稳定，模块子 Agent 委派触发了限流或超时；② 模型接口兼容问题。建议：先在「设置 → 模型管理」测试连接，等 1 分钟后再试。'
+      let stallTimer: number | undefined
+      const stallFire = (): void => {
         // 已被停止/已开启新一轮回复：本次回复不再处理
         if (sendEpochRef.current !== sendId) return
         updateMessage(convId, assistantMessage.id, (m) => {
           if (m.content !== '') return m
           return {
             ...m,
-            content:
-              agentMode === 'swarm'
-                ? '错误: 蜂群在 4 分钟内未产出任何结果。可能原因：① 接口每分钟请求数配额太低，多个工蜂并发触发了限流；② 网络/接口不稳定。建议：先在「设置 → 模型管理」测试连接，等 1 分钟后再试，或临时改用标准模式。'
-                : '错误: 模型在 60 秒内未开始回复。请检查：① 网络与接口地址（「设置 → 模型管理」里可点测试连接）；② API Key 是否正确有效；③ 若仍复现，请把应用控制台/终端输出发来排查。',
+            content: stallMsg,
           }
         })
         // 超时中止同样把执行树里运行中的节点标为已取消
@@ -692,7 +905,13 @@ export function ChatView({ rightSidebarCollapsed, onToggleRightSidebar, sidebarC
           )
         )
         void window.electronAPI?.stopMessage?.()
-      }, stallMs)
+      }
+      /** 重新武装看门狗：正文 token 或 Agent 过程事件到达都视为"有进展"，重置计时。 */
+      const armStall = (): void => {
+        window.clearTimeout(stallTimer)
+        stallTimer = window.setTimeout(stallFire, stallMs)
+      }
+      armStall()
 
       try {
         if (window.electronAPI) {
@@ -704,21 +923,35 @@ export function ChatView({ rightSidebarCollapsed, onToggleRightSidebar, sidebarC
               // 已被停止/已开启新一轮回复：丢弃本回复剩余所有文本/事件 chunk
               if (sendEpochRef.current !== sendId) return
               // Agent 过程事件经同一 chunk 通道送达（前缀信封）：拆包应用到该回复消息的事件树，不进入正文。
-              if (chunk.startsWith(SWARM_EVENT_PREFIX)) {
+              if (chunk.startsWith(AGENT_EVENT_PREFIX)) {
                 try {
                   const event = JSON.parse(
-                    chunk.slice(SWARM_EVENT_PREFIX.length)
+                    chunk.slice(AGENT_EVENT_PREFIX.length)
                   ) as Parameters<typeof applyTraceEvent>[2]
                   applyTraceEvent(convId, assistantMessage.id, event)
+                  // M3：破坏性工具完成时记录「失效提醒」，供后续轮次过滤旧描述
+                  const reminder = reminderTextFromEvent(event)
+                  if (reminder !== null) void addConversationReminder(convId, reminder)
+                  // Agent 侧有活动（工具执行/阶段推进）也算进展，重置看门狗
+                  armStall()
                 } catch {
                   // 忽略无法解析的行程
                 }
                 return
               }
               fullContent += chunk
+              // 收到正文 token：有进展，重置看门狗
+              armStall()
               updateMessage(convId, assistantMessage.id, (m) => ({ ...m, content: fullContent }))
             },
-            agentMode
+            undefined,
+            {
+              // Ultra 增强控制器（可选增强层）：enabled 总开关 + 增强策略（auto 由 Ultra 自动选）
+              ultra: ultraEnabled ? { enabled: true, strategy: ultraStrategy } : undefined,
+              // 手动 / 技能直通：跳过 Agent 自动技能路由（正文已注入）
+              manual: slashMatch !== null,
+              ...(outgoingHistory.length > 0 ? { history: outgoingHistory } : {})
+            }
           )
         } else {
           // 浏览器降级：直接调用 LLM API
@@ -743,9 +976,7 @@ export function ChatView({ rightSidebarCollapsed, onToggleRightSidebar, sidebarC
           }
 
           const systemPrompt =
-            agentMode === 'swarm'
-              ? '你是 Mimir 蜂群模式的编排 Agent。拆解复杂任务并委派给子 Agent 协作完成。使用中文回复。'
-              : '你是 Mimir，一个以 Agent 为核心的科研助手。使用中文回复，保持专业且友好的语气。'
+            '你是 Mimir，一个以 Supervisor 编排架构工作的科研 Agent：复杂任务先拆解规划，需要工具或专业知识时委派给模块子 Agent，汇总后给出最终回答。使用中文回复，保持专业且友好的语气。'
           const baseUrl = (selected.baseUrl as string) || 'https://api.deepseek.com/v1'
           const apiUrl = baseUrl.replace(/\/+$/, '') + '/chat/completions'
 
@@ -783,28 +1014,16 @@ export function ChatView({ rightSidebarCollapsed, onToggleRightSidebar, sidebarC
         }))
       } finally {
         window.clearTimeout(stallTimer)
-        // 蜂群：把各子 Agent 的最终产出挂到该气泡的折叠区（执行树已内嵌在气泡上方）
-        if (agentMode === 'swarm') {
-          const sections = Object.values(swarmCollectRef.current)
-            .filter(
-              (row): row is SwarmRow & { text: string } =>
-                row.id !== 'scheduler' &&
-                row.id !== 'aggregate' &&
-                row.id !== 'main' &&
-                row.status === 'done' &&
-                typeof row.text === 'string' &&
-                row.text.trim() !== ''
-            )
-            .map((row) => ({ label: row.title, text: row.text }))
-          if (sections.length > 0) {
-            updateMessage(convId, assistantMessage.id, (m) => ({ ...m, swarmSections: sections }))
-          }
-        }
+        // 标记本条助手消息流式结束（无论纪元是否已过期都需执行，确保单条消息状态正确）
         updateMessage(convId, assistantMessage.id, (m) => ({ ...m, isStreaming: false }))
-        setIsStreaming(false)
+        // 仅当本流仍是当前纪元时才重置全局流状态——若用户已停止并发起新流，不得覆盖新流的状态
+        if (sendEpochRef.current === sendId) {
+          setIsStreaming(false)
+          sendingRef.current = false
+        }
       }
     },
-    [isStreaming, activeConvId, updateMessage, agentMode, slashEntries, applyTraceEvent]
+    [isStreaming, activeConvId, updateMessage, slashEntries, applyTraceEvent, ultraEnabled, ultraStrategy]
   )
 
   /** 重试：移除该条失败的助手消息，重新发送其前一条用户消息。 */
@@ -832,18 +1051,24 @@ export function ChatView({ rightSidebarCollapsed, onToggleRightSidebar, sidebarC
   )
 
   const handleNewChat = useCallback(() => {
-    const newConv = makeWelcomeConversation(agentMode)
+    const newConv = makeWelcomeConversation()
     setConversations((prev) => [newConv, ...prev])
     setActiveConvId(newConv.id)
-  }, [agentMode])
+  }, [])
 
   const handleDeleteConv = useCallback(
     (id: string) => {
+      // 异步清理该会话的归档历史与失效提醒键（跨空间串键 + 敏感内容残留）
+      const api = window.electronAPI
+      if (api?.setStoreValue) {
+        void api.setStoreValue(`${HISTORY_ARCHIVE_PREFIX}${id}`, [] as unknown[]).catch(() => {})
+        void api.setStoreValue(`${REMINDER_STORE_PREFIX}${id}`, [] as string[]).catch(() => {})
+      }
       setConversations((prev) => {
         const filtered = prev.filter((c) => c.id !== id)
         if (filtered.length === 0) {
           // 保留至少一个会话，避免空状态
-          const fresh = makeWelcomeConversation(agentMode)
+          const fresh = makeWelcomeConversation()
           setActiveConvId(fresh.id)
           return [fresh]
         }
@@ -853,7 +1078,7 @@ export function ChatView({ rightSidebarCollapsed, onToggleRightSidebar, sidebarC
         return filtered
       })
     },
-    [activeConvId, agentMode]
+    [activeConvId]
   )
 
   const handleTogglePin = useCallback((id: string) => {
@@ -876,14 +1101,6 @@ export function ChatView({ rightSidebarCollapsed, onToggleRightSidebar, sidebarC
     setRenamingId(null)
     setRenameValue('')
   }, [renamingId, renameValue])
-
-  const toggleMode = useCallback((mode: AgentMode) => {
-    setAgentMode(mode)
-    setShowModeMenu(false)
-  }, [])
-
-  const currentMode = MODE_CONFIG[agentMode]
-  const ModeIcon = currentMode.icon
 
   // Sort: pinned first, then by createdAt desc
   const sortedConversations = [...conversations].sort((a, b) => {
@@ -997,48 +1214,80 @@ export function ChatView({ rightSidebarCollapsed, onToggleRightSidebar, sidebarC
             <span className="text-[11px] text-muted-foreground">就绪</span>
           </div>
           <div className="flex items-center gap-1.5 no-drag">
-            {/* Mode selector */}
-            <div className="relative" ref={modeMenuRef}>
-              <button
-                onClick={() => setShowModeMenu(!showModeMenu)}
-                className={cn(
-                  'flex items-center gap-1.5 rounded-md px-2 py-1 text-[11px] font-medium transition-colors',
-                  agentMode === 'swarm'
-                    ? 'bg-amber-500/10 text-amber-600 hover:bg-amber-500/15'
-                    : 'text-muted-foreground hover:bg-accent hover:text-foreground'
+            {/* Ultra 二级：增强策略选择（开启后展示，放在 Ultra 左边） */}
+            {ultraEnabled && (
+              <div className="relative" ref={ultraMenuRef}>
+                <button
+                  type="button"
+                  onClick={() => setShowUltraMenu((v) => !v)}
+                  className="flex h-7 items-center gap-1 rounded-full bg-violet-500/10 px-2 text-[11px] font-medium text-violet-600 transition-colors hover:bg-violet-500/15 dark:text-violet-300"
+                  title="增强策略：自动选择 / 普通增强 / 多专家合议 / 批判迭代 / 混合增强 / 一致性投票"
+                >
+                  策略：{ULTRA_LABEL[ultraStrategy]}
+                  <ChevronDown className={cn('h-3 w-3 transition-transform', showUltraMenu && 'rotate-180')} />
+                </button>
+                {showUltraMenu && (
+                  <div className="absolute right-0 top-full mt-1 z-50 w-64 rounded-lg border border-border bg-popover p-1 shadow-md">
+                    {ULTRA_OPTIONS.map((opt) => {
+                      const active = ultraStrategy === opt.value
+                      return (
+                        <button
+                          key={opt.value}
+                          type="button"
+                          onClick={() => {
+                            setUltraStrategy(opt.value)
+                            setShowUltraMenu(false)
+                          }}
+                          className={cn(
+                            'flex w-full items-start gap-2 px-2.5 py-2 text-left rounded-md transition-colors',
+                            active ? 'bg-primary/5 text-primary' : 'hover:bg-accent'
+                          )}
+                        >
+                          <span
+                            className={cn(
+                              'mt-0.5 h-3 w-3 shrink-0 rounded-full border',
+                              active ? 'border-primary bg-primary' : 'border-muted-foreground/40'
+                            )}
+                            aria-hidden="true"
+                          />
+                          <span className="min-w-0">
+                            <span className="flex items-center gap-1.5 text-[12px] font-medium text-foreground">
+                              {opt.label}
+                              {opt.badge !== undefined && (
+                                <span className="rounded bg-violet-500/10 px-1 py-px text-[9px] font-medium text-violet-600 dark:text-violet-300">
+                                  {opt.badge}
+                                </span>
+                              )}
+                            </span>
+                            <span className="block text-[10px] leading-snug text-muted-foreground">{opt.desc}</span>
+                          </span>
+                        </button>
+                      )
+                    })}
+                  </div>
                 )}
-              >
-                <ModeIcon className="h-3.5 w-3.5" />
-                {currentMode.label}
-                <ChevronDown className={cn('h-3 w-3 transition-transform', showModeMenu && 'rotate-180')} />
-              </button>
-              {showModeMenu && (
-                <div className="absolute right-0 top-full mt-1 z-50 w-52 rounded-md border border-border bg-popover shadow-md">
-                  {(Object.keys(MODE_CONFIG) as AgentMode[]).map((mode) => {
-                    const cfg = MODE_CONFIG[mode]
-                    const Icon = cfg.icon
-                    return (
-                      <button
-                        key={mode}
-                        onClick={() => toggleMode(mode)}
-                        className={cn(
-                          'flex w-full items-start gap-2.5 px-3 py-2.5 text-left text-[12px] transition-colors',
-                          agentMode === mode
-                            ? 'bg-primary/5 text-primary'
-                            : 'hover:bg-accent'
-                        )}
-                      >
-                        <Icon className={cn('h-4 w-4 mt-0.5 shrink-0', mode === 'swarm' ? 'text-amber-500' : 'text-muted-foreground')} />
-                        <div>
-                          <div className="font-medium">{cfg.label}</div>
-                          <div className="text-[10px] text-muted-foreground mt-0.5">{cfg.description}</div>
-                        </div>
-                      </button>
-                    )
-                  })}
-                </div>
+              </div>
+            )}
+
+            {/* Ultra 增强总开关 */}
+            <button
+              type="button"
+              onClick={() => setUltraEnabled((v) => !v)}
+              className={cn(
+                'flex h-7 items-center gap-1 rounded-full px-2.5 text-[11px] font-medium transition-all',
+                ultraEnabled
+                  ? 'ultra-active text-white'
+                  : 'text-muted-foreground hover:bg-accent hover:text-foreground'
               )}
-            </div>
+              title={
+                ultraEnabled
+                  ? 'Ultra 增强已开启（策略：' + ULTRA_LABEL[ultraStrategy] + '）。点击关闭增强。'
+                  : 'Ultra：Supervisor 之上的增强层——长程规划 + 增强策略调度（多专家合议只是可选项之一）。开启成本更高。'
+              }
+            >
+              <Sparkles className={cn('h-3.5 w-3.5', ultraEnabled && 'animate-pulse')} />
+              Ultra
+            </button>
 
             {/* Right sidebar toggle - only shown when sidebar is collapsed */}
             {rightSidebarCollapsed && (
@@ -1054,15 +1303,7 @@ export function ChatView({ rightSidebarCollapsed, onToggleRightSidebar, sidebarC
         <ScrollArea ref={scrollRef} className="flex-1 px-4">
           <div className="mx-auto max-w-3xl py-6 space-y-4">
             {displayMessages.map((message) => (
-              <div
-                key={message.id}
-                ref={(el) => {
-                  messageRefs.current[message.id] = el
-                }}
-                onClick={() => scrollToMessage(message.id)}
-                className="group/message cursor-pointer rounded-lg transition-colors"
-                title="点击跳转到此消息"
-              >
+              <div key={message.id} className="group/message rounded-lg transition-colors">
                 <MessageBubble
                   message={message}
                   onRetry={
@@ -1117,7 +1358,7 @@ export function ChatView({ rightSidebarCollapsed, onToggleRightSidebar, sidebarC
             </div>
           </div>
         )}
-        <ChatInput onSend={handleSend} onStop={handleStop} entries={slashEntries} disabled={isStreaming} isStreaming={isStreaming} agentMode={agentMode} />
+        <ChatInput onSend={handleSend} onStop={handleStop} entries={slashEntries} disabled={isStreaming} isStreaming={isStreaming} ultraEnabled={ultraEnabled} ultraStrategyLabel={ULTRA_LABEL[ultraStrategy]} />
       </div>
 
       {/* Right Sidebar - Conversation list */}
@@ -1125,7 +1366,12 @@ export function ChatView({ rightSidebarCollapsed, onToggleRightSidebar, sidebarC
         collapsed={rightSidebarCollapsed}
         onToggle={onToggleRightSidebar}
         headerActions={
-          <Button onClick={handleNewChat} variant="ghost" size="sm" className="h-7 text-[11px]">
+          <Button
+            onClick={handleNewChat}
+            variant="ghost"
+            size="sm"
+            className="no-drag h-7 text-[11px]"
+          >
             <Plus className="h-3.5 w-3.5" />
             新对话
           </Button>

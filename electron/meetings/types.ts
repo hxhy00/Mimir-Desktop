@@ -3,7 +3,7 @@
  *
  * 数据来源：文献库 `library:papers` / `library:projects` 与实验模块
  * `experiments:list`（均存于 store.json）。产物为真实 .pptx，落在
- * `userData/meetings/`，文件系统为真相；元信息存 store key `meetings:index`。
+ * 空间根 `meetings/`，文件系统为真相；元信息存 store key `meetings:index`。
  */
 
 export type ExperimentStatus = 'running' | 'success' | 'failed'

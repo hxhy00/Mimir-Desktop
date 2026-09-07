@@ -11,6 +11,9 @@
 
 export type SlashKind = 'command' | 'skill'
 
+/** 客户端特殊动作标记（不走 Agent，由前端直接处理）。 */
+export type ClientAction = 'clear' | 'help'
+
 /** 注册表条目：一条指令或一个技能。 */
 export interface SlashEntry {
   /** 触发词（不含 `/`），如 research-lit-review */
@@ -30,6 +33,8 @@ export interface SlashEntry {
   readonly requiresArg: boolean
   /** 把本次参数展开成发给 Agent 的任务提示全文。 */
   readonly compose: (args: string) => string
+  /** 标记为客户端命令时，ChatView 走对应分支处理而不发 Agent。 */
+  readonly clientAction?: ClientAction
 }
 
 /** `/trigger 参数` 的解析结果；未命中任何条目时为 null。 */

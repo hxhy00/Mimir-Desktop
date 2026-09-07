@@ -265,7 +265,7 @@ export function deleteProject(id: string): void {
 
 /**
  * 把论文追加到项目的 references.bib（跳过已存在的引用键）。
- * 项目有 paperDir 时写入该目录；否则写入 userData/projects/<id>/references.bib。
+ * 项目有 paperDir 时写入该目录；否则写入空间根 projects/<id>/references.bib。
  */
 export async function importPapersToBib(
   projectId: string,

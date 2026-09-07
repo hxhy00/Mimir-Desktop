@@ -1,7 +1,8 @@
 import { tool } from 'langchain/tools'
 import { z } from 'zod'
 import { importPaper, updatePaper, listProjects } from '../../library/libraryService'
-import { getStoreValue } from '../../library/store'
+import { getStoreValue, currentSpaceEpoch, assertSpaceUnchanged } from '../../library/store'
+import { requireUserApproval } from '../approval'
 import type { ArxivEntry } from '../../library/types'
 
 /**
@@ -11,6 +12,7 @@ import type { ArxivEntry } from '../../library/types'
 export const paperFetchTool = tool(
   async ({ arxivId, projectId, notes, tags }) => {
     try {
+      const epoch = currentSpaceEpoch()
       const id = arxivId.trim().replace(/^https?:\/\/arxiv\.org\/abs\//, '')
       if (!id) return '无效的 arXiv id。'
       const url = `https://export.arxiv.org/api/query?id_list=${encodeURIComponent(id)}&max_results=1`
@@ -33,17 +35,30 @@ export const paperFetchTool = tool(
         targetProjectId = projects[0]?.id
       }
 
+      assertSpaceUnchanged(epoch)
+
+      // 副作用确认：保存论文到文献库
+      const allowed = await requireUserApproval({
+        tool: 'paper_fetch',
+        summary: `保存论文「${entry.title.slice(0, 60)}」到文献库`,
+        detail: `arXiv id: ${id}\n作者: ${entry.authors.join(', ')}${targetProjectId ? `\n关联项目: ${targetProjectId}` : ''}`,
+      })
+      if (!allowed) return '已取消：保存论文操作未获得用户确认。'
+
       await importPaper(entry, targetProjectId)
+      assertSpaceUnchanged(epoch)
 
       // 附加笔记（追加到现有笔记）
       if (notes && notes.trim()) {
         const current = await getPaperNotes(id)
         await updatePaper({ arxivId: id, notes: current ? `${current}\n\n${notes.trim()}` : notes.trim() })
+        assertSpaceUnchanged(epoch)
       }
       // 附加标签
       if (tags && tags.length > 0) {
         const current = await getPaperTags(id)
         await updatePaper({ arxivId: id, tags: [...new Set([...current, ...tags.map((t) => t.trim()).filter(Boolean)])] })
+        assertSpaceUnchanged(epoch)
       }
 
       return `论文已保存到文献库: ${entry.title}\n- arXiv id: ${id}\n- 作者: ${entry.authors.join(', ')}\n- 链接: ${entry.url}`
@@ -71,6 +86,7 @@ export const paperFetchTool = tool(
 export const setPaperTool = tool(
   async ({ arxivId, tags, notes, projectId, relevanceScore, relevanceReason }) => {
     try {
+      const epoch = currentSpaceEpoch()
       const id = arxivId.trim().replace(/^https?:\/\/arxiv\.org\/abs\//, '')
       if (!id) return '无效的 arXiv id。'
 
@@ -84,7 +100,23 @@ export const setPaperTool = tool(
           reason: relevanceReason ?? ''
         }
       }
+
+      assertSpaceUnchanged(epoch)
+
+      // 副作用确认：更新论文
+      const parts: string[] = []
+      if (tags !== undefined) parts.push(`标签: ${tags.join(', ') || '(清空)'}`)
+      if (notes !== undefined) parts.push(`笔记: ${notes ? '已设置' : '(清空)'}`)
+      if (projectId !== undefined && relevanceScore !== undefined) parts.push(`项目 ${projectId} 相关性: ${relevanceScore}/10`)
+      const allowed = await requireUserApproval({
+        tool: 'set_paper',
+        summary: `更新论文 ${id}`,
+        detail: parts.join('\n') || '无变更',
+      })
+      if (!allowed) return '已取消：更新论文操作未获得用户确认。'
+
       const updated = await updatePaper(patch)
+      assertSpaceUnchanged(epoch)
       return `论文已更新: ${updated.title}\n- 标签: ${updated.tags.join(', ') || '无'}\n- 笔记: ${updated.notes ? '已设置' : '无'}\n- 相关性评分: ${updated.relevance?.[projectId ?? ''] ? `${updated.relevance[projectId!].score}/10` : '未设置'}`
     } catch (error) {
       return `更新论文失败: ${error instanceof Error ? error.message : '未知错误'}`

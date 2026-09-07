@@ -1,5 +1,5 @@
 /**
- * 图表管理域服务：把上传的图片以原始二进制落到 userData/figures/，
+ * 图表管理域服务：把上传的图片以原始二进制落到空间根 figures/，
  * 元信息记录在 store key `figures:list`。渲染进程通过自定义协议
  * `mimir-img://figures/<fileName>` 按需读取图片内容（避免 base64 落 store）。
  */
@@ -116,9 +116,6 @@ export async function listFigures(): Promise<FigureRecord[]> {
       createdAt: meta?.createdAt ?? stats.birthtime.toISOString(),
     })
   }
-  // 磁盘上已被外部删除的记录无需保留
-  const stale = index.filter((record) => !files.includes(record.fileName))
-  if (stale.length > 0) writeIndex(index.filter((record) => files.includes(record.fileName)))
   return list.sort((a, b) => b.createdAt.localeCompare(a.createdAt))
 }
 

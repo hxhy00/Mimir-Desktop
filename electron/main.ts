@@ -147,7 +147,7 @@ app.whenReady().then(async () => {
     }
   })
 
-  // 注册 mimir-img:// 自定义协议：iframe/img 内联展示 userData/figures 下的图片
+  // 注册 mimir-img:// 自定义协议：iframe/img 内联展示空间根 figures/ 下的图片
   // URL 形态：mimir-img://figures/<encodeURIComponent(fileName)>
   protocol.handle('mimir-img', (request) => {
     try {

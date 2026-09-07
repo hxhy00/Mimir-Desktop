@@ -4,7 +4,8 @@
 
 ## 功能特性
 
-- **Agent 对话**：以 DeepAgents 为核心的自然语言交互，支持 Markdown 渲染、流式输出、会话管理，会话历史（含重命名/置顶）本地持久化
+- **Agent 对话**：以 DeepAgents 为核心的自然语言交互，采用 **Supervisor 编排架构**——主管 Agent 会把文献/论文/实验/组会/服务器等专业任务按需委派给对应模块子 Agent 协作完成并汇总作答；支持 Markdown 渲染、流式输出、气泡内执行过程轨迹卡、会话管理，会话历史（含重命名/置顶）本地持久化；提供可选的 **Ultra 增强控制器**（Supervisor 之上的增强层总开关：自动或手动选择增强策略——`普通增强`仅长程规划、`多专家合议`K 路评审→共识/分歧→反思、`批判迭代`草稿→批判→修订循环、`混合增强`关键判断点合议+整体批判反思、`一致性投票`轻量 SC 选最优；策略带 cost 标签，会话上下文过长时自动降级，选型可被事件轨迹回溯；执行动作全部下沉 Supervisor，分歧/待验证点由模块子 Agent 工具核验后作答；默认关闭以控制 token 消耗）；**会话上下文治理**：发送时携带最近对话为滑动窗口，超阈值自动把更早对话压缩为结构化摘要（原文归档可回看），工具返回与各增强子图产物不沉淀进历史；删除/改名等破坏性操作会产生会话级「失效提醒」防止跨轮复述旧对象；全局长期记忆档案默认不注入、仅按需读取；另有**永久层身份常量**（「设置 → 身份与默认值」维护科研身份/交互与写作语言等几乎不变的身份事实），配置后作为极小 system 段每轮恒定注入、保存即生效，默认不注入任何内容，自动学习永不写入该层（详见 `docs/agent-context-governance.md`）
+- **技能分层路由（Skill Router）**：技能以元数据注册（L3 目录 / tags / 适用边界 / 反例 / 成本 / 会话次数），每轮 Meta-Cognition 意图识别 → 规则粗召回 →（可配）LLM 精排 → 只把 **top-K 候选**注入 Supervisor，替换原先全量技能目录注入；手动 `/技能` 直通绕过；自定义技能缺字段自动推导、关键字段缺失拒绝注册；开关在「设置 → 技能路由」（详见 `docs/skill-routing.md`）
 - **文献库**：arXiv + Web 双来源搜索，项目关联、标签、AI 相关性评分、内嵌 PDF 阅读器 + 阅读笔记、BibTeX 导出、arXiv 订阅、Zotero 集成
 - **论文编辑**：以文件夹为项目的 LaTeX 工作区——打开/新建论文项目，管理 `main.tex` 与章节文件的多标签编辑（语法高亮 + 行号跳转），一键用 latexmk / Tectonic 真实编译，错误/警告诊断点击跳转行，编译产物 `main.pdf` 内嵌预览；引擎缺失时可在「设置 → 资源下载」中下载内置 Tectonic 单文件引擎
 - **论文增强**：编译成功后自动快照项目（列表对比 main.tex 差异并可一键回退），错误行一键 AI 修复并自动重编译，references.bib 结构化编辑，会议排版模板注入（template/TEMPLATE.md）
@@ -91,6 +92,8 @@ pnpm typecheck
 |---|---|
 | `arxiv_search` | 搜索 arXiv 学术论文 |
 | `arxiv_fetch_paper` | 按 id 读取单篇论文完整元数据（不写入文献库） |
+| `library_search` | 检索文献库内已收藏论文：标题/摘要/标签/阅读笔记关键词命中（只读，按需返回片段） |
+| `wiki_search` | 检索当前科研空间的 Wiki 笔记：标题/正文关键词命中（只读，按需返回片段） |
 | `web_search` | 搜索网页获取最新信息 |
 | `wiki_note` | 创建/追加 Wiki 研究笔记 |
 | `paper_fetch` | 获取 arXiv 论文并自动保存到文献库（关联项目） |
@@ -102,8 +105,11 @@ pnpm typecheck
 | `meeting_deck` | 生成组会 .pptx（复用组会模块，可选 AI 要点/配图）或列出历史 |
 | `ledger` | 操作成长记录：list / create / delete（副作用先确认） |
 | `figure` | 操作图表库：list / add(磁盘路径) / rename(同步 .tex) / remove |
+| `load_memory` | 按需读取全局长期记忆档案（研究方向/常用约束/常用事实，于「设置 → 长期记忆」维护，默认不注入） |
 
 > 副作用确认：写盘/长耗时的桥工具（experiment / ledger / figure / latex_compile / meeting_deck）在执行前会向聊天区推送「批准卡片」，用户允许后才真正执行；拒绝或 120s 未响应自动取消。
+>
+> 调试 Agent：主进程会输出模型层 `[agent-trace]` 日志（每个 ChatModel 请求的上下文、tool_calls、耗时与 token）并落盘 `~/.mimir/logs/agent-trace-*.jsonl`，级别经 `MIMIR_AGENT_TRACE` 或 `settings.agentTraceLevel` 控制（off/compact/full），用法见 `docs/agent-debug.md`。
 
 ## 技能与指令
 
@@ -112,11 +118,13 @@ pnpm typecheck
 - **指令**：`/research-idea <方向>` 科研开题 · `/research-plan [课题]` 实验方案 · `/paper-write [主题]` 论文写作 · `/paper-compile` 编译诊断 · `/research-review` 论文评审
 - **技能**：`/research-pipeline` 全流程管线 · `/research-lit-review <方向>` 文献综述 · `/research-novelty-check <想法>` 查新 · `/research-experiment-plan` 实验设计 · `/research-result-to-claim` 结果到结论 · `/research-paper-drafting` 论文逐节起草 · `/research-paper-deai` 去 AI 味 · `/research-citation-audit` 引用审计 · `/research-rebuttal` 回复审稿 · `/research-figure-plan` 配图规划 · `/research-meeting-deck` 组会汇报
 
-### 自定义技能（设置 → 技能管理）
+### 插件管理（插件模块：技能 / 子代理 / 插件 / Hooks）
 
-「设置 → 技能管理」可查看全部技能详情、导入/删除自定义技能：
+左侧栏「设置」上方的「插件」模块统一管理四类能力（增删改查 + 启停开关，均本地持久化）：
 
-- 内置 research-* 技能只读；**自定义技能**支持弹窗导入（手动表单或粘贴 JSON）与删除，导入即在本机落盘并立即生效（无需点「保存设置」），增删后重新进入「对话」模块自动刷新斜杠菜单。
+- **技能**：内置 research-* 技能只读；**自定义技能**支持弹窗导入（手动表单或粘贴 JSON）与删除，导入即在本机落盘并立即生效（无需点「保存设置」），增删后重新进入「对话」模块自动刷新斜杠菜单；
+- **子代理**：Supervisor 可委派模块子代理的管理界面——内置 5 个科研 worker（文献/论文/实验/组会/服务器）只读展示、支持「克隆」改造；支持 **AI 生成**：用一句话描述职责即可生成 name / 说明 / 系统提示词 / 工具白名单草稿；自定义子代理可增删改查 + 启停，从**内置工具白名单**（15 个，含 arxiv_search / paper_fetch / latex_compile / meeting_deck 等）勾选工具并自写 systemPrompt/说明；保存或切换启停后自动「重载 Agent」（主进程按 `electron/agent/subagentRegistry.ts` 重建 Supervisor），免重启生效；name 全局唯一校验、未启用项不注册，写盘等副作用仍走批准卡；
+- **插件 / Hooks**：提供注册与管理界面（启用开关、描述、配置等），配置留待运行时扩展消费。
 - 输入 `/trigger 参数` 即可调用自定义技能；参数会替换任务正文中的 `{{args}}` 占位符（正文无占位符时参数前置为「本次任务对象」，未带参数时正文给出澄清提示）。
 - 自定义技能在菜单中与内置技能并列展示，仍以 `skill` 语义展开为任务提示注入 Agent（L0，无文件副作用）。
 
@@ -139,5 +147,5 @@ pnpm typecheck
 - [x] 可展开侧边栏
 - [x] LaTeX 论文项目管理（打开/新建项目、多 .tex 标签编辑、语法高亮、诊断跳转、内嵌 PDF 预览；依赖本机 latexmk 或 Tectonic）
 - [x] 组会 PPT 实际生成（pptxgenjs 确定性渲染 + 可选 LLM 要点提炼）
-- [x] 蜂群模式（调度/执行分离：蜂王将请求拆成带依赖的 DAG 子任务，就绪任务分波并发、上层等待依赖产物；界面含实时调度状态条与分任务产出折叠区）
+- [x] Supervisor 编排架构（主管 Agent + 模块子 Agent：文献/论文/实验/组会/服务器按需委派、结果汇总作答；界面含执行过程轨迹卡）
 - [ ] 数据持久化（SQLite）

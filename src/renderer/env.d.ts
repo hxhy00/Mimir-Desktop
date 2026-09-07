@@ -3,22 +3,49 @@
 interface ElectronAPI {
   getAppVersion: () => Promise<string>
   getPlatform: () => string
-  sendMessage: (message: string, conversationId: string, mode?: 'normal' | 'swarm') => Promise<string>
+  sendMessage: (message: string, conversationId: string) => Promise<string>
   streamMessage: (
     message: string,
     conversationId: string,
     onChunk: (chunk: string) => void,
-    mode?: 'normal' | 'swarm',
-    onSwarmStatus?: (event: {
+    onWorkerEvent?: (event: {
       taskId: string
       title: string
       status: 'running' | 'done' | 'error'
       text?: string
-      kind?: 'phase' | 'task' | 'tool' | 'think'
-      detail?: { id: string; title: string; role: 'researcher' | 'analyst' | 'writer'; dependsOn: string[] }[]
-    }) => void
+      kind?: 'phase' | 'task' | 'tool' | 'think' | 'think-token'
+    }) => void,
+    options?: {
+      ultra?: {
+        enabled: boolean
+        strategy?: 'auto' | 'plain' | 'multi_expert' | 'critique_reflect' | 'hybrid_mix' | 'self_consistency_vote'
+      }
+      history?: { role: 'user' | 'assistant'; content: string }[]
+      manual?: boolean
+    }
   ) => Promise<string>
+  compressConversation: (history: { role: 'user' | 'assistant'; content: string }[]) => Promise<{
+    ok: boolean
+    summary?: string
+    message?: string
+  }>
   stopMessage: () => Promise<boolean>
+  /** 「插件 → 子代理」只读目录：工具白名单 + 内置子代理元数据（展示 / 克隆用）。 */
+  getSubagentCatalog: () => Promise<{
+    tools: { id: string; label: string; description: string }[]
+    builtin: { id: string; label: string; description: string; systemPrompt: string; toolIds: string[] }[]
+  }>
+  /** 按最新子代理注册重新初始化 Agent（增删改查后免重启生效）。 */
+  reloadAgent: () => Promise<{ ok: boolean; message: string }>
+  /** 一句话职责描述 → AI 生成自定义子代理草稿（name/说明/提示词/工具白名单）。 */
+  generateSubagent: (
+    prompt: string,
+    takenNames: string[]
+  ) => Promise<{
+    ok: boolean
+    draft?: { name: string; label: string; description: string; systemPrompt: string; toolIds: string[] }
+    message?: string
+  }>
   getSettings: () => Promise<Record<string, unknown>>
   setSettings: (settings: Record<string, unknown>) => Promise<void>
   transcribeLocal: (audioBase64: string) => Promise<{ text?: string; error?: string }>

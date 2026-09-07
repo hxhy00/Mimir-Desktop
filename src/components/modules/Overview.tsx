@@ -154,7 +154,7 @@ export function Overview({ onNavigate }: OverviewProps) {
           {hasContent ? (
             <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
               <ArrowRight className="h-3 w-3" />
-              数据来自文献库 / 实验管理 / 成长记录，保持实时同步
+              数据来自文献库 / 实验管理 / 成长记录，切回此页时自动刷新
             </div>
           ) : (
             <div>

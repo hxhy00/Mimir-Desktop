@@ -5,7 +5,7 @@
  */
 import { tool } from 'langchain/tools'
 import { z } from 'zod'
-import { getStoreValue, setStoreValue } from '../../library/store'
+import { getStoreValue, setStoreValue, currentSpaceEpoch, assertSpaceUnchanged } from '../../library/store'
 import { requireUserApproval } from '../approval'
 
 export type ExperimentStatus = 'running' | 'success' | 'failed'
@@ -63,6 +63,7 @@ function describe(list: ExperimentRecord[]): string {
 export const experimentTool = tool(
   async ({ action, name, status, metrics, serverId, id }) => {
     try {
+      const epoch = currentSpaceEpoch()
       const list = load()
       if (action === 'list') return describe(list)
 
@@ -101,6 +102,7 @@ export const experimentTool = tool(
           ...(serverId ? { serverId } : {}),
           updatedAt: now,
         }
+        assertSpaceUnchanged(epoch)
         save([record, ...list])
         return `已创建实验 ${record.id}「${record.name}」。`
       }
@@ -119,6 +121,7 @@ export const experimentTool = tool(
           serverId: serverId === undefined ? target.serverId : (serverId === '' ? undefined : serverId),
           updatedAt: new Date().toISOString(),
         }
+        assertSpaceUnchanged(epoch)
         save(list.map((exp) => (exp.id === id ? next : exp)))
         return `已更新实验 ${next.id}「${next.name}」→ [${STATUS_LABEL[next.status]}]。`
       }
@@ -126,6 +129,7 @@ export const experimentTool = tool(
       if (action === 'delete') {
         const target = list.find((exp) => exp.id === id)
         if (target === undefined) return `删除失败：找不到实验 id「${id}」。`
+        assertSpaceUnchanged(epoch)
         save(list.filter((exp) => exp.id !== id))
         return `已删除实验 ${target.id}「${target.name}」。`
       }
