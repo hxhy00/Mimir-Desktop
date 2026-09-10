@@ -161,6 +161,18 @@ export interface ElectronAPI {
 
   // Model connectivity test
   testModel: (config: { baseUrl: string; modelId: string; apiKey: string }) => Promise<{ ok: boolean; message: string }>
+  /** OpenAI 兼容端点模型发现：按 baseUrl + apiKey 拉取 /v1/models。 */
+  listModels: (config: { baseUrl: string; apiKey: string }) => Promise<{
+    ok: boolean
+    message?: string
+    models?: { id: string; ownedBy?: string }[]
+    endpoint?: string
+  }>
+  // Harness 管理（Issue 1）
+  harness: {
+    list: () => Promise<{ harnesses: { id: string; name: string; kind: string; available: boolean }[]; activeId: string }>
+    setActive: (id: string) => Promise<{ ok: boolean; activeId?: string; message?: string }>
+  }
 
   // Dialog
   showOpenDialog: (options: Electron.OpenDialogOptions) => Promise<Electron.OpenDialogReturnValue>
@@ -392,6 +404,13 @@ const electronAPI: ElectronAPI = {
   setSettings: (settings) => ipcRenderer.invoke('settings:set', settings),
 
   testModel: (config) => ipcRenderer.invoke('model:test', config),
+
+  listModels: (config) => ipcRenderer.invoke('model:list', config),
+
+  harness: {
+    list: () => ipcRenderer.invoke('harness:list'),
+    setActive: (id: string) => ipcRenderer.invoke('harness:set', id)
+  },
 
   showOpenDialog: (options) => ipcRenderer.invoke('dialog:open', options),
   showSaveDialog: (options) => ipcRenderer.invoke('dialog:save', options),
