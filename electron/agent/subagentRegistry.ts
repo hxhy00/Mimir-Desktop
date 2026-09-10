@@ -24,6 +24,7 @@ import { ledgerTool } from './tools/ledger'
 import { figureTool } from './tools/figures'
 import { librarySearchTool } from './tools/librarySearch'
 import { wikiSearchTool } from './tools/wikiSearch'
+import { readDirTool, readFileTool, writeFileTool } from './tools/files'
 
 /** 自定义子代理在 store 中的键名（渲染层 Plugins 面板写入同一 key）。 */
 export const SUBAGENT_STORE_KEY = 'plugins:subagents'
@@ -57,6 +58,9 @@ export const WORKER_TOOL_CATALOG: WorkerToolMeta[] = [
   { id: 'figure', label: '图表库管理', description: '论文配图列出/添加/重命名/删除（写操作）' },
   { id: 'wiki_search', label: 'Wiki 检索', description: '检索研究笔记片段' },
   { id: 'wiki_note', label: 'Wiki 笔记', description: '创建/追加研究笔记（写操作）' },
+  { id: 'read_dir', label: '目录列表', description: '只读列出本地目录内的文件与文件夹（空间外需批准）' },
+  { id: 'read_file', label: '读取文本文件', description: '只读读取本地文本文件内容（空间外需批准）' },
+  { id: 'write_file', label: '写入文档', description: '把 Markdown/文本创建或覆盖写入指定路径（写操作需批准）' },
   { id: 'experiment', label: '实验记录', description: '实验模块记录/指标/进度操作（写操作需批准）' },
   { id: 'ledger', label: '成长记录', description: '成长/里程碑时间线操作（写操作需批准）' },
   { id: 'meeting_deck', label: '组会 PPT 生成', description: '从论文/实验生成汇报 .pptx（落盘，需批准）' },
@@ -78,7 +82,10 @@ const TOOL_BY_ID: Record<string, unknown> = {
   experiment: experimentTool,
   ledger: ledgerTool,
   meeting_deck: meetingDeckTool,
-  server_status: serverStatusTool
+  server_status: serverStatusTool,
+  read_dir: readDirTool,
+  read_file: readFileTool,
+  write_file: writeFileTool
 }
 
 /** 把工具 id 白名单解析为真实工具实例（未知 id 静默丢弃）。 */
@@ -160,6 +167,23 @@ export const BUILTIN_SUBAGENTS: BuiltinSubAgent[] = [
 
 纪律：只做只读查询与状态解读，不执行任何远程改动；返回结构化中文结果（服务器名/状态/GPU 利用率与显存）。`,
     toolIds: ['server_status']
+  },
+  {
+    id: 'files',
+    label: '文件 Agent',
+    description: '读写本地磁盘文件：读取用户目录/项目里的文本文件与清单、把调研/综述/评审等结论写成指定路径文档（写与空间外读需用户批准）',
+    systemPrompt: `你是 Mimir 科研工作台中的「文件 Agent」。你负责在用户明确给出路径时，把本机磁盘文件纳入处理上下文，或把 Agent 产出落成文档。职责：
+- 用 read_dir 列出某个目录下有哪些文件/文件夹，先探清结构再决定读哪个；
+- 用 read_file 读取某个文本文件（.md/.txt/.tex/.py/.json 等）的内容，把草稿、已有笔记、配置等拿进上下文分析；
+- 用 write_file 把一段 Markdown/文本创建或覆盖写入用户指定的完整目标路径（例如把调研结论、综述、评审意见存成一份 .md）。
+
+工作纪律（重要）：
+- 绝不臆造或猜测路径：每个路径都必须来自用户明确给出，或来自刚才 read_dir/read_file 的真实返回；拿不准时先向用户确认完整绝对路径。
+- 读取当前科研空间内的文件一般免批准；读取科研空间之外（如任意项目文件夹、系统目录）会弹批准卡，须等用户放行后再执行，用户拒绝就如实说明并停下。
+- 任何写入都会弹批准卡让你把目标文件路径与内容给用户确认；不得未经批准落盘，也不得擅自改用户已有文件。写入前先读该文件、若内容较长或可能覆盖用户原稿，先提示用户。
+- 只处理文本/文档；二进制、图片（配图请走 figure）、超大文件不读入，需读取时如实给用户体验提示。
+- 输出中文，已读内容简短概括要点再继续后续处理，不要无谓整篇复述。`,
+    toolIds: ['read_dir', 'read_file', 'write_file']
   }
 ]
 

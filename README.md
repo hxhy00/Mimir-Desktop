@@ -1,90 +1,146 @@
-# Mimir Desktop
+<p align="center">
+  <img src="src/assets/logo.png" alt="Mimir Desktop" width="120" />
+</p>
 
-以 Agent 为核心的科研工作台，基于 Electron + React + DeepAgents 构建。
+<h1 align="center">Mimir Desktop</h1>
+
+<p align="center"><b>以 Agent 为核心的一站式科研工作台 · 桌面版</b></p>
+
+<p align="center">文献 · 论文 · 实验 · 图表 · 组会 · 会议截稿 · GPU 服务器 · Agent 语音 —— 覆盖科研全生命周期</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/Electron-33-blue" alt="Electron" />
+  <img src="https://img.shields.io/badge/React-18-blueviolet" alt="React" />
+  <img src="https://img.shields.io/badge/TypeScript-blue" alt="TypeScript" />
+  <img src="https://img.shields.io/badge/DeepAgents-purple" alt="DeepAgents" />
+  <img src="https://img.shields.io/badge/License-MIT-green" alt="License" />
+</p>
+
+> **Mimir Desktop** 是 [dsh-Mimir-Academic-research](https://github.com/1692775560/dsh-Mimir-Academic-research)（Mimir 的一站式科研工作台）的**独立桌面发行版**。
+> 父项目以 DeepSeek Harness (dsh) 为宿主、以插件形态运行于 `dsh web`；本项目把它工程化重写为**开箱即用的 Electron 桌面应用** ——
+> 自带主进程 / 渲染进程 / IPC 与本地协议层，无需安装 dsh、无需自起后端，下载安装即可启动。
+
+---
+
+## 演示视频
+
+> **尚未录制** —— 此处为预留插槽。录制后把下方 `<source src>` 替换为实际地址即可显示。
+> 两种放法任选其一：
+> - **本地文件**：将影片放入仓库（如 `docs/demo.mp4`），并把 `src` 改为 `docs/demo.mp4`；
+> - **在线直链**：上传到公网后填写直链。
+
+```html
+<video controls width="820">
+  <source src="PATH_TO_YOUR_VIDEO.mp4" type="video/mp4" />
+  你的浏览器不支持 video 标签。
+</video>
+```
+
+> 你也可以在其中夹层展示应用截图作静态预览。
+
+---
 
 ## 功能特性
 
-- **Agent 对话**：以 DeepAgents 为核心的自然语言交互，采用 **Supervisor 编排架构**——主管 Agent 会把文献/论文/实验/组会/服务器等专业任务按需委派给对应模块子 Agent 协作完成并汇总作答；支持 Markdown 渲染、流式输出、气泡内执行过程轨迹卡、会话管理，会话历史（含重命名/置顶）本地持久化；提供可选的 **Ultra 增强控制器**（Supervisor 之上的增强层总开关：自动或手动选择增强策略——`普通增强`仅长程规划、`多专家合议`K 路评审→共识/分歧→反思、`批判迭代`草稿→批判→修订循环、`混合增强`关键判断点合议+整体批判反思、`一致性投票`轻量 SC 选最优；策略带 cost 标签，会话上下文过长时自动降级，选型可被事件轨迹回溯；执行动作全部下沉 Supervisor，分歧/待验证点由模块子 Agent 工具核验后作答；默认关闭以控制 token 消耗）；**会话上下文治理**：发送时携带最近对话为滑动窗口，超阈值自动把更早对话压缩为结构化摘要（原文归档可回看），工具返回与各增强子图产物不沉淀进历史；删除/改名等破坏性操作会产生会话级「失效提醒」防止跨轮复述旧对象；全局长期记忆档案默认不注入、仅按需读取；另有**永久层身份常量**（「设置 → 身份与默认值」维护科研身份/交互与写作语言等几乎不变的身份事实），配置后作为极小 system 段每轮恒定注入、保存即生效，默认不注入任何内容，自动学习永不写入该层（详见 `docs/agent-context-governance.md`）
-- **技能分层路由（Skill Router）**：技能以元数据注册（L3 目录 / tags / 适用边界 / 反例 / 成本 / 会话次数），每轮 Meta-Cognition 意图识别 → 规则粗召回 →（可配）LLM 精排 → 只把 **top-K 候选**注入 Supervisor，替换原先全量技能目录注入；手动 `/技能` 直通绕过；自定义技能缺字段自动推导、关键字段缺失拒绝注册；开关在「设置 → 技能路由」（详见 `docs/skill-routing.md`）
-- **文献库**：arXiv + Web 双来源搜索，项目关联、标签、AI 相关性评分、内嵌 PDF 阅读器 + 阅读笔记、BibTeX 导出、arXiv 订阅、Zotero 集成
-- **论文编辑**：以文件夹为项目的 LaTeX 工作区——打开/新建论文项目，管理 `main.tex` 与章节文件的多标签编辑（语法高亮 + 行号跳转），一键用 latexmk / Tectonic 真实编译，错误/警告诊断点击跳转行，编译产物 `main.pdf` 内嵌预览；引擎缺失时可在「设置 → 资源下载」中下载内置 Tectonic 单文件引擎
-- **论文增强**：编译成功后自动快照项目（列表对比 main.tex 差异并可一键回退），错误行一键 AI 修复并自动重编译，references.bib 结构化编辑，会议排版模板注入（template/TEMPLATE.md）
-- **实验管理**：实验记录、指标可视化、训练进度跟踪
-- **图表管理**：图片上传并落盘到本地目录（mimir-img 协议内联预览），一键复制 LaTeX 代码，支持从 PDF 提取论文内嵌图、重命名并预览后同步 LaTeX 引用
-- **组会管理**：从文献库项目论文与实验记录生成真实 16:9 .pptx 汇报（封面 / 目录 / 文献分享 / 实验结果 / 下一步计划），支持按 AI 相关度排序选文、AI 要点提炼（可选），产物统一管理（列表 / 打开所在文件夹 / 删除）；可选 AI 配图（封面 / 论文概念插图，图片存入图表库可复用，需在设置「图像生成」配置端点）
-- **服务器管理**：SSH 远程连接，nvidia-smi 实时 GPU/显存监控，内置远程终端
-- **成长记录**：研究进展时间线，支持里程碑/论文/实验等类型；本地持久化、可删除
-- **Wiki 笔记**：Agent 自动保存研究笔记
-- **科研空间**：目录制多空间（默认 `~/Mimir/<空间名>`，可自选任意目录），每个空间独立承载论文/实验/图表/组会/对话等研究数据，基础设置（模型/主题/服务器）全局共享；支持切换当前空间、设定默认空间与启动恢复，旧版单目录数据会自动迁移进默认空间；首次使用走三步引导（选择/创建空间 → 模型 → 外观）——若本机基础信息（全局模型/apiKey 等）已存在，引导会检测并直接复用：跳过模型手填、在界面标注“已导入 N 个模型”，外观主题自动预填
-- **会议截稿**：ccfddl 会议截稿目录（本地缓存优先、启动自动抓取 + 6h 定时/手动刷新，离线可用），支持按领域/CCF 等级/时间窗过滤与倒计时高亮、关注星标；内置 CCF-A 期刊目录；对话中可直接让 Agent 用 `venue_search` 查询截稿
+以 **DeepAgents (LangChain/LangGraph)** 为核心，配合 Supervisor 编排 + 子 Agent 协作，用自然语言无侵入驱动整条科研工作流。
+
+### Agent 对话与上下文治理
+
+- **Supervisor 编排**：主管 Agent 把文献 / 论文 / 实验 / 组会 / 服务器等任务按需委派给模块子 Agent 协作并汇总作答；支持 Markdown、流式输出、气泡内**执行过程轨迹卡**，会话管理 / 历史（重命名 / 置顶）本地持久化。
+- **可选 Ultra 增强控制器**（Supervisor 之上的增强总开关，默认关闭以控制 token）：自动或手动选择增强策略——普通增强(仅长程规划) / 多专家合议(K 路评审→共识/分歧→反思) / 批判迭代(草稿→批判→修订) / 混合增强(关键判断点合议+整体批判) / 一致性投票(轻量 SC 选最优)；策略带 cost 标签，上下文过长自动降级，选型轨迹可回溯，执行动作全部下沉 Supervisor，分歧点由子 Agent 工具核验。
+- **会话上下文治理**：发送时携带最近对话为滑动窗口，超阈值自动把更早对话压缩为结构化摘要（原文归档可回看）；工具返回与增强子产物不沉淀历史；删除 / 改名等破坏性操作触发会话级**失效提醒**，防止跨轮复述旧对象。
+- **永久身份常量**：在「设置 → 身份与默认值」维护科研身份 / 交互语言 / 写作语言等几乎不变的 identity，作为极小 system 段每轮恒定注入、保存即生效；默认不注入任何内容，自动学习永不写入该层。
+- **长期记忆档案**：全局记忆默认不注入，仅当任务相关时由 Supervisor 调用 `load_memory` 按需读取（「设置 → 长期记忆」维护）。
+- **语音输入**：对话输入框支持语音转文本——本地 **SenseVoice**（sherpa-onnx，Electron 主进程离线识别，可下载模型）或浏览器 **Web Speech** 引擎，在「设置 → 语音与资源」切换。
+
+### 技能分层路由（Skill Router）
+
+技能以元数据注册（L3 目录 / tags / 适用边界 / 反例 / 成本 / 会话次数），每轮 Meta-Cognition 意图识别 → 规则粗召回 →(可配) LLM 精排 → 只把 **top-K 候选**注给 Supervisor，替换原先的全量技能目录注入；手动 `/技能` 直通绕过；自定义技能缺字段自动推导、缺关键字段拒绝注册；开关在「设置 → 技能路由」。
+
+### 科研空间
+
+目录制多空间（默认 `~/Mimir/<空间名>`，可自选任意目录），每个空间独立承载论文 / 实验 / 图表 / 组会 / 对话等研究数据；基础设置（模型 / 主题 / 服务器）全局共享；支持切换当前空间、设定默认与启动恢复；旧版单目录数据自动迁移进默认空间；首次使用三步引导（选空间 → 模型 → 外观）。
+
+### 功能模块
+
+| 模块 | 说明 |
+|---|---|
+| **对话 `chat`** | Agent 自然语言总入口（含语音输入、技能与指令菜单） |
+| **总览 `overview`** | 研究总览——各模块（论文 / 实验 / 记录 / 图表…）统计指标聚合 |
+| **文献库 `library`** | arXiv + Web 双来源搜索，项目关联、标签、AI 相关性评分、内嵌 PDF 阅读器 + 阅读笔记、BibTeX 导出、arXiv 订阅、Zotero 集成 |
+| **论文 `paper`** | 以文件夹为项目的 LaTeX 工作区——打开 / 新建项目，多 `main.tex` & 章节文件多标签编辑（语法高亮 + 行号跳转），latexmk / Tectonic 真实编译，错误 / 警告诊断点击跳行，`main.pdf` 内嵌预览；引擎缺失可在「设置 → 语音与资源」下载内置 Tectonic 单文件引擎 |
+| **论文增强** | 编译成功自动快照（列表对比 `main.tex` 差异并可一键回退），错误行一键 AI 修复并自动重编译，`references.bib` 结构化编辑，会议排版模板注入 |
+| **实验 `experiments`** | 实验记录、指标可视化、训练进度跟踪 |
+| **图表 `figures`** | 图片上传落盘（`mimir-img` 协议内联预览），一键复制 LaTeX 代码；从 PDF 提取论文内嵌图、重命名并预览后同步 LaTeX 引用；图片存入图表库供组会 AI 配图复用 |
+| **组会 `meetings`** | 从项目论文与实验记录生成真实 16:9 `.pptx`（封面 / 目录 / 文献分享 / 实验结果 / 下一步计划），AI 相关度排序选文、AI 要点提炼（可选），产物统一管理；可选 AI 配图（数据存图表库） |
+| **服务器 `servers`** | SSH 远程连接，nvidia-smi 实时 GPU / 显存监控，内置远程终端 |
+| **记录 `ledger`** | 成长记录时间线（里程碑 / 论文 / 实验等），本地持久化、可删除 |
+| **会议截稿 `venues`** | ccfddl 会议截稿目录（本地缓存优先、启动自动抓取 + 6h 定时 / 手动刷新，离线可用），领域 / CCF 等级 / 时间窗过滤、倒计时高亮、关注星标；内置 CCF-A 期刊目录 |
+| **插件 `plugins`** | 统一管理技能 / 子代理 / 插件 / Hooks（增删改查 + 启停开关，本地持久化） |
+| **设置 `settings`** | 模型 / 外观 / Agent（技能路由 · 身份与默认值 · 长期记忆）/ 图像生成 / 科研空间 / 语音与资源 / 关于 |
+
+### 插件模块（技能 / 子代理 / 插件 / Hooks）
+
+- **技能**：内置 `research-*` 只读；**自定义技能**支持弹窗导入（手动表单或粘贴 JSON）与删除，导入即落盘生效；增删后重进「对话」自动刷新斜杠菜单。
+- **子代理**：Supervisor 可委派子代理的管理界面——内置 5 个科研 worker（文献 / 论文 / 实验 / 组会 / 服务器）只读展示、可「克隆」改造；支持 **AI 生成**（一句话描述职责草拟 name / 说明 / systemPrompt / 工具白名单）；自定义子代理可增删改查 + 启停，从**内置工具白名单**勾选工具并自写 systemPrompt；保存 / 切换启停自动「重载 Agent」（重建 Supervisor）免重启；副作用仍走批准卡。
+- **插件 / Hooks**：注册与管理界面（启用开关 / 描述 / 配置）。
+
+---
 
 ## 技术栈
 
 | 层 | 技术 |
 |---|---|
 | 桌面框架 | Electron 33 |
-| 构建工具 | electron-vite 2 |
+| 构建工具 | electron-vite 2 + electron-builder |
 | UI 框架 | React 18 + TypeScript |
 | 样式 | Tailwind CSS 3 + Shadcn-UI |
 | Markdown | react-markdown + remark-gfm |
-| Agent 引擎 | DeepAgents (LangChain) |
+| Agent 引擎 | DeepAgents (LangChain / LangGraph) |
 | PPT 渲染 | PptxGenJS 4 |
+| LaTeX | latexmk / Tectonic |
+| 远程终端 | @xterm/xterm + node-pty |
+| 语音 | sherpa-onnx (SenseVoice) / Web Speech |
 | 数据存储 | 双层 JSON Store（全局设置 + 科研空间）+ arXiv API |
+
+---
 
 ## 快速开始
 
 ```bash
-# 安装依赖
+# 1. 安装依赖（国内加速：npm 配置 registry 或使用 cnpm / pnpm --registry）
 pnpm install
 
-# 开发模式
+# 2. 开发模式
 pnpm dev
 
-# 构建
+# 3. 构建产物
 pnpm build
 
-# 类型检查
+# 4. 类型检查
 pnpm typecheck
 ```
 
-## 配置 Agent
+> 打包平台：`pnpm build:mac` / `pnpm build:win` / `pnpm build:linux`（分别产出 dmg/zip、nsis/portable、AppImage/deb）。
 
-1. 打开应用，进入「设置」
-2. 在「模型管理」中点击「添加模型」
-3. 填写请求地址、模型ID、API密钥，选择是否支持图片输入
-4. 点击「测试并添加」，应用会自动测试连通性
+### 环境要求
+
+- **Node.js ≥ 22**
+- 编译论文可选用本机 `latexmk`，或在「设置 → 语音与资源」下载内置 **Tectonic** 单文件引擎（推荐，跨平台，免安装）
+
+---
+
+## 配置 Agent（模型）
+
+1. 启动应用，进入「设置」
+2. 在「模型管理」点击「添加模型」
+3. 填写 **请求地址**、**模型 ID**、**API 密钥**，选择是否支持图片输入
+4. 点击 **测试并添加**，应用自动测试连通性
 5. 测试通过后模型自动保存，选中即可使用
 
-## 项目结构
+> 采用 OpenAI 兼容接口：可直连 DeepSeek / OpenAI，也可挂到任意自建 / 网关 / 本地推理端点。
 
-```
-├── electron/               # Electron 主进程
-│   ├── main.ts             # 主进程入口（注册 mimir-pdf / mimir-tex 本地预览协议）
-│   ├── preload.ts          # 预加载脚本（IPC 桥接）
-│   ├── latex.ts            # LaTeX 编译引擎（latexmk / Tectonic）与编译日志解析
-│   ├── latex/runtime.ts    # Tectonic 引擎探测 / 官方 release 下载安装（内置引擎）
-│   ├── ipc/                # IPC 处理器
-│   ├── library/            # 文献库服务（论文/项目/订阅 CRUD、BibTeX、Zotero）
-│   ├── figures/            # 图表管理（图片落盘 + mimir-img 协议服务）
-│   ├── paper/              # 论文增强（快照 / AI 修复 / Bib / 会议模板）
-│   ├── meetings/           # 组会演示文稿（DeckSlide 纯模型 + pptxgenjs 渲染 + 可选 LLM 要点）
-│   ├── venues/             # 会议截稿（ccfddl 缓存 + venue_search 工具）
-│   └── agent/              # DeepAgents 集成
-│       ├── agentService.ts # Agent 服务
-│       └── tools/          # Agent 工具
-├── src/
-│   ├── renderer/           # 渲染进程（React 应用）
-│   │   ├── App.tsx         # 主应用
-│   │   └── index.css       # 全局样式 + 主题
-│   ├── components/
-│   │   ├── chat/           # Agent 对话组件
-│   │   ├── layout/         # 侧边栏
-│   │   ├── modules/        # 10 大功能模块
-│   │   │   └── paper/      # LatexEditor：语法高亮覆盖层编辑器
-│   │   └── ui/             # Shadcn-UI 组件
-│   └── lib/                # 工具函数（latex-highlight.ts：LaTeX 语法高亮 tokenizer）
-└── electron.vite.config.ts # 构建配置
-```
+---
 
 ## Agent 工具
 
@@ -92,60 +148,84 @@ pnpm typecheck
 |---|---|
 | `arxiv_search` | 搜索 arXiv 学术论文 |
 | `arxiv_fetch_paper` | 按 id 读取单篇论文完整元数据（不写入文献库） |
-| `library_search` | 检索文献库内已收藏论文：标题/摘要/标签/阅读笔记关键词命中（只读，按需返回片段） |
-| `wiki_search` | 检索当前科研空间的 Wiki 笔记：标题/正文关键词命中（只读，按需返回片段） |
+| `library_search` | 检索文献库内已收藏论文（标题 / 摘要 / 标签 / 笔记关键词，只读片段） |
+| `wiki_search` | 检索当前科研空间的 Wiki 笔记（只读片段） |
 | `web_search` | 搜索网页获取最新信息 |
-| `wiki_note` | 创建/追加 Wiki 研究笔记 |
+| `wiki_note` | 创建 / 追加 Wiki 研究笔记 |
 | `paper_fetch` | 获取 arXiv 论文并自动保存到文献库（关联项目） |
 | `set_paper` | 更新文献库论文的标签、笔记、AI 相关性评分 |
-| `venue_search` | 查询 CCF 会议截稿时间与倒计时（本地缓存，离线可用） |
+| `venue_search` | 查询 CCF 会议截稿与倒计时（本地缓存，离线可用） |
 | `experiment` | 操作实验模块：list / create / update / delete（副作用先确认） |
-| `server_status` | 只读查询已注册 GPU 服务器：连通性 + SSH nvidia-smi 实时状态 |
-| `latex_compile` | 编译用户论文项目目录（真实 latexmk/Tectonic，最长 120s）并返回诊断 |
-| `meeting_deck` | 生成组会 .pptx（复用组会模块，可选 AI 要点/配图）或列出历史 |
+| `server_status` | 只读查询 GPU 服务器连通性 + nvidia-smi 实时状态 |
+| `latex_compile` | 编译用户论文（真实 latexmk/Tectonic，最长 120s）返回诊断 |
+| `meeting_deck` | 生成组会 .pptx（可选 AI 要点 / 配图）或列出历史 |
 | `ledger` | 操作成长记录：list / create / delete（副作用先确认） |
 | `figure` | 操作图表库：list / add(磁盘路径) / rename(同步 .tex) / remove |
-| `load_memory` | 按需读取全局长期记忆档案（研究方向/常用约束/常用事实，于「设置 → 长期记忆」维护，默认不注入） |
+| `load_memory` | 按需读取全局长期记忆档案（默认不注入） |
 
-> 副作用确认：写盘/长耗时的桥工具（experiment / ledger / figure / latex_compile / meeting_deck）在执行前会向聊天区推送「批准卡片」，用户允许后才真正执行；拒绝或 120s 未响应自动取消。
+> **副作用确认**：写盘 / 长耗时的桥工具（experiment / ledger / figure / latex_compile / meeting_deck）执行前向聊天区推送「批准卡片」，允许后才执行；拒绝或 120s 未响应自动取消。
 >
-> 调试 Agent：主进程会输出模型层 `[agent-trace]` 日志（每个 ChatModel 请求的上下文、tool_calls、耗时与 token）并落盘 `~/.mimir/logs/agent-trace-*.jsonl`，级别经 `MIMIR_AGENT_TRACE` 或 `settings.agentTraceLevel` 控制（off/compact/full），用法见 `docs/agent-debug.md`。
+> **调试 Agent**：主进程输出 `[agent-trace]` 日志并落盘 `~/.mimir/logs/agent-trace-*.jsonl`，级别经 `MIMIR_AGENT_TRACE` 或 `settings.agentTraceLevel` 控制（off / compact / full）。
+
+---
 
 ## 技能与指令
 
-对话输入框输入 `/` 会弹出「技能与指令」菜单（过滤 + 键盘补全），清单照搬 Mimir 的 commands/skills，展开为任务提示注入 Agent（L0，无文件副作用）：
+对话框输入 `/` 弹出「技能与指令」菜单（过滤 + 键盘补全），清单照搬 Mimir 的 commands/skills，展开为任务提示注入 Agent（L0，无文件副作用）：
 
 - **指令**：`/research-idea <方向>` 科研开题 · `/research-plan [课题]` 实验方案 · `/paper-write [主题]` 论文写作 · `/paper-compile` 编译诊断 · `/research-review` 论文评审
 - **技能**：`/research-pipeline` 全流程管线 · `/research-lit-review <方向>` 文献综述 · `/research-novelty-check <想法>` 查新 · `/research-experiment-plan` 实验设计 · `/research-result-to-claim` 结果到结论 · `/research-paper-drafting` 论文逐节起草 · `/research-paper-deai` 去 AI 味 · `/research-citation-audit` 引用审计 · `/research-rebuttal` 回复审稿 · `/research-figure-plan` 配图规划 · `/research-meeting-deck` 组会汇报
+- 输入 `/trigger 参数` 可调用自定义技能（覆盖 `{{args}}` 占位符）。
 
-### 插件管理（插件模块：技能 / 子代理 / 插件 / Hooks）
+---
 
-左侧栏「设置」上方的「插件」模块统一管理四类能力（增删改查 + 启停开关，均本地持久化）：
+## 项目结构
 
-- **技能**：内置 research-* 技能只读；**自定义技能**支持弹窗导入（手动表单或粘贴 JSON）与删除，导入即在本机落盘并立即生效（无需点「保存设置」），增删后重新进入「对话」模块自动刷新斜杠菜单；
-- **子代理**：Supervisor 可委派模块子代理的管理界面——内置 5 个科研 worker（文献/论文/实验/组会/服务器）只读展示、支持「克隆」改造；支持 **AI 生成**：用一句话描述职责即可生成 name / 说明 / 系统提示词 / 工具白名单草稿；自定义子代理可增删改查 + 启停，从**内置工具白名单**（15 个，含 arxiv_search / paper_fetch / latex_compile / meeting_deck 等）勾选工具并自写 systemPrompt/说明；保存或切换启停后自动「重载 Agent」（主进程按 `electron/agent/subagentRegistry.ts` 重建 Supervisor），免重启生效；name 全局唯一校验、未启用项不注册，写盘等副作用仍走批准卡；
-- **插件 / Hooks**：提供注册与管理界面（启用开关、描述、配置等），配置留待运行时扩展消费。
-- 输入 `/trigger 参数` 即可调用自定义技能；参数会替换任务正文中的 `{{args}}` 占位符（正文无占位符时参数前置为「本次任务对象」，未带参数时正文给出澄清提示）。
-- 自定义技能在菜单中与内置技能并列展示，仍以 `skill` 语义展开为任务提示注入 Agent（L0，无文件副作用）。
+```
+├── electron/                      # Electron 主进程
+│   ├── main.ts                    # 进程入口（mimir-pdf / mimir-tex / mimir-img 本地协议注册）
+│   ├── preload.ts                 # 预加载脚本（IPC 桥接）
+│   ├── latex.ts                   # LaTeX 编译引擎（latexmk / Tectonic）与编译日志解析
+│   ├── latex/runtime.ts           # Tectonic 探测与官方 release 下载安装（内置引擎）
+│   ├── ipc/                       # IPC 处理器
+│   ├── library/                   # 文献库服务（论文 / 项目 / 订阅 CRUD、BibTeX、Zotero）
+│   ├── figures/                   # 图表管理（落盘 + mimir-img 协议服务）
+│   ├── paper/                     # 论文增强（快照 / AI 修复 / Bib / 会议模板）
+│   ├── meetings/                  # 组会演示文稿（DeckSlide + pptxgenjs 渲染 + 可选 LLM 要点）
+│   ├── venues/                    # 会议截稿（ccfddl 缓存 + venue_search 工具）
+│   ├── servers/                   # 服务器（SSH / nvidia-smi / 终端）
+│   ├── speech/                    # 语音识别（SenseVoice / sherpa-onnx）
+│   └── agent/                     # DeepAgents 集成
+│       ├── agentService.ts        # Agent 服务
+│       ├── subagentRegistry.ts    # 内置子代理注册（重建 Supervisor）
+│       ├── skillRouter.ts         # 技能分层路由
+│       ├── approval.ts            # 副作用批准卡
+│       ├── trace.ts               # Agent 轨迹日志
+│       └── tools/                 # 16 个 Agent 工具
+├── src/
+│   ├── renderer/                  # 渲染进程（React 应用）
+│   │   ├── App.tsx                # 主应用
+│   │   └── index.css              # 全局样式 + 主题
+│   ├── components/
+│   │   ├── chat/                  # Agent 对话组件（ChatInput / ChatView / MessageBubble…）
+│   │   ├── layout/                # 侧边栏（Sidebar）与导航
+│   │   ├── modules/               # 功能模块（library / paper / figures / Experiments / Meetings…）
+│   │   │   └── paper/             # LatexEditor：语法高亮覆盖层编辑器
+│   │   └── ui/                    # Shadcn-UI 组件
+│   ├── stores/                    # 状态管理
+│   └── lib/                       # 工具（latex-highlight.ts：LaTeX 语法高亮 tokenizer）
+├── build/                         # electron-builder 资源（icon.png）
+└── components.json / tailwind.config / electron.vite / electron-builder
+```
 
-## 路线图
+---
 
-- [x] 基础框架（Electron + React + Tailwind + Shadcn）
-- [x] DeepAgents 引擎集成
-- [x] Agent 对话核心（Markdown 渲染 + 会话管理 + 流式输出）
-- [x] 10 大功能模块
-- [x] 真实 arXiv 文献搜索
-- [x] 模型连通性测试（添加时自动验证）
-- [x] 文献库增强（收藏持久化 + PDF 下载 + 阅读笔记）
-- [x] 真正文献库（项目关联 + 标签 + AI 相关性评分 + 内嵌 PDF 阅读器 + BibTeX 导出 + arXiv 订阅 + Zotero 集成 + Web 搜索导入）
-- [x] GPU 服务器管理（SSH 远程连接 + nvidia-smi GPU 监控）
-- [x] 实验管理（指标跟踪 + 进度可视化）
-- [x] 图表管理（上传 + LaTeX 代码生成）
-- [x] 成长记录时间线
-- [x] 主题系统（浅色/深色/跟随系统）
-- [x] 工作台自定义背景图（设置-外观：本地选图 + 背景浓度/明暗遮罩，随主题适配）
-- [x] 可展开侧边栏
-- [x] LaTeX 论文项目管理（打开/新建项目、多 .tex 标签编辑、语法高亮、诊断跳转、内嵌 PDF 预览；依赖本机 latexmk 或 Tectonic）
-- [x] 组会 PPT 实际生成（pptxgenjs 确定性渲染 + 可选 LLM 要点提炼）
-- [x] Supervisor 编排架构（主管 Agent + 模块子 Agent：文献/论文/实验/组会/服务器按需委派、结果汇总作答；界面含执行过程轨迹卡）
-- [ ] 数据持久化（SQLite）
+## 相关项目
+
+- [**dsh-Mimir-Academic-research**](https://github.com/1692775560/dsh-Mimir-Academic-research) —— 本项目来源与功能同源：一个以 DeepSeek Harness (dsh) 为宿主的科研工作台插件，覆盖相同科研生命周期。**Mimir Desktop 是其工程化重写的独立桌面版**。
+
+---
+
+## License
+
+本项目采用 **MIT License**（见 `package.json` 中 `license` 字段；如需分发请补充仓库根目录 `LICENSE` 文件）。功能与理念承自 [dsh-Mimir-Academic-research](https://github.com/1692775560/dsh-Mimir-Academic-research)（MIT）。
