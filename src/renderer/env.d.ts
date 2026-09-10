@@ -55,6 +55,12 @@ interface ElectronAPI {
   downloadResource: (resourceId: string) => Promise<{ ok: boolean; message?: string }>
   onResourceProgress: (callback: (info: { resourceId: string; percent: number; status: string; message?: string }) => void) => () => void
   testModel: (config: { baseUrl: string; modelId: string; apiKey: string }) => Promise<{ ok: boolean; message: string }>
+  // ─── 本地桥接服务（Issue 3）──────────────────────────────────────
+  bridge: {
+    start: () => Promise<{ ok: boolean; port?: number; message?: string }>
+    stop: () => Promise<{ ok: boolean }>
+    status: () => Promise<{ running: boolean; port: number; confirmToken: string }>
+  }
   showOpenDialog: (options: any) => Promise<any>
   showSaveDialog: (options: any) => Promise<any>
   readFile: (path: string) => Promise<string>

@@ -5,6 +5,7 @@ import { app } from 'electron'
 import { join, basename, extname, dirname, relative } from 'path'
 import { existsSync, mkdirSync } from 'fs'
 import { agentService } from '../agent/agentService'
+import { startBridge, stopBridge, isBridgeRunning, getBridgePort, getConfirmToken } from '../plugins/bridge'
 import { setApprovalSender, settleApproval } from '../agent/approval'
 import { probeServer, type ProbeConfig } from '../servers/probe'
 import { compileLatex, registerLatexPdfDir } from '../latex'
@@ -167,6 +168,32 @@ export function setupIpcHandlers(winRef: { current: BrowserWindow | null }): voi
     } catch (error) {
       const message = error instanceof Error ? error.message : '连接失败'
       return { ok: false, message }
+    }
+  })
+
+  // ─── 本地桥接服务（Issue 3）──────────────────────────────────────
+  ipcMain.handle('bridge:start', async () => {
+    if (isBridgeRunning()) {
+      return { ok: true, port: getBridgePort(), message: '桥接服务已在运行' }
+    }
+    try {
+      const { port } = await startBridge()
+      return { ok: true, port, message: `桥接服务已启动 (127.0.0.1:${port})` }
+    } catch (error) {
+      return { ok: false, port: 0, message: error instanceof Error ? error.message : '启动失败' }
+    }
+  })
+
+  ipcMain.handle('bridge:stop', async () => {
+    await stopBridge()
+    return { ok: true }
+  })
+
+  ipcMain.handle('bridge:status', async () => {
+    return {
+      running: isBridgeRunning(),
+      port: getBridgePort(),
+      confirmToken: getConfirmToken()
     }
   })
 
