@@ -17,6 +17,7 @@
     "build:linux": "electron-vite build && electron-builder --linux --publish never",
     "preview": "electron-vite preview",
     "typecheck": "tsc --noEmit -p tsconfig.node.json && tsc --noEmit -p tsconfig.web.json",
+    "test:model-discovery": "node --experimental-strip-types --no-warnings electron/modelDiscovery.test.ts",
     "start": "electron-vite preview"
   },
   "dependencies": {

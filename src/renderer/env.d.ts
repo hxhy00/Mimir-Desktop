@@ -55,6 +55,13 @@ interface ElectronAPI {
   downloadResource: (resourceId: string) => Promise<{ ok: boolean; message?: string }>
   onResourceProgress: (callback: (info: { resourceId: string; percent: number; status: string; message?: string }) => void) => () => void
   testModel: (config: { baseUrl: string; modelId: string; apiKey: string }) => Promise<{ ok: boolean; message: string }>
+  /** OpenAI 兼容端点模型发现：按 baseUrl + apiKey 拉取 /v1/models。 */
+  listModels: (config: { baseUrl: string; apiKey: string }) => Promise<{
+    ok: boolean
+    message?: string
+    models?: { id: string; ownedBy?: string }[]
+    endpoint?: string
+  }>
   showOpenDialog: (options: any) => Promise<any>
   showSaveDialog: (options: any) => Promise<any>
   readFile: (path: string) => Promise<string>

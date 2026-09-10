@@ -59,6 +59,7 @@ import {
   readSnapshotFile,
   revertPaperSnapshot,
 } from '../paper/snapshots'
+import { listModels } from '../modelDiscovery'
 import { aiFixIssue } from '../paper/aiFix'
 import { readPaperBib, writePaperBib } from '../paper/bib'
 import { VENUE_TEMPLATES, applyVenueTemplate } from '../paper/venueTemplates'
@@ -168,6 +169,11 @@ export function setupIpcHandlers(winRef: { current: BrowserWindow | null }): voi
       const message = error instanceof Error ? error.message : '连接失败'
       return { ok: false, message }
     }
+  })
+
+  // 模型发现：按 baseUrl + apiKey 拉取 /v1/models，渲染层可快速填入模型 ID。
+  ipcMain.handle('model:list', async (_event, args: { baseUrl: string; apiKey: string }) => {
+    return listModels({ baseUrl: args?.baseUrl ?? '', apiKey: args?.apiKey ?? '' })
   })
 
   // Settings

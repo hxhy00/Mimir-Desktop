@@ -36,7 +36,8 @@ import {
   Palette,
   Pencil,
   Sparkles,
-  Settings2
+  Settings2,
+  ListChecks
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { Textarea } from '@/components/ui/textarea'
@@ -239,6 +240,12 @@ export function Settings({ autoOpenModelDialog = 0, guided = false, onModelStepD
   const [showApiKeyInForm, setShowApiKeyInForm] = useState(false)
   const [testing, setTesting] = useState(false)
   const [testResult, setTestResult] = useState<{ ok: boolean; message: string } | null>(null)
+  // 模型发现（Issue 2）：按 baseUrl + apiKey 拉取 /v1/models，结果展示为下拉。
+  const [listingModels, setListingModels] = useState(false)
+  const [modelList, setModelList] = useState<{ id: string; ownedBy?: string }[]>([])
+  const [modelListEndpoint, setModelListEndpoint] = useState('')
+  const [modelListMsg, setModelListMsg] = useState<{ type: 'ok' | 'error'; text: string } | null>(null)
+  const [modelPickerOpen, setModelPickerOpen] = useState(false)
   const [speechEngine, setSpeechEngine] = useState<'local' | 'web'>('web')
   const [imgGenBaseUrl, setImgGenBaseUrl] = useState('')
   const [imgGenModelId, setImgGenModelId] = useState('')
@@ -704,6 +711,10 @@ export function Settings({ autoOpenModelDialog = 0, guided = false, onModelStepD
     setEditingModelId(null)
     setForm(EMPTY_MODEL_FORM)
     setTestResult(null)
+    setModelList([])
+    setModelListMsg(null)
+    setModelListEndpoint('')
+    setModelPickerOpen(false)
   }, [])
 
   /** 进入「编辑模型」：预填现有字段并保留 id，复用同一弹窗。 */
@@ -718,6 +729,53 @@ export function Settings({ autoOpenModelDialog = 0, guided = false, onModelStepD
     setTestResult(null)
     setDialogOpen(true)
   }, [])
+
+  /** 拉取 /v1/models：供「获取模型列表」按钮使用，复用 issue 2 规范的 URL 归一化。
+   *  baseUrl / apiKey 为空时直接给出错误提示，不会发送请求。 */
+  const handleFetchModels = useCallback(async () => {
+    if (!form.baseUrl || !form.apiKey) {
+      setModelListMsg({ type: 'error', text: '请先填写请求地址和 API Key。' })
+      setModelList([])
+      setModelPickerOpen(false)
+      return
+    }
+    if (!window.electronAPI?.listModels) {
+      setModelListMsg({ type: 'error', text: '当前环境未暴露模型发现接口（preload 缺失）。' })
+      return
+    }
+    setListingModels(true)
+    setModelListMsg(null)
+    setModelList([])
+    setModelPickerOpen(false)
+    try {
+      const res = await window.electronAPI.listModels({ baseUrl: form.baseUrl, apiKey: form.apiKey })
+      if (res.endpoint) setModelListEndpoint(res.endpoint)
+      if (!res.ok || !res.models) {
+        setModelListMsg({ type: 'error', text: res.message ?? '获取模型列表失败' })
+        return
+      }
+      setModelList(res.models)
+      setModelPickerOpen(res.models.length > 0)
+      setModelListMsg({
+        type: 'ok',
+        text: res.endpoint
+          ? `已发现 ${res.models.length} 个模型（来源：${res.endpoint}）`
+          : `已发现 ${res.models.length} 个模型`
+      })
+    } catch (error) {
+      setModelListMsg({ type: 'error', text: error instanceof Error ? error.message : '请求失败' })
+    } finally {
+      setListingModels(false)
+    }
+  }, [form.baseUrl, form.apiKey])
+
+  /** 关闭「添加/编辑」弹窗或切换 baseUrl 时清空已拉取的模型列表，避免误导。 */
+  useEffect(() => {
+    setModelList([])
+    setModelPickerOpen(false)
+    setModelListMsg(null)
+    setModelListEndpoint('')
+  }, [form.baseUrl])
 
   /** 新增或编辑模型的统一保存：先连通测试，成功后按 id 覆盖（编辑）或追加（新增）并立即落盘。 */
   const handleSaveModel = useCallback(async () => {
@@ -2130,6 +2188,58 @@ export function Settings({ autoOpenModelDialog = 0, guided = false, onModelStepD
                   className="h-7 text-[12px] font-mono"
                 />
               </div>
+              <div className="col-span-5 -mt-1.5 flex items-center justify-between gap-2">
+                <button
+                  type="button"
+                  onClick={() => void handleFetchModels()}
+                  disabled={listingModels || !form.baseUrl || !form.apiKey}
+                  className="inline-flex h-6 items-center gap-1 rounded-md border border-border bg-card px-2 text-[11px] text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
+                  title="按当前请求地址 + API Key 拉取可用模型"
+                >
+                  {listingModels ? <Loader2 className="h-3 w-3 animate-spin" /> : <ListChecks className="h-3 w-3" />}
+                  {listingModels ? '获取中...' : '获取模型列表'}
+                </button>
+                {modelListMsg !== null && (
+                  <span
+                    className={cn(
+                      'truncate text-[10px]',
+                      modelListMsg.type === 'error' ? 'text-destructive' : 'text-muted-foreground'
+                    )}
+                    title={modelListMsg.text}
+                  >
+                    {modelListMsg.text}
+                  </span>
+                )}
+              </div>
+              {modelPickerOpen && modelList.length > 0 && (
+                <div className="col-span-5 rounded-md border border-border bg-muted/30 px-2 py-1.5">
+                  <Label className="text-[10px] text-muted-foreground">选择已发现的模型</Label>
+                  <div className="mt-1 flex max-h-32 flex-wrap gap-1.5 overflow-y-auto">
+                    {modelList.map((m) => (
+                      <button
+                        key={m.id}
+                        type="button"
+                        onClick={() => setForm({ ...form, modelId: m.id })}
+                        className={cn(
+                          'inline-flex max-w-full items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] font-mono transition-colors',
+                          form.modelId === m.id
+                            ? 'border-primary bg-primary/10 text-primary'
+                            : 'border-border bg-card hover:bg-accent'
+                        )}
+                        title={m.ownedBy ? `${m.id} · owned_by: ${m.ownedBy}` : m.id}
+                      >
+                        <span className="truncate">{m.id}</span>
+                        {m.ownedBy !== undefined && (
+                          <span className="text-[8px] text-muted-foreground">· {m.ownedBy}</span>
+                        )}
+                      </button>
+                    ))}
+                  </div>
+                  <p className="mt-1 text-[9px] text-muted-foreground">
+                    也可以继续手动输入自定义模型 ID；下方测试会按你当前填写的 ID 发起。
+                  </p>
+                </div>
+              )}
             </div>
 
             {/* Row 2: API密钥 + 支持图片 */}
@@ -2189,6 +2299,8 @@ export function Settings({ autoOpenModelDialog = 0, guided = false, onModelStepD
                 setDialogOpen(false)
                 resetModelDialog()
               }}
+              type="button"
+              data-testid="model-dialog-cancel"
             >
               取消
             </Button>
