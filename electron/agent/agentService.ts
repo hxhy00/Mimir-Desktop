@@ -8,6 +8,7 @@ import { loadSkillRegistry } from './skills'
 import { candidatesToContext, routeSkills, SKILL_TOP_K } from './skillRouter'
 import type { RouterCandidate } from './skillRouter'
 import { loadSubAgentDefs, WORKER_TOOL_CATALOG, BUILTIN_SUBAGENTS } from './subagentRegistry'
+import { MimirFsBackend } from './fsBackend'
 import { createAgentTraceHandler, type AgentTraceLevel } from './trace'
 
 /** Supervisor 模式：主管 Agent 负责规划并把任务委派给按科研模块划分的子 Agent（worker）。
@@ -80,7 +81,7 @@ const SUPERVISOR_SYSTEM = `你是 Mimir，一个以 Agent 为核心的科研助�
 - experiment「实验 Agent」— 实验记录管理、成长/里程碑时间线；
 - meeting「组会 Agent」— 从文献库与实验记录生成组会汇报 .pptx；
 - server「服务器 Agent」— 查询已注册 GPU 服务器的连通性与实时状态（nvidia-smi）；
-- files「文件 Agent」— 按用户给定路径读写本机文件：read_dir 列目录、read_file 读文本（把草稿/项目文件纳入上下文）、write_file 把 Markdown 产物（调研/综述/评审）创建或覆盖写入指定文档（写与空间外读需批准）。
+- files「文件 Agent」— 按用户给定路径读写本机文件：read_dir 列目录、read_file 读文本（把草稿/项目文件纳入上下文）、write_file 把 Markdown 产物（调研/综述/评审）创建或覆盖写入指定文档（写与空间外读需批准）。其中 read_file/edit_file/write_file/ls 等由系统内置文件工具提供（已在 backend 层接入批准卡）。
 
 工作原则：
 - 使用中文回复，保持专业且友好的语气；
@@ -495,7 +496,10 @@ export class AgentService {
       // 仅在路由不可用时作为兜底目录注入），解决全量目录的 token 与召回噪声问题。
       systemPrompt: SUPERVISOR_SYSTEM,
       tools: [memoryToolTraced] as never,
-      subagents: this.buildWorkerSubagents() as never
+      subagents: this.buildWorkerSubagents() as never,
+      // 内置文件工具（read_file/write_file/edit_file/ls/glob/grep/delete）默认走内存 StateBackend，
+      // 不会落到真实磁盘。注入 MimirFsBackend：真实磁盘读写 + 写/空间外读的批准卡。
+      backend: new MimirFsBackend() as never
     }) as unknown as SupervisorAgent
 
     // 记忆链路诊断（M5 后新增）：打印 supervisor 直属工具注册清单。复现「让模型读取长期记忆」时，
@@ -557,7 +561,7 @@ export class AgentService {
           ? '\n注意：本次由 Ultra 策略强制启用合议，enable 必须为 true，直接选择最合适的专家并说明理由。'
           : ''
       const parsed = await judge
-        .withStructuredOutput(SC_META_SCHEMA, { name: 'sc_meta_decision' })
+        .withStructuredOutput(SC_META_SCHEMA, { name: 'sc_meta_decision', method: 'functionCalling' })
         .invoke([
           { role: 'system', content: SC_META_SYSTEM },
           { role: 'user', content: `用户请求：\n${taskText}${forceDirective}` }
@@ -766,7 +770,7 @@ export class AgentService {
     let roles: ScExpertId[] = []
     try {
       const parsed = await judge
-        .withStructuredOutput(VOTE_META_SCHEMA, { name: 'svc_meta_decision' })
+        .withStructuredOutput(VOTE_META_SCHEMA, { name: 'svc_meta_decision', method: 'functionCalling' })
         .invoke([
           { role: 'system', content: VOTE_META_SYSTEM },
           { role: 'user', content: `用户请求：\n${message}` }
@@ -921,7 +925,7 @@ export class AgentService {
     let criticalQuestion = ''
     try {
       const meta = await judge
-        .withStructuredOutput(ULTRA_HYBRID_META_SCHEMA, { name: 'ultra_hybrid_meta' })
+        .withStructuredOutput(ULTRA_HYBRID_META_SCHEMA, { name: 'ultra_hybrid_meta', method: 'functionCalling' })
         .invoke([
           { role: 'system', content: ULTRA_HYBRID_META_SYSTEM },
           { role: 'user', content: `用户任务：\n${message}` }
@@ -1135,6 +1139,8 @@ export class AgentService {
     this.activeStreamAbort = controller
     // 本次流式调用期间，模块 worker 的执行事件经 onWorkerEvent 外发（渲染层按需入树）
     this.workerTraceEmit = (event) => onWorkerEvent?.(event)
+    /** 本次回复的轨迹外发器；主流程各阶段用它补齐 supervisor 自身的节点。 */
+    const emit = (event: AgentWorkerEvent): void => onWorkerEvent?.(event)
     let fullContent = ''
     const isManual = options?.manual === true || message.trim().startsWith('/')
     // 进入 Supervisor 主流程前的上下文片段（当前消息 → 技能路由候选 → Ultra 增强产出）
@@ -1153,13 +1159,22 @@ export class AgentService {
 
       // Skill 分层路由（每轮自动；手动 / 触发绕过）：粗召回 + 精排 → 仅注入 top-K 候选。
       if (!isManual && this.readSettingsFlag('skillRouting', true)) {
-        const routed = await this.runSkillRouting(message, conversationId, controller.signal, (event) =>
-          onWorkerEvent?.(event)
-        )
+        emit({ taskId: 'phase:routing', title: '技能路由', status: 'running' })
+        const routed = await this.runSkillRouting(message, conversationId, controller.signal, emit)
         if (controller.signal.aborted) {
           console.log('[agent] 技能路由阶段被用户中止')
+          emit({ taskId: 'phase:routing', title: '技能路由', status: 'error', text: '已被用户中止。' })
           return ''
         }
+        emit({
+          taskId: 'phase:routing',
+          title: '技能路由',
+          status: 'done',
+          text:
+            routed === null
+              ? '路由不可用，回退静态技能目录。'
+              : `已召回 ${routed.meta?.categories.length ?? 0} 类技能候选。`
+        })
         if (routed === null) {
           // 路由不可用（无判定模型/判定失败）→ 回退静态目录，保留原有的自然语言命中能力
           contextParts.push(SLASH_CATALOG_TEXT)
@@ -1179,7 +1194,7 @@ export class AgentService {
         const uc = await this.runUltraController({
           message,
           signal: controller.signal,
-          emit: (event) => onWorkerEvent?.(event),
+          emit,
           historyChars,
           manual: manualStrategy,
           routerMeta: routeMeta
@@ -1203,6 +1218,10 @@ export class AgentService {
         { role: 'user', content: finalMessage }
       ]
 
+      // Supervisor 主流程节点：模块 worker 的工具事件（taskId=worker id）会长在这个容器下，
+      // 使渲染层的事件树能显示「主管 → 模块 → 工具」的层级，而不是散落的顶层行。
+      emit({ taskId: 'main', title: '主管 Agent', status: 'running', kind: 'task' })
+
       // 官方推荐：streamEvents(state, { version: 'v3' }) → run.messages 内每条
       // AI 消息的 .text 是逐字 AsyncIterable。deepagents legacy `.stream()` 的
       // chunk 结构与文本抽取不匹配（会“正常结束但零输出”），已弃用。
@@ -1222,11 +1241,19 @@ export class AgentService {
           }
           if (controller.signal.aborted) break
         }
+        emit({ taskId: 'main', title: '主管 Agent', status: 'done' })
       } catch (streamError) {
         if (controller.signal.aborted) {
           console.log('[agent] v3 流被用户中止')
+          emit({ taskId: 'main', title: '主管 Agent', status: 'error', text: '已被用户中止。' })
         } else {
           console.warn('[agent] v3 逐字流执行异常，回退 invoke：', streamError)
+          emit({
+            taskId: 'main',
+            title: '主管 Agent',
+            status: 'error',
+            text: `执行异常：${humanizeAgentError(streamError)}`
+          })
         }
       }
 
@@ -1321,7 +1348,7 @@ export class AgentService {
     let complexity: 'low' | 'medium' | 'high' = 'medium'
     try {
       const meta = await judge
-        .withStructuredOutput(ROUTE_META_SCHEMA, { name: 'skill_route_meta' })
+        .withStructuredOutput(ROUTE_META_SCHEMA, { name: 'skill_route_meta', method: 'functionCalling' })
         .invoke([
           { role: 'system', content: ROUTE_META_SYSTEM },
           { role: 'user', content: `用户请求：\n${message}` }
@@ -1352,7 +1379,7 @@ export class AgentService {
             try {
               const lines = cands.map((c) => `- ${c.trigger} · ${c.title} — ${c.description}`)
               const ranked = await judge
-                .withStructuredOutput(ROUTE_RANK_SCHEMA, { name: 'skill_route_rerank' })
+                .withStructuredOutput(ROUTE_RANK_SCHEMA, { name: 'skill_route_rerank', method: 'functionCalling' })
                 .invoke([
                   { role: 'system', content: ROUTE_RANK_SYSTEM },
                   { role: 'user', content: `用户请求：${q}\n\n候选技能：\n${lines.join('\n')}` }
@@ -1459,7 +1486,7 @@ ${toolLines}
 用户职责描述：${p}`
     try {
       const parsed = await judge
-        .withStructuredOutput(GEN_SCHEMA, { name: 'subagent_design' })
+        .withStructuredOutput(GEN_SCHEMA, { name: 'subagent_design', method: 'functionCalling' })
         .invoke([
           { role: 'system', content: system },
           { role: 'user', content: `一句话职责描述：\n${p}` }
