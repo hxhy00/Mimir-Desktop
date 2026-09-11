@@ -173,6 +173,11 @@ export interface ElectronAPI {
     models?: { id: string; ownedBy?: string }[]
     endpoint?: string
   }>
+  // Harness 管理（Issue 1）
+  harness: {
+    list: () => Promise<{ harnesses: { id: string; name: string; kind: string; available: boolean }[]; activeId: string }>
+    setActive: (id: string) => Promise<{ ok: boolean; activeId?: string; message?: string }>
+  }
 
   // Dialog
   showOpenDialog: (options: Electron.OpenDialogOptions) => Promise<Electron.OpenDialogReturnValue>
@@ -416,6 +421,11 @@ const electronAPI: ElectronAPI = {
   testModel: (config) => ipcRenderer.invoke('model:test', config),
 
   listModels: (config) => ipcRenderer.invoke('model:list', config),
+
+  harness: {
+    list: () => ipcRenderer.invoke('harness:list'),
+    setActive: (id: string) => ipcRenderer.invoke('harness:set', id)
+  },
 
   showOpenDialog: (options) => ipcRenderer.invoke('dialog:open', options),
   showSaveDialog: (options) => ipcRenderer.invoke('dialog:save', options),

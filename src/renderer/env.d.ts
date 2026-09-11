@@ -67,6 +67,11 @@ interface ElectronAPI {
     models?: { id: string; ownedBy?: string }[]
     endpoint?: string
   }>
+  // Harness 管理（Issue 1）
+  harness: {
+    list: () => Promise<{ harnesses: { id: string; name: string; kind: string; available: boolean }[]; activeId: string }>
+    setActive: (id: string) => Promise<{ ok: boolean; activeId?: string; message?: string }>
+  }
   showOpenDialog: (options: any) => Promise<any>
   showSaveDialog: (options: any) => Promise<any>
   readFile: (path: string) => Promise<string>
