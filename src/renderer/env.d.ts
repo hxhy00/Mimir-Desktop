@@ -72,6 +72,12 @@ interface ElectronAPI {
     list: () => Promise<{ harnesses: { id: string; name: string; kind: string; available: boolean }[]; activeId: string }>
     setActive: (id: string) => Promise<{ ok: boolean; activeId?: string; message?: string }>
   }
+  // ─── 本地桥接服务（Issue 3）──────────────────────────────────────
+  bridge: {
+    start: () => Promise<{ ok: boolean; port?: number; message?: string }>
+    stop: () => Promise<{ ok: boolean }>
+    status: () => Promise<{ running: boolean; port: number; confirmToken: string }>
+  }
   showOpenDialog: (options: any) => Promise<any>
   showSaveDialog: (options: any) => Promise<any>
   readFile: (path: string) => Promise<string>

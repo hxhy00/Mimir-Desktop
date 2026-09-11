@@ -160,6 +160,13 @@ export interface ElectronAPI {
   downloadResource: (resourceId: string) => Promise<{ ok: boolean; message?: string }>
   onResourceProgress: (callback: (info: { resourceId: string; percent: number; status: string; message?: string }) => void) => () => void
 
+  // ─── 本地桥接服务（Issue 3）──────────────────────────────────────
+  bridge: {
+    start: () => Promise<{ ok: boolean; port?: number; message?: string }>
+    stop: () => Promise<{ ok: boolean }>
+    status: () => Promise<{ running: boolean; port: number; confirmToken: string }>
+  }
+
   // Settings
   getSettings: () => Promise<Record<string, unknown>>
   setSettings: (settings: Record<string, unknown>) => Promise<void>
@@ -425,6 +432,12 @@ const electronAPI: ElectronAPI = {
   harness: {
     list: () => ipcRenderer.invoke('harness:list'),
     setActive: (id: string) => ipcRenderer.invoke('harness:set', id)
+  },
+
+  bridge: {
+    start: () => ipcRenderer.invoke('bridge:start'),
+    stop: () => ipcRenderer.invoke('bridge:stop'),
+    status: () => ipcRenderer.invoke('bridge:status')
   },
 
   showOpenDialog: (options) => ipcRenderer.invoke('dialog:open', options),
