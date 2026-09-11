@@ -17,6 +17,7 @@ import { FilesystemBackend } from 'deepagents'
 import { resolve, sep } from 'path'
 import { spaceRoot } from '../library/store'
 import { requireUserApproval } from './approval'
+import { isControlPlanePath, controlPlaneRejectMessage } from './controlPlane'
 
 /** 目标是否位于当前激活科研空间内（空间内视为用户自有资料，只读免批准）。 */
 function isInsideSpace(p: string): boolean {
@@ -46,7 +47,7 @@ async function approveWrite(summary: string, detail: string): Promise<boolean> {
 }
 
 /**
- * 科研工作台文件后端：真实磁盘 + 批准卡。
+ * 科研工作台文件后端：真实磁盘 + 批准卡 + 控制平面写保护。
  * virtualMode=false 使绝对路径原样落到宿主磁盘（这是「写桌面文档」能生效的关键）。
  */
 export class MimirFsBackend extends FilesystemBackend {
@@ -73,6 +74,10 @@ export class MimirFsBackend extends FilesystemBackend {
 
   override async write(filePath: string, content: string) {
     const target = resolve(filePath)
+    // C4 控制平面写保护：配置/能力定义目录一律硬拒绝（不弹卡——用户无法审查隐藏的提权后果）
+    if (isControlPlanePath(target)) {
+      return { error: controlPlaneRejectMessage(target) } as never
+    }
     const existing = await super.read(target).catch(() => null)
     const existingText =
       existing !== null && typeof existing === 'object' && 'content' in existing
@@ -92,6 +97,9 @@ export class MimirFsBackend extends FilesystemBackend {
 
   override async edit(filePath: string, oldString: string, newString: string, replaceAll?: boolean) {
     const target = resolve(filePath)
+    if (isControlPlanePath(target)) {
+      return { error: controlPlaneRejectMessage(target) } as never
+    }
     const allowed = await approveWrite(
       `编辑文档 ${target}`,
       `将以替换方式修改该文件（oldString → newString，${replaceAll === true ? '全部替换' : '首个匹配'}）。`
@@ -104,6 +112,9 @@ export class MimirFsBackend extends FilesystemBackend {
 
   override async delete(filePath: string) {
     const target = resolve(filePath)
+    if (isControlPlanePath(target)) {
+      return { error: controlPlaneRejectMessage(target) } as never
+    }
     const allowed = await approveWrite(`删除 ${target}`, '将删除该文件或整个目录（含其内容）。此操作不可撤销。')
     if (!allowed) {
       return { error: '已取消：删除未获得用户确认（或等待超时）。' } as never

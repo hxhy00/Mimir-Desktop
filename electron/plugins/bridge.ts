@@ -1,15 +1,20 @@
 /**
- * 本地桥接服务（Issue 3 Phase 1）。
+ * 本地桥接服务（Issue 3 Phase 1；安全收口 C4 后为「本机只读协作面」）。
  *
- * 在 Electron 主进程中起一个 HTTP server，只绑定 127.0.0.1，
- * 让各 harness 的插件（Codex extension / Claude Code skill / Pi MCP）通过
- * HTTP 调用 Mimir 的本地科研能力。
+ * 在 Electron 主进程中起一个 HTTP server，只绑定 127.0.0.1，供本机进程间协作
+ * 查询 Mimir 的本地科研数据。
  *
- * 设计原则：
- * - 只读操作默认允许，写入/删除操作需要 header 中携带确认 token。
+ * 设计原则（C4 收口后）：
+ * - **只暴露只读查询**：写入/删除路由已全部移除（原 library/import、update、remove、
+ *   meetings/generate、venues/watch 的写入口改为「不对外提供」）。理由：确认 token 只能
+ *   证明调用方读过 ~/.mimir/bridge.json（同机任意进程都能读），无法构成远程鉴权，
+ *   更挡不住「一次授权后调任意写接口」。把危险面整体拿掉，比加固一个挡不住的 token 更可靠。
  * - 只绑定 loopback，不暴露到网络。
  * - 端口通过环境变量 MIMIR_BRIDGE_PORT 或随机端口指定。
- * - 启动时把端口号写入 ~/.mimir/bridge.json，供插件发现。
+ * - 启动时把端口号写入 ~/.mimir/bridge.json，供本机调用方发现。
+ *
+ * 注：历史上该 bridge 是「为外部 harness 插件提供写能力」的通道；多 harness 集成本身
+ * 已在架构 v3 定案中取消，故其写入路由一并下线。
  */
 
 import { createServer, type IncomingMessage, type ServerResponse } from 'http'
@@ -17,7 +22,7 @@ import { writeFile, readFile, mkdir } from 'fs/promises'
 import { existsSync } from 'fs'
 import { join } from 'path'
 import { homedir } from 'os'
-import { randomUUID } from 'crypto'
+import { randomUUID, timingSafeEqual } from 'crypto'
 
 /** 桥接服务状态。 */
 interface BridgeState {
@@ -132,23 +137,25 @@ function matchRoute(
   return null
 }
 
-/** 校验写入操作的确认 token。 */
-function requireConfirm(req: IncomingMessage): void {
-  const token = req.headers['x-mimir-confirm']
-  if (token !== state.confirmToken) {
-    throw new Error('写入操作需要 X-Mimir-Confirm 头携带确认 token')
-  }
+/**
+ * 恒定时间字符串比较（C4，长度不等直接返回 false，不泄漏前缀信息）。
+ * 保留：供未来若重新开放需鉴权的接口使用；当前只读路由无需 token。
+ */
+export function timingSafeEqualStr(a: string, b: string): boolean {
+  const ba = Buffer.from(a, 'utf-8')
+  const bb = Buffer.from(b, 'utf-8')
+  if (ba.length !== bb.length) return false
+  return timingSafeEqual(ba, bb)
 }
 
 // ═══════════════════════════════════════════════════════════════
-//  路由实现（只展示几个核心能力作为 Phase 1 验证）
+//  路由实现（只读查询面）
 // ═══════════════════════════════════════════════════════════════
 
 import * as library from '../library/libraryService'
 import { listFigures } from '../figures/figuresService'
-import { listMeetingDecks, generateMeetingDeck } from '../meetings/service'
-import type { GenerateDeckRequest } from '../meetings/types'
-import { listVenueDeadlines, setVenueWatch } from '../venues/venuesService'
+import { listMeetingDecks } from '../meetings/service'
+import { listVenueDeadlines } from '../venues/venuesService'
 
 // ── 服务器状态（占位：返回空列表，Issue 3 Phase 2 补充）───────
 route('GET', '/api/servers/list', async () => {
@@ -164,27 +171,11 @@ route('GET', '/api/library/projects', async () => {
   return { projects: library.listProjects() }
 })
 
-route('POST', '/api/library/import', async (req, _params, body) => {
-  requireConfirm(req)
-  const entry = (body as Record<string, unknown>)?.entry
-  if (entry === undefined) throw new Error('缺少 entry 参数')
-  const projectId = (body as Record<string, unknown>)?.projectId as string | undefined
-  return library.importPaper(entry as Parameters<typeof library.importPaper>[0], projectId)
-})
-
-route('POST', '/api/library/update', async (req, _params, body) => {
-  requireConfirm(req)
-  if (body === undefined || body === null) throw new Error('缺少请求体')
-  return library.updatePaper(body as Parameters<typeof library.updatePaper>[0])
-})
-
-route('POST', '/api/library/remove', async (req, _params, body) => {
-  requireConfirm(req)
-  const arxivId = (body as Record<string, unknown>)?.arxivId as string | undefined
-  if (!arxivId) throw new Error('缺少 arxivId 参数')
-  await library.removePaper(arxivId)
-  return { ok: true }
-})
+// ── 写路由（C4 已移除）─────────────────────────────────────────
+// 原 POST /api/library/import、/api/library/update、/api/library/remove、
+// /api/meetings/generate、/api/venues/watch 均已下线：确认 token 只证明调用方读过
+// 本机 bridge.json，无法作为写操作授权（同机任意进程可读，且一次授权即可调任意写接口）。
+// 写入能力保留在应用内的 UI 与 Agent 工具路径（后者经 approval.ts 逐次人工确认）。
 
 // ── 图表 ─────────────────────────────────────────────────────
 route('GET', '/api/figures/list', async () => {
@@ -196,24 +187,9 @@ route('GET', '/api/meetings/list', async () => {
   return { decks: await listMeetingDecks() }
 })
 
-route('POST', '/api/meetings/generate', async (req, _params, body) => {
-  requireConfirm(req)
-  if (body === null || body === undefined) throw new Error('缺少请求体')
-  return generateMeetingDeck(body as GenerateDeckRequest)
-})
-
 // ── 会议截稿 ─────────────────────────────────────────────────
 route('GET', '/api/venues/list', async () => {
   return listVenueDeadlines()
-})
-
-route('POST', '/api/venues/watch', async (req, _params, body) => {
-  requireConfirm(req)
-  const seriesKey = (body as Record<string, unknown>)?.seriesKey as string | undefined
-  const watched = (body as Record<string, unknown>)?.watched as boolean | undefined
-  if (!seriesKey || watched === undefined) throw new Error('缺少 seriesKey 或 watched')
-  setVenueWatch(seriesKey, watched)
-  return { ok: true }
 })
 
 // ═══════════════════════════════════════════════════════════════

@@ -1,10 +1,11 @@
 /**
- * 批准卡机制单元测试：无发送器时保守放行、回填生效、超时按拒绝、并发互不干扰。
+ * 批准卡机制单元测试：无发送器时 Fail-Closed（默认拒绝）、回填生效、超时按拒绝、并发互不干扰、来源透传。
  */
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   requireUserApproval,
   setApprovalSender,
+  resetApprovalSender,
   settleApproval,
   approvalTimeoutMs,
   type ApprovalRequest
@@ -26,15 +27,41 @@ function captureSender(): ApprovalRequest[] {
 }
 
 describe('approval：副作用工具的用户确认握手', () => {
-  it('无发送器（默认状态，无窗口）时保守放行，避免阻塞 Agent', async () => {
-    // 初始 sender 为 null（模块级默认）——本用例不调用 setApprovalSender
+  it('无发送器（无窗口/通道未注册）时 Fail-Closed：默认拒绝并告警', async () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+    resetApprovalSender() // 确保回到「无通道」状态
 
     const allow = await requireUserApproval({ tool: 'write_file', summary: '写文件' })
 
-    expect(allow).toBe(true)
+    expect(allow).toBe(false)
     expect(warn).toHaveBeenCalled()
     warn.mockRestore()
+  })
+
+  it('窗口销毁（resetApprovalSender）后，在途请求被拒绝而非放行', async () => {
+    const seen = captureSender()
+    const pending = requireUserApproval({ tool: 'write_file', summary: '写文件' })
+    expect(seen).toHaveLength(1)
+
+    resetApprovalSender()
+
+    await expect(pending).resolves.toBe(false)
+    restorers.pop()?.()
+  })
+
+  it('缺省来源视为主 agent；显式来源原样透传（C3）', async () => {
+    const seen = captureSender()
+    const a = requireUserApproval({ tool: 'write_file', summary: '主 agent 写盘' })
+    const b = requireUserApproval({
+      tool: 'write_file',
+      summary: '子代理写盘',
+      source: { origin: 'subagent', subagentId: 'paper-writer', subagentLabel: '论文写作员' }
+    })
+    expect(seen[0].source).toEqual({ origin: 'main' })
+    expect(seen[1].source).toEqual({ origin: 'subagent', subagentId: 'paper-writer', subagentLabel: '论文写作员' })
+    settleApproval(seen[0].id, true)
+    settleApproval(seen[1].id, true)
+    await Promise.all([a, b])
   })
 
   it('回填 true → 放行', async () => {

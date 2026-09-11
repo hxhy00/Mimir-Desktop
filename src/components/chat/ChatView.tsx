@@ -33,11 +33,18 @@ import type { SlashEntry } from '@/lib/slash/types'
 import { registerSpaceFlush } from '@/lib/spaceFlush'
 
 /** Agent 副作用确认（见 electron/agent/approval.ts）。 */
+interface ApprovalSourceInfo {
+  origin: 'main' | 'subagent'
+  subagentId?: string
+  subagentLabel?: string
+}
 interface PendingApproval {
   id: string
   tool: string
   summary: string
   detail?: string
+  /** C3：发起方来源（主 agent / 子代理），用于批准卡展示「谁在申请」。 */
+  source?: ApprovalSourceInfo
 }
 
 /** Agent 执行事件树节点（run 根 / 阶段 / 任务 / 思考 / 工具行）。 */
@@ -125,10 +132,50 @@ type HistoryMsg = { role: 'user' | 'assistant'; content: string }
 const MAX_CONTEXT_CHARS = 60_000
 /** 压缩后仍保留的「最近原文窗口」字符数。 */
 const KEEP_TAIL_CHARS = 32_000
+/** 单次压缩请求的最大字符数（B2）：超长一次调用易被网关拒绝/超时，分段压缩提高成功率。 */
+const COMPRESS_CHUNK_CHARS = 8_000
 /** 归档 store key 前缀：被压缩掉的旧轮原文，key = chat:archive:<convId>。 */
 const HISTORY_ARCHIVE_PREFIX = 'chat:archive:'
 /** 失效对象提醒 store key 前缀：key = chat:reminders:<convId>（治理 M3）。 */
 const REMINDER_STORE_PREFIX = 'chat:reminders:'
+/** 压缩熔断 store key 前缀：key = chat:compressFail:<convId>（治理 B3）。 */
+const COMPRESS_FAIL_PREFIX = 'chat:compressFail:'
+/** 同一会话连续压缩失败熔断阈值（治理 B3）：达到后本轮直接截断，不再重试。 */
+const COMPRESS_FAIL_LIMIT = 3
+
+/**
+ * 压缩后能力声明（B1）：上下文被压缩后，早期历史里出现过的「可委派子代理 / 技能与指令」
+ * 会一起消失，模型会「失忆」到只记得摘要里的内容，从而不再主动委派或建议技能。
+ *
+ * 关键设计：声明**不硬编码能力清单**，而是从当前真实注册表实时派生——
+ * 内置 + 自定义子代理来自 IPC `agent:getSubagentCatalog`（= 主进程 `subagentRegistry`，
+ * 含 deepagents 内置 fs 工具与批准卡说明），技能来自渲染层同一份 `slashEntries`
+ * （= `src/lib/slash/registry.ts`）。这样文档删改 harness / 增删技能或子代理时，
+ * 声明自动同步，不会像静态常量那样漂移成「已删除但仍被宣称」的幻觉来源。
+ */
+const BUILTIN_FS_CAPABILITY_LINE =
+  '- 内置文件工具：read_file/write_file/edit_file/glob/grep/ls/execute（写盘与读空间外路径会先弹批准卡）。'
+
+/** 能力声明正文（不含标题）：子代理来自主进程真实注册表，技能来自本进程 slash 目录。 */
+interface CapabilityContext {
+  subagents: { id: string; label: string; description: string }[]
+  skills: { trigger: string; title: string }[]
+}
+
+function buildCapabilityDeclaration(ctx: CapabilityContext): string {
+  const subs = ctx.subagents.filter((s) => s.id !== 'files') // files 能力由内置 fs 工具说明覆盖
+  const lines: string[] = [
+    BUILTIN_FS_CAPABILITY_LINE,
+    subs.length > 0
+      ? `- 可委派子代理：${subs.map((s) => `${s.label}(${s.id})`).join('、')}。`
+      : '- 可委派子代理：见系统提示词中的委派清单。',
+    ctx.skills.length > 0
+      ? `- 技能与指令：${ctx.skills.map((s) => `/${s.trigger}`).join('、')}；用户以「/触发词 参数」调用时，完整说明会随该消息附带。`
+      : '- 技能与指令：用户可随时以「/触发词 参数」形式调用。',
+    '若任务匹配某技能或某个子代理的职责（如文献综述、查新、实验设计、回复审稿、文件产出），优先按对应能力推进，不要因为早期记录被压缩而遗忘。'
+  ]
+  return lines.join('\n')
+}
 /** 破坏性动作特征词：命中则认为会话内对象可能已失效（删除/改名/覆盖等）。 */
 const DESTRUCTIVE_ACTION_RE = /(删除|移除|改名|重命名|覆盖|清除|回退)/
 
@@ -194,14 +241,37 @@ async function addConversationReminder(convId: string, text: string): Promise<vo
 }
 
 /**
+ * 压缩汇总（B1 前置）：把「子代理注册表 + 技能目录」收敛成一条可复用的能力声明正文。
+ * 子代理取自主进程真实注册表（IPC），技能取自渲染层同一份 slash 目录（调用方传入）。
+ * 取不到时返回 null（调用方跳过，不阻断发送）。
+ * @param entries 当前生效的斜杠目录（内置 + 自定义），与 `resolveSlashInput` 用的是同一份
+ */
+async function loadCapabilityContext(entries: readonly SlashEntry[]): Promise<CapabilityContext | null> {
+  const api = window.electronAPI
+  try {
+    const catalog = (await api?.getSubagentCatalog?.()) ?? null
+    return {
+      subagents: (catalog?.builtin ?? []).map((b) => ({ id: b.id, label: b.label, description: b.description })),
+      skills: entries.map((e) => ({ trigger: e.trigger, title: e.title }))
+    }
+  } catch {
+    return null
+  }
+}
+
+/**
  * 组装发送给 Agent 的对话历史：
  * 0) 前置本会话的「失效对象提醒」（M3：删除/改名/覆盖后防止跨轮复述旧描述）；
  * 1) 总长 ≤ 阈值 → 直接原样返回（滑动窗口无需触发）；
- * 2) 超过阈值 → 保留最近 KEEP_TAIL_CHARS 原文，更早部分先做 LLM 结构化摘要，
- *    摘要以一条 assistant 消息置于队首；压缩失败则降级为截断窗口。
+ * 2) 超过阈值 → 逐段压缩更早部分（每段上限 8k 字 + 熔断），摘要置于队首，
+ *    并用能力声明（B1）重建被压掉的能力感知；单条摘要失败即中断压缩、降级为截断窗口。
  * 被压缩原文异步归档到 store（chat:archive:<convId>）供回看，不回灌模型。
+ * @param capability B1 能力声明：压缩生效时追加，避免模型压缩后「失忆」到不再委派/建议技能
  */
-async function buildOutgoingHistory(conv: Conversation): Promise<HistoryMsg[]> {
+async function buildOutgoingHistory(
+  conv: Conversation,
+  capability: CapabilityContext | null
+): Promise<HistoryMsg[]> {
   const api = window.electronAPI
   // M3：本会话失效对象提醒（删除/改名/覆盖）作为轻量 assistant 消息前置，防止跨轮复述旧描述
   const reminders = await loadConversationReminders(conv.id)
@@ -209,51 +279,135 @@ async function buildOutgoingHistory(conv: Conversation): Promise<HistoryMsg[]> {
   const all = [...reminderMsgs, ...toHistoryMessages(conv.messages)]
   if (all.length === 0) return all
   if (!api?.compressConversation) return all
-  const total = all.reduce((sum, m) => sum + m.content.length, 0)
-  if (total <= MAX_CONTEXT_CHARS) return all
-
-  // 找到「最近 KEEP_TAIL_CHARS」对应的起始索引，之前部分进入压缩
-  let start = all.length
-  let acc = 0
-  while (start > 0) {
-    const len = all[start - 1].content.length
-    if (acc + len > KEEP_TAIL_CHARS) break
-    acc += len
-    start -= 1
+  // B3 熔断：同一会话连续压缩失败 ≥3 次则本轮直接走截断窗口，
+  // 不再烧 token 重试（避免无限失败静默消耗），并提示模型上下文被截断。
+  const failKey = `${COMPRESS_FAIL_PREFIX}${conv.id}`
+  let failCount = 0
+  try {
+    failCount = ((await api.getStoreValue<number>(failKey)) ?? 0) as number
+  } catch {
+    // ignore
   }
+  const total = all.reduce((sum, m) => sum + m.content.length, 0)
+  if (total <= MAX_CONTEXT_CHARS) {
+    // 有余量即重置熔断计数，下次超限可重试压缩
+    if (failCount > 0) void api.setStoreValue(failKey, 0).catch(() => {})
+    return all
+  }
+  if (failCount >= COMPRESS_FAIL_LIMIT) {
+    return truncateToTail(all, KEEP_TAIL_CHARS, true)
+  }
+
+  // 找到「最近 KEEP_TAIL_CHARS」对应的起始索引，之前部分进入压缩。
+  // B1/B2 断点保护：边界只落在 user 消息上，尾窗口不会从半轮（只有 assistant）开始。
+  const start = findChunkStart(all, all.length, KEEP_TAIL_CHARS)
   if (start === 0) return all // 单条消息就超长：不循环压缩同一条，原样返回
   const head = all.slice(0, start)
   const tail = all.slice(start)
 
-  let res: { ok: boolean; summary?: string; message?: string }
-  try {
-    res = await api.compressConversation(head)
-  } catch {
-    res = { ok: false }
-  }
-  if (res.ok && res.summary !== undefined && res.summary.trim() !== '') {
-    // 归档最旧原文（尽力而为，失败不阻塞主流程）
+  // ── B2 断点保护：分段压缩，每段独立限额 + 独立熔断 ────────────────────────
+  // 原实现把整段 head 一次性丢给 LLM：超长时大概率请求失败/被网关拒绝，退化为
+  // 纯截断（旧信息全丢）。改为从最新往旧逐段压缩，每段上限 COMPRESS_CHUNK_CHARS：
+  // ① 单段失败只丢该段，更旧的不再尝试（避免连环烧 token），已成功段落照常保留；
+  // ② 段间边界只落在 user 消息上，不会把一轮问答拆散（B1/B2 断点保护）。
+  const summaries: string[] = []
+  let cursor = head.length
+  let compressedAny = false
+  let segmentFail = 0
+  while (cursor > 0) {
+    const chunkStart = findChunkStart(head, cursor, COMPRESS_CHUNK_CHARS)
+    const chunk = head.slice(chunkStart, cursor)
+    cursor = chunkStart
+    if (chunk.length === 0) break
+    let res: { ok: boolean; summary?: string; message?: string }
     try {
-      const key = `${HISTORY_ARCHIVE_PREFIX}${conv.id}`
-      const prev = (await api.getStoreValue<unknown[]>(key)) ?? []
-      await api.setStoreValue(key, [...prev, { at: new Date().toISOString(), head }])
+      res = await api.compressConversation(chunk)
     } catch {
-      // ignore archive error
+      res = { ok: false }
     }
-    return [{ role: 'assistant', content: `【更早对话摘要（已压缩）】\n${res.summary}` }, ...tail]
+    if (res.ok && res.summary !== undefined && res.summary.trim() !== '') {
+      summaries.unshift(`【对话片段摘要】\n${res.summary.trim()}`)
+      compressedAny = true
+      segmentFail = 0
+      // 该段原文归档（尽力而为，失败不阻塞主流程）
+      try {
+        const key = `${HISTORY_ARCHIVE_PREFIX}${conv.id}`
+        const prev = (await api.getStoreValue<unknown[]>(key)) ?? []
+        await api.setStoreValue(key, [...prev, { at: new Date().toISOString(), head: chunk }])
+      } catch {
+        // ignore archive error
+      }
+    } else {
+      segmentFail += 1
+      if (segmentFail >= COMPRESS_FAIL_LIMIT) break // B3 段级熔断：连续失败即停止继续压缩旧段
+    }
   }
-  // 压缩失败降级：仅保留最近窗口
+
+  if (compressedAny) {
+    // 压缩成功：重置会话级熔断计数
+    if (failCount > 0) void api.setStoreValue(failKey, 0).catch(() => {})
+    // B1：压缩后重建能力声明——被压掉的历史里可能出现过 /技能 与子代理委派记录，
+    // 模型压缩后容易「失忆」到不再主动委派/建议技能。声明由真实注册表派生（非硬编码）。
+    const head0: HistoryMsg[] = [
+      { role: 'assistant', content: `【更早对话摘要（已压缩）】\n${summaries.join('\n\n')}` }
+    ]
+    if (capability !== null) {
+      head0.push({
+        role: 'assistant',
+        content: `【能力提醒（历史已压缩，此为按当前注册表生成的固定声明）】\n${buildCapabilityDeclaration(capability)}`
+      })
+    }
+    return [...head0, ...tail]
+  }
+  // 全部段压缩失败降级：仅保留最近窗口，并累计失败次数供熔断
+  try {
+    await api.setStoreValue(failKey, failCount + 1)
+  } catch {
+    // ignore
+  }
+  return truncateToTail(all, KEEP_TAIL_CHARS, false)
+}
+
+/**
+ * B1/B2 断点保护：从 end 往前取一段「≤ maxChars」的历史，边界只落在 user 消息上，
+ * 保证不把一轮问答（user+assistant）拆散——拆散会让摘要丢上下文、让尾窗口从半轮开始。
+ * 若 end 之前没有任何 user 边界（整段都属于一轮），则整段返回，不硬切。
+ */
+function findChunkStart(all: HistoryMsg[], end: number, maxChars: number): number {
+  let acc = 0
+  let idx = end
+  while (idx > 0) {
+    const len = all[idx - 1].content.length
+    if (acc + len > maxChars) break
+    acc += len
+    idx -= 1
+    if (all[idx].role === 'user') return idx // 落在 user 边界，收束
+  }
+  return idx
+}
+
+/**
+ * 截断保留最近 keepChars 字符的尾部历史（B3 降级路径共用）。
+ * @param noticeTruncated 为 true 时在队首加一条 assistant 提示，告知模型更早内容被截断。
+ */
+function truncateToTail(all: HistoryMsg[], keepChars: number, noticeTruncated: boolean): HistoryMsg[] {
   const cut: HistoryMsg[] = []
-  let budget = KEEP_TAIL_CHARS
-  for (let i = tail.length - 1; i >= 0; i--) {
+  let budget = keepChars
+  for (let i = all.length - 1; i >= 0; i--) {
     if (budget <= 0) break
-    const content = tail[i].content
+    const content = all[i].content
     if (content.length > budget) {
-      cut.unshift({ ...tail[i], content: content.slice(-budget) })
+      cut.unshift({ ...all[i], content: content.slice(-budget) })
       break
     }
     budget -= content.length
-    cut.unshift(tail[i])
+    cut.unshift(all[i])
+  }
+  if (noticeTruncated) {
+    cut.unshift({
+      role: 'assistant',
+      content: '【注意】更早的对话历史因上下文超限且压缩多次失败而被截断，缺失部分可能影响连续性；如需关键细节请向用户确认。'
+    })
   }
   return cut
 }
@@ -387,64 +541,6 @@ export function ChatView({ rightSidebarCollapsed, onToggleRightSidebar, sidebarC
   const [showUltraMenu, setShowUltraMenu] = useState(false)
   const ultraMenuRef = useRef<HTMLDivElement>(null)
 
-  // ── Harness 选择（Issue 7）：顶栏下拉，切换后持久化到 settings.selectedHarness ──
-  interface HarnessItem {
-    id: string
-    name: string
-    kind: string
-    available: boolean
-  }
-  const [harnessList, setHarnessList] = useState<readonly HarnessItem[]>([])
-  const [activeHarnessId, setActiveHarnessId] = useState('mimir')
-  const [showHarnessMenu, setShowHarnessMenu] = useState(false)
-  const harnessMenuRef = useRef<HTMLDivElement>(null)
-
-  // 初始加载 harness 列表与当前激活项
-  useEffect(() => {
-    let cancelled = false
-    window.electronAPI?.harness
-      ?.list()
-      .then((res) => {
-        if (cancelled) return
-        setHarnessList(res.harnesses)
-        setActiveHarnessId(res.activeId)
-      })
-      .catch(() => {})
-    return () => {
-      cancelled = true
-    }
-  }, [])
-
-  // 点击外部关闭 harness 菜单
-  useEffect(() => {
-    if (!showHarnessMenu) return
-    const onDocMouseDown = (e: MouseEvent): void => {
-      if (harnessMenuRef.current && !harnessMenuRef.current.contains(e.target as Node)) {
-        setShowHarnessMenu(false)
-      }
-    }
-    document.addEventListener('mousedown', onDocMouseDown)
-    return () => document.removeEventListener('mousedown', onDocMouseDown)
-  }, [showHarnessMenu])
-
-  /** 切换 harness：主进程激活 + 持久化到 settings.selectedHarness（不可用项直接忽略）。 */
-  const switchHarness = useCallback(async (item: HarnessItem) => {
-    if (!item.available) return
-    setShowHarnessMenu(false)
-    const res = await window.electronAPI?.harness?.setActive(item.id)
-    if (!res?.ok) return
-    setActiveHarnessId(res.activeId ?? item.id)
-    try {
-      const settings = ((await window.electronAPI?.getSettings()) ?? {}) as Record<string, unknown>
-      await window.electronAPI?.setSettings({ ...settings, selectedHarness: item.id })
-    } catch {
-      // 持久化失败不影响本次会话内已切换生效
-    }
-  }, [])
-  const activeHarness = useMemo(
-    () => harnessList.find((h) => h.id === activeHarnessId) ?? null,
-    [harnessList, activeHarnessId]
-  )
   const [renamingId, setRenamingId] = useState<string | null>(null)
   const [renameValue, setRenameValue] = useState('')
   const [hydrated, setHydrated] = useState(false)
@@ -883,8 +979,10 @@ export function ChatView({ rightSidebarCollapsed, onToggleRightSidebar, sidebarC
         return
       }
 
-      // 上下文治理（M2）：滑动窗口历史 + 超限时对最旧部分摘要压缩（大会话才触发 LLM 压缩）
-      const outgoingHistory = await buildOutgoingHistory(activeConvRef.current)
+      // 上下文治理（M2）：滑动窗口历史 + 超限时对最旧部分摘要压缩（大会话才触发 LLM 压缩）；
+      // B1：能力声明由真实注册表派生（子代理目录 + 技能目录），压缩生效时随摘要注入
+      const capabilityCtx = await loadCapabilityContext(slashEntries)
+      const outgoingHistory = await buildOutgoingHistory(activeConvRef.current, capabilityCtx)
 
       // Build full message with attachments
       let fullMessage = slashMatch === null ? trimmed : slashMatch.expanded
@@ -1296,59 +1394,6 @@ export function ChatView({ rightSidebarCollapsed, onToggleRightSidebar, sidebarC
                 <PanelLeftOpen className="h-4 w-4" />
               </button>
             )}
-            {/* Harness 选择（Issue 7）：标题即下拉触发器，未实现的 harness 灰显占位 */}
-            <div className="relative" ref={harnessMenuRef}>
-              <button
-                type="button"
-                onClick={() => setShowHarnessMenu((v) => !v)}
-                className="no-drag flex items-center gap-1 rounded-md px-1 -mx-1 transition-colors hover:bg-accent"
-                title="Agent Harness：选择消息执行引擎（Codex / Claude Code / Pi 即将支持）"
-              >
-                <span className="module-title">{activeHarness?.name ?? 'Mimir'}</span>
-                <ChevronDown className={cn('h-3 w-3 text-muted-foreground transition-transform', showHarnessMenu && 'rotate-180')} />
-              </button>
-              {showHarnessMenu && (
-                <div className="no-drag absolute left-0 top-full mt-1 z-50 w-56 rounded-lg border border-border bg-popover p-1 shadow-md">
-                  {harnessList.map((h) => {
-                    const active = h.id === activeHarnessId
-                    return (
-                      <button
-                        key={h.id}
-                        type="button"
-                        onClick={() => switchHarness(h)}
-                        disabled={!h.available}
-                        className={cn(
-                          'flex w-full items-center gap-2 px-2.5 py-2 text-left rounded-md transition-colors',
-                          active
-                            ? 'bg-primary/5 text-primary'
-                            : h.available
-                              ? 'hover:bg-accent text-foreground'
-                              : 'cursor-not-allowed opacity-45'
-                        )}
-                      >
-                        <span
-                          className={cn(
-                            'h-3 w-3 shrink-0 rounded-full border',
-                            active ? 'border-primary bg-primary' : 'border-muted-foreground/40'
-                          )}
-                          aria-hidden="true"
-                        />
-                        <span className="min-w-0 flex-1">
-                          <span className="flex items-center gap-1.5 text-[12px] font-medium">
-                            {h.name}
-                            {!h.available && (
-                              <span className="rounded bg-muted px-1 py-px text-[9px] text-muted-foreground">
-                                即将支持
-                              </span>
-                            )}
-                          </span>
-                        </span>
-                      </button>
-                    )
-                  })}
-                </div>
-              )}
-            </div>
             <span className="status-dot bg-green-500" title="就绪" />
             <span className="text-[11px] text-muted-foreground">就绪</span>
           </div>
@@ -1465,6 +1510,14 @@ export function ChatView({ rightSidebarCollapsed, onToggleRightSidebar, sidebarC
                 <div className="flex items-center gap-2">
                   <span className="text-[11px] font-medium text-foreground">Agent 请求执行「{pendingApproval.tool}」</span>
                   <span className="rounded bg-amber-500/15 px-1.5 py-px text-[9px] font-medium text-amber-700">需确认</span>
+                  {pendingApproval.source?.origin === 'subagent' && (
+                    <span
+                      className="rounded bg-sky-500/15 px-1.5 py-px text-[9px] font-medium text-sky-700"
+                      title={pendingApproval.source.subagentId !== undefined ? `子代理 id：${pendingApproval.source.subagentId}` : undefined}
+                    >
+                      来自子代理：{pendingApproval.source.subagentLabel ?? pendingApproval.source.subagentId ?? '未命名'}
+                    </span>
+                  )}
                 </div>
                 <p className="mt-0.5 text-[12px] text-foreground/90">{pendingApproval.summary}</p>
                 {pendingApproval.detail !== undefined && pendingApproval.detail !== '' && (

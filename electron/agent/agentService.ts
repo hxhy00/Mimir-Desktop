@@ -10,6 +10,9 @@ import type { RouterCandidate } from './skillRouter'
 import { loadSubAgentDefs, WORKER_TOOL_CATALOG, BUILTIN_SUBAGENTS } from './subagentRegistry'
 import { MimirFsBackend } from './fsBackend'
 import { createAgentTraceHandler, type AgentTraceLevel } from './trace'
+import { withApprovalSource, type ApprovalSource } from './approval'
+import { assertNoDelegationTools, guardSubagentTools } from './delegationFirewall'
+import { SUBAGENT_RETURN_CONTRACT, SUPERVISOR_DELEGATION_CONSUMPTION } from './subagentResult'
 
 /** Supervisor 模式：主管 Agent 负责规划并把任务委派给按科研模块划分的子 Agent（worker）。
  *  每个 worker 携带各自模块的工具，在独立上下文中执行并把结构化结果返回给主管；
@@ -90,7 +93,7 @@ const SUPERVISOR_SYSTEM = `你是 Mimir，一个以 Agent 为核心的科研助�
 - 涉及写盘/长耗时/生成产物等副作用时，相关工具会先向用户弹「批准卡片」，请等待用户确认后再继续；
 - 各模块（文献库/论文/实验/组会/服务器/图表/成长记录/会议截稿等）的能力均由对应子 Agent 的工具提供，你本人不直接持有这些工具；
 - 长期记忆（load_memory，你直属的只读工具）：当任务与用户的长期研究方向/常用约束/常用事实相关时才按需调用，不要默认请求每次加载；档案为空时不要臆造用户偏好；
-- 每条消息可能附带一段「可选技能候选」：当其中某技能与该请求匹配时，按它的流程执行；不匹配就忽略，保持常规工作方式，不要编造候选之外的技能。`
+- 每条消息可能附带一段「可选技能候选」：当其中某技能与该请求匹配时，按它的流程执行；不匹配就忽略，保持常规工作方式，不要编造候选之外的技能。${SUPERVISOR_DELEGATION_CONSUMPTION}`
 
 /** ── Self-Consistency 多专家合议（可选增强子图，默认关闭，用户按条消息开启）──
  *  控制流：Meta-Cognition 元认知判定 → 并行 K 路独立候选生成（无工具）→
@@ -306,23 +309,29 @@ function humanizeAgentError(error: unknown): string {
   return raw
 }
 
-/** 包装工具：调用前 / 返回 / 出错三处打点（每个 worker/用途实例化一份，避免并发互串）；返回/出错附带耗时（ms）。 */
+/** 包装工具：调用前 / 返回 / 出错三处打点（每个 worker/用途实例化一份，避免并发互串）；返回/出错附带耗时（ms）。
+ *  C3：可选 `source` 会把整条调用链标记为某子代理发起，使链内 `requireUserApproval` 的批准卡带上来源。 */
 function withToolTrace(
   base: ToolLike,
   hooks: {
     onCall: (name: string, args: unknown) => void
     onDone: (name: string, out: unknown, durationMs: number) => void
     onError: (name: string, error: unknown, durationMs: number) => void
+    source?: ApprovalSource
   }
 ): ToolLike {
   const proxied = Object.create(base) as ToolLike
   proxied.invoke = async (input: unknown) => {
     hooks.onCall(base.name, input)
     const t0 = Date.now()
-    try {
+    const run = async () => {
       const out = await base.invoke.call(proxied, input)
       hooks.onDone(base.name, out, Date.now() - t0)
       return out
+    }
+    try {
+      if (hooks.source !== undefined) return await withApprovalSource(hooks.source, run)
+      return await run()
     } catch (error) {
       hooks.onError(base.name, error, Date.now() - t0)
       throw error
@@ -373,44 +382,53 @@ export class AgentService {
     if (rejected.length > 0) {
       console.warn('[subagent-registry] 以下自定义子代理注册被拒绝：', rejected)
     }
-    return agents.map((def) => ({
-      name: def.id,
-      description: def.description,
-      systemPrompt: def.systemPrompt,
-      tools: def.tools.map((base) =>
-        withToolTrace(base as ToolLike, {
-          onCall: (name, args): void => {
-            this.workerTraceEmit?.({
-              taskId: def.id,
-              title: def.label,
-              status: 'running',
-              kind: 'tool',
-              text: `调用 ${name}${args ? `：${truncateSummary(args, 120)}` : ''}`
-            })
-          },
-          onDone: (name, out, durationMs): void => {
-            this.workerTraceEmit?.({
-              taskId: def.id,
-              title: def.label,
-              status: 'done',
-              kind: 'tool',
-              text: `${name} 返回：${truncateSummary(out, 4000)}`,
-              durationMs
-            })
-          },
-          onError: (name, error, durationMs): void => {
-            this.workerTraceEmit?.({
-              taskId: def.id,
-              title: def.label,
-              status: 'error',
-              kind: 'tool',
-              text: `${name} 出错：${humanizeAgentError(error)}`,
-              durationMs
-            })
-          }
-        })
-      )
-    }))
+    return agents.map((def) => {
+      // D1 禁嵌套：构建期校验子代理工具集不含委派工具（命中即抛错，避免运行期拓扑失控）
+      assertNoDelegationTools(def.id, def.tools as { name?: string }[])
+      // D1 纵深防御：运行期再包一层，委派工具即使被调用也直接拒绝
+      const guarded = guardSubagentTools(def.id, def.tools as ToolLike[])
+      return {
+        name: def.id,
+        description: def.description,
+        // D2 结构化返回：给每个子代理追加统一「返回契约」，让报告分节、边界清晰
+        systemPrompt: `${def.systemPrompt}${SUBAGENT_RETURN_CONTRACT}`,
+        tools: guarded.map((base) =>
+          withToolTrace(base as ToolLike, {
+            onCall: (name, args): void => {
+              this.workerTraceEmit?.({
+                taskId: def.id,
+                title: def.label,
+                status: 'running',
+                kind: 'tool',
+                text: `调用 ${name}${args ? `：${truncateSummary(args, 120)}` : ''}`
+              })
+            },
+            onDone: (name, out, durationMs): void => {
+              this.workerTraceEmit?.({
+                taskId: def.id,
+                title: def.label,
+                status: 'done',
+                kind: 'tool',
+                text: `${name} 返回：${truncateSummary(out, 4000)}`,
+                durationMs
+              })
+            },
+            onError: (name, error, durationMs): void => {
+              this.workerTraceEmit?.({
+                taskId: def.id,
+                title: def.label,
+                status: 'error',
+                kind: 'tool',
+                text: `${name} 出错：${humanizeAgentError(error)}`,
+                durationMs
+              })
+            },
+            // C3：子代理链内所有副作用工具的批准卡都标记来源，用户能分辨是谁在申请
+            source: { origin: 'subagent', subagentId: def.id, subagentLabel: def.label }
+          })
+        )
+      }
+    })
   }
 
   /**

@@ -5,13 +5,6 @@ import { app } from 'electron'
 import { join, basename, extname, dirname, relative } from 'path'
 import { existsSync, mkdirSync } from 'fs'
 import { agentService } from '../agent/agentService'
-import {
-  HARNESS_REGISTRATIONS,
-  getActiveHarness,
-  getActiveHarnessId,
-  setActiveHarness,
-  applyHarnessFromSettings
-} from '../agent/harnessRegistry'
 import { startBridge, stopBridge, isBridgeRunning, getBridgePort, getConfirmToken } from '../plugins/bridge'
 import { setApprovalSender, settleApproval } from '../agent/approval'
 import { probeServer, type ProbeConfig } from '../servers/probe'
@@ -189,30 +182,6 @@ export function setupIpcHandlers(winRef: { current: BrowserWindow | null }): voi
     return listModels({ baseUrl: args?.baseUrl ?? '', apiKey: args?.apiKey ?? '' })
   })
 
-  // ─── Harness 注册与切换（Issue 1）──────────────────────────────────────
-  ipcMain.handle('harness:list', async () => {
-    return {
-      harnesses: HARNESS_REGISTRATIONS,
-      activeId: getActiveHarnessId()
-    }
-  })
-
-  ipcMain.handle('harness:set', async (_event, id: string) => {
-    const ok = setActiveHarness(id)
-    if (!ok) {
-      return { ok: false, message: `无效的 harness id: ${id}` }
-    }
-    const harness = getActiveHarness()
-    const available = await harness.isAvailable()
-    if (!available) {
-      return {
-        ok: false,
-        message: `「${harness.name}」Harness 尚未实现或当前环境不可用，请选择 Mimir Harness。`
-      }
-    }
-    return { ok: true, activeId: getActiveHarnessId() }
-  })
-
   // ─── 本地桥接服务（Issue 3）──────────────────────────────────────
   ipcMain.handle('bridge:start', async () => {
     if (isBridgeRunning()) {
@@ -247,11 +216,8 @@ export function setupIpcHandlers(winRef: { current: BrowserWindow | null }): voi
   ipcMain.handle('settings:set', async (_event, settings) => {
     setStoreValue('settings', settings)
 
-    // 同步 harness 选择（Issue 1：按 selectedHarness 字段激活）
-    const s = settings as Record<string, unknown>
-    applyHarnessFromSettings(s)
-
     // Initialize agent from models list
+    const s = settings as Record<string, unknown>
     const models = (s.models as Array<Record<string, unknown>> | undefined) || []
     const selectedModelId = s.selectedModelId as string | undefined
     const selected = models.find((m) => m.id === selectedModelId) || models[0]

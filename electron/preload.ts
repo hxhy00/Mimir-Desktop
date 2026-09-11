@@ -180,12 +180,6 @@ export interface ElectronAPI {
     models?: { id: string; ownedBy?: string }[]
     endpoint?: string
   }>
-  // Harness 管理（Issue 1）
-  harness: {
-    list: () => Promise<{ harnesses: { id: string; name: string; kind: string; available: boolean }[]; activeId: string }>
-    setActive: (id: string) => Promise<{ ok: boolean; activeId?: string; message?: string }>
-  }
-
   // Dialog
   showOpenDialog: (options: Electron.OpenDialogOptions) => Promise<Electron.OpenDialogReturnValue>
   showSaveDialog: (options: Electron.SaveDialogOptions) => Promise<Electron.SaveDialogReturnValue>
@@ -236,7 +230,7 @@ export interface ElectronAPI {
   }>
 
   // Agent 副作用确认
-  onApprovalRequest: (callback: (request: { id: string; tool: string; summary: string; detail?: string }) => void) => () => void
+  onApprovalRequest: (callback: (request: { id: string; tool: string; summary: string; detail?: string; source?: { origin: 'main' | 'subagent'; subagentId?: string; subagentLabel?: string } }) => void) => () => void
   approvalRespond: (id: string, allow: boolean) => Promise<boolean>
 
   // ─── 文献库（Library）────────────────────────────────────────────
@@ -429,11 +423,6 @@ const electronAPI: ElectronAPI = {
 
   listModels: (config) => ipcRenderer.invoke('model:list', config),
 
-  harness: {
-    list: () => ipcRenderer.invoke('harness:list'),
-    setActive: (id: string) => ipcRenderer.invoke('harness:set', id)
-  },
-
   bridge: {
     start: () => ipcRenderer.invoke('bridge:start'),
     stop: () => ipcRenderer.invoke('bridge:stop'),
@@ -473,7 +462,10 @@ const electronAPI: ElectronAPI = {
   probeServer: (config) => ipcRenderer.invoke('server:probe', config),
 
   onApprovalRequest: (callback) => {
-    const listener = (_event: unknown, request: { id: string; tool: string; summary: string; detail?: string }) => callback(request)
+    const listener = (
+      _event: unknown,
+      request: { id: string; tool: string; summary: string; detail?: string; source?: { origin: 'main' | 'subagent'; subagentId?: string; subagentLabel?: string } }
+    ) => callback(request)
     ipcRenderer.on('agent:approval-request', listener)
     return () => {
       ipcRenderer.removeListener('agent:approval-request', listener)

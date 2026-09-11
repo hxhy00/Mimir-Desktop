@@ -67,11 +67,6 @@ interface ElectronAPI {
     models?: { id: string; ownedBy?: string }[]
     endpoint?: string
   }>
-  // Harness 管理（Issue 1）
-  harness: {
-    list: () => Promise<{ harnesses: { id: string; name: string; kind: string; available: boolean }[]; activeId: string }>
-    setActive: (id: string) => Promise<{ ok: boolean; activeId?: string; message?: string }>
-  }
   // ─── 本地桥接服务（Issue 3）──────────────────────────────────────
   bridge: {
     start: () => Promise<{ ok: boolean; port?: number; message?: string }>
@@ -118,7 +113,7 @@ interface ElectronAPI {
   }>
 
   // Agent 副作用确认
-  onApprovalRequest: (callback: (request: { id: string; tool: string; summary: string; detail?: string }) => void) => () => void
+  onApprovalRequest: (callback: (request: { id: string; tool: string; summary: string; detail?: string; source?: { origin: 'main' | 'subagent'; subagentId?: string; subagentLabel?: string } }) => void) => () => void
   approvalRespond: (id: string, allow: boolean) => Promise<boolean>
   library: {
     listPapers: () => Promise<{ ok: boolean; papers?: unknown[]; message?: string }>

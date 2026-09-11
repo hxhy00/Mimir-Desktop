@@ -249,10 +249,6 @@ export function Settings({ autoOpenModelDialog = 0, guided = false, onModelStepD
   const [bulkSelected, setBulkSelected] = useState<Set<string>>(new Set())
   const [bulkAdding, setBulkAdding] = useState(false)
   // ── Harness 选择（Issue 1）─────────────────────────────────────────
-  const [harnessList, setHarnessList] = useState<{ id: string; name: string; kind: string; available: boolean }[]>([])
-  const [activeHarnessId, setActiveHarnessId] = useState('mimir')
-  const [harnessBusy, setHarnessBusy] = useState(false)
-  const [harnessMsg, setHarnessMsg] = useState<{ type: 'ok' | 'error'; text: string } | null>(null)
 
   const [speechEngine, setSpeechEngine] = useState<'local' | 'web'>('web')
   const [imgGenBaseUrl, setImgGenBaseUrl] = useState('')
@@ -538,37 +534,6 @@ export function Settings({ autoOpenModelDialog = 0, guided = false, onModelStepD
       off()
     }
   }, [loadResourceStatus])
-
-  // ── Harness 加载与切换（Issue 1）──────────────────────────────────
-  const loadHarnesses = useCallback(async () => {
-    if (!window.electronAPI?.harness?.list) return
-    try {
-      const res = await window.electronAPI.harness.list()
-      setHarnessList(res.harnesses)
-      setActiveHarnessId(res.activeId)
-    } catch { /* ignore */ }
-  }, [])
-
-  useEffect(() => { void loadHarnesses() }, [loadHarnesses])
-
-  const handleSelectHarness = useCallback(async (id: string) => {
-    if (!window.electronAPI?.harness?.setActive || id === activeHarnessId) return
-    setHarnessBusy(true)
-    setHarnessMsg(null)
-    try {
-      const res = await window.electronAPI.harness.setActive(id)
-      if (res.ok) {
-        setActiveHarnessId(id)
-        setHarnessMsg({ type: 'ok', text: `已切换到「${id}」Harness` })
-      } else {
-        setHarnessMsg({ type: 'error', text: res.message ?? '切换失败' })
-      }
-    } catch {
-      setHarnessMsg({ type: 'error', text: '切换失败' })
-    } finally {
-      setHarnessBusy(false)
-    }
-  }, [activeHarnessId])
 
   const handleDownloadResource = useCallback(async (resourceId: string) => {
     if (!window.electronAPI?.downloadResource) return
@@ -1154,65 +1119,6 @@ export function Settings({ autoOpenModelDialog = 0, guided = false, onModelStepD
 
           {/* Model Management Section */}
           {tab === 'models' && (<div className="space-y-3">
-          {/* Harness 选择（Issue 1）*/}
-          <section className="space-y-3">
-            <div className="flex items-center gap-2">
-              <Settings2 className="h-4 w-4 text-primary" />
-              <h2 className="text-sm font-semibold text-foreground">Harness</h2>
-            </div>
-            <p className="text-[11px] text-muted-foreground">
-              选择 Agent 运行环境。Mimir 是当前唯一可用的 Harness；Codex、Claude Code、Pi 即将支持。
-            </p>
-            {harnessMsg !== null && (
-              <div className={cn(
-                'rounded-md border px-3 py-2 text-[11px]',
-                harnessMsg.type === 'ok'
-                  ? 'border-primary/20 bg-primary/5 text-primary'
-                  : 'border-destructive/30 bg-destructive/5 text-destructive'
-              )}>
-                {harnessMsg.text}
-              </div>
-            )}
-            <div className="grid grid-cols-2 gap-2">
-              {harnessList.map((h) => {
-                const isActive = h.id === activeHarnessId
-                return (
-                  <button
-                    key={h.id}
-                    type="button"
-                    onClick={() => void handleSelectHarness(h.id)}
-                    disabled={!h.available || harnessBusy}
-                    className={cn(
-                      'rounded-lg border p-3 text-left transition-all',
-                      isActive
-                        ? 'border-primary bg-primary/5 shadow-sm'
-                        : h.available
-                          ? 'border-border bg-card hover:bg-muted/30'
-                          : 'border-border bg-card opacity-50 cursor-not-allowed'
-                    )}
-                  >
-                    <div className="flex items-center gap-2">
-                      <span className={cn('text-[12px] font-semibold', isActive ? 'text-primary' : 'text-foreground')}>
-                        {h.name}
-                      </span>
-                      {isActive && (
-                        <span className="rounded-full bg-primary/10 px-1.5 py-0.5 text-[9px] font-medium text-primary">
-                          当前
-                        </span>
-                      )}
-                      {!h.available && (
-                        <span className="rounded-full bg-muted px-1.5 py-0.5 text-[9px] text-muted-foreground">
-                          即将支持
-                        </span>
-                      )}
-                    </div>
-                    <p className="mt-1 text-[10px] text-muted-foreground">{h.kind}</p>
-                  </button>
-                )
-              })}
-            </div>
-          </section>
-
           <section className="space-y-3">
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2">
