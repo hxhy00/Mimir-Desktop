@@ -386,6 +386,65 @@ export function ChatView({ rightSidebarCollapsed, onToggleRightSidebar, sidebarC
   const [ultraStrategy, setUltraStrategy] = useState<UltraPick>('auto')
   const [showUltraMenu, setShowUltraMenu] = useState(false)
   const ultraMenuRef = useRef<HTMLDivElement>(null)
+
+  // ── Harness 选择（Issue 7）：顶栏下拉，切换后持久化到 settings.selectedHarness ──
+  interface HarnessItem {
+    id: string
+    name: string
+    kind: string
+    available: boolean
+  }
+  const [harnessList, setHarnessList] = useState<readonly HarnessItem[]>([])
+  const [activeHarnessId, setActiveHarnessId] = useState('mimir')
+  const [showHarnessMenu, setShowHarnessMenu] = useState(false)
+  const harnessMenuRef = useRef<HTMLDivElement>(null)
+
+  // 初始加载 harness 列表与当前激活项
+  useEffect(() => {
+    let cancelled = false
+    window.electronAPI?.harness
+      ?.list()
+      .then((res) => {
+        if (cancelled) return
+        setHarnessList(res.harnesses)
+        setActiveHarnessId(res.activeId)
+      })
+      .catch(() => {})
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  // 点击外部关闭 harness 菜单
+  useEffect(() => {
+    if (!showHarnessMenu) return
+    const onDocMouseDown = (e: MouseEvent): void => {
+      if (harnessMenuRef.current && !harnessMenuRef.current.contains(e.target as Node)) {
+        setShowHarnessMenu(false)
+      }
+    }
+    document.addEventListener('mousedown', onDocMouseDown)
+    return () => document.removeEventListener('mousedown', onDocMouseDown)
+  }, [showHarnessMenu])
+
+  /** 切换 harness：主进程激活 + 持久化到 settings.selectedHarness（不可用项直接忽略）。 */
+  const switchHarness = useCallback(async (item: HarnessItem) => {
+    if (!item.available) return
+    setShowHarnessMenu(false)
+    const res = await window.electronAPI?.harness?.setActive(item.id)
+    if (!res?.ok) return
+    setActiveHarnessId(res.activeId ?? item.id)
+    try {
+      const settings = ((await window.electronAPI?.getSettings()) ?? {}) as Record<string, unknown>
+      await window.electronAPI?.setSettings({ ...settings, selectedHarness: item.id })
+    } catch {
+      // 持久化失败不影响本次会话内已切换生效
+    }
+  }, [])
+  const activeHarness = useMemo(
+    () => harnessList.find((h) => h.id === activeHarnessId) ?? null,
+    [harnessList, activeHarnessId]
+  )
   const [renamingId, setRenamingId] = useState<string | null>(null)
   const [renameValue, setRenameValue] = useState('')
   const [hydrated, setHydrated] = useState(false)
@@ -1237,7 +1296,59 @@ export function ChatView({ rightSidebarCollapsed, onToggleRightSidebar, sidebarC
                 <PanelLeftOpen className="h-4 w-4" />
               </button>
             )}
-            <span className="module-title">Mimir Agent</span>
+            {/* Harness 选择（Issue 7）：标题即下拉触发器，未实现的 harness 灰显占位 */}
+            <div className="relative" ref={harnessMenuRef}>
+              <button
+                type="button"
+                onClick={() => setShowHarnessMenu((v) => !v)}
+                className="no-drag flex items-center gap-1 rounded-md px-1 -mx-1 transition-colors hover:bg-accent"
+                title="Agent Harness：选择消息执行引擎（Codex / Claude Code / Pi 即将支持）"
+              >
+                <span className="module-title">{activeHarness?.name ?? 'Mimir'}</span>
+                <ChevronDown className={cn('h-3 w-3 text-muted-foreground transition-transform', showHarnessMenu && 'rotate-180')} />
+              </button>
+              {showHarnessMenu && (
+                <div className="no-drag absolute left-0 top-full mt-1 z-50 w-56 rounded-lg border border-border bg-popover p-1 shadow-md">
+                  {harnessList.map((h) => {
+                    const active = h.id === activeHarnessId
+                    return (
+                      <button
+                        key={h.id}
+                        type="button"
+                        onClick={() => switchHarness(h)}
+                        disabled={!h.available}
+                        className={cn(
+                          'flex w-full items-center gap-2 px-2.5 py-2 text-left rounded-md transition-colors',
+                          active
+                            ? 'bg-primary/5 text-primary'
+                            : h.available
+                              ? 'hover:bg-accent text-foreground'
+                              : 'cursor-not-allowed opacity-45'
+                        )}
+                      >
+                        <span
+                          className={cn(
+                            'h-3 w-3 shrink-0 rounded-full border',
+                            active ? 'border-primary bg-primary' : 'border-muted-foreground/40'
+                          )}
+                          aria-hidden="true"
+                        />
+                        <span className="min-w-0 flex-1">
+                          <span className="flex items-center gap-1.5 text-[12px] font-medium">
+                            {h.name}
+                            {!h.available && (
+                              <span className="rounded bg-muted px-1 py-px text-[9px] text-muted-foreground">
+                                即将支持
+                              </span>
+                            )}
+                          </span>
+                        </span>
+                      </button>
+                    )
+                  })}
+                </div>
+              )}
+            </div>
             <span className="status-dot bg-green-500" title="就绪" />
             <span className="text-[11px] text-muted-foreground">就绪</span>
           </div>
