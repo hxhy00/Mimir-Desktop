@@ -245,6 +245,9 @@ export function Settings({ autoOpenModelDialog = 0, guided = false, onModelStepD
   const [modelListEndpoint, setModelListEndpoint] = useState('')
   const [modelListMsg, setModelListMsg] = useState<{ type: 'ok' | 'error'; text: string } | null>(null)
   const [modelPickerOpen, setModelPickerOpen] = useState(false)
+  // 模型多选批量添加（Issue 8）：从发现结果中勾选多个模型一次性写入。
+  const [bulkSelected, setBulkSelected] = useState<Set<string>>(new Set())
+  const [bulkAdding, setBulkAdding] = useState(false)
   // ── Harness 选择（Issue 1）─────────────────────────────────────────
   const [harnessList, setHarnessList] = useState<{ id: string; name: string; kind: string; available: boolean }[]>([])
   const [activeHarnessId, setActiveHarnessId] = useState('mimir')
@@ -751,6 +754,7 @@ export function Settings({ autoOpenModelDialog = 0, guided = false, onModelStepD
     setModelListMsg(null)
     setModelListEndpoint('')
     setModelPickerOpen(false)
+    setBulkSelected(new Set())
   }, [])
 
   /** 进入「编辑模型」：预填现有字段并保留 id，复用同一弹窗。 */
@@ -805,12 +809,53 @@ export function Settings({ autoOpenModelDialog = 0, guided = false, onModelStepD
     }
   }, [form.baseUrl, form.apiKey])
 
+  /**
+   * 批量添加（Issue 8）：把勾选的已发现模型一次性写入。
+   * 按 baseUrl+modelId 去重（跳过已存在的），跳过逐条连通测试——发现列表本身就证明
+   * 网关可达、Key 有效；写入后立即落盘并广播，ChatInput 下拉自动同步。
+   */
+  const handleBulkAddModels = useCallback(async () => {
+    const ids = [...bulkSelected]
+    if (ids.length === 0 || !form.baseUrl || !form.apiKey) return
+    setBulkAdding(true)
+    try {
+      const existing = new Set(models.map((m) => `${m.baseUrl}::${m.modelId}`))
+      const toAdd: ModelConfig[] = ids
+        .filter((mid) => !existing.has(`${form.baseUrl}::${mid}`))
+        .map((mid, i) => ({
+          id: `model-${Date.now()}-${i}`,
+          baseUrl: form.baseUrl,
+          modelId: mid,
+          apiKey: form.apiKey,
+          supportsImages: form.supportsImages
+        }))
+      if (toAdd.length === 0) {
+        setModelListMsg({ type: 'error', text: '所选模型均已存在，未添加任何模型。' })
+        return
+      }
+      const updated = [...models, ...toAdd]
+      // 仅当当前没有选中模型时，默认选中第一个新添加的
+      const selectedAfter = selectedModelId === '' ? toAdd[0].id : selectedModelId
+      setModels(updated)
+      if (selectedModelId === '') setSelectedModelId(toAdd[0].id)
+      await persistModelsNow(updated, selectedAfter)
+      setModelListMsg({ type: 'ok', text: `已批量添加 ${toAdd.length} 个模型。` })
+      setBulkSelected(new Set())
+      // 关闭弹窗并重置
+      setDialogOpen(false)
+      resetModelDialog()
+    } finally {
+      setBulkAdding(false)
+    }
+  }, [bulkSelected, form, models, selectedModelId, persistModelsNow, resetModelDialog])
+
   /** 关闭「添加/编辑」弹窗或切换 baseUrl 时清空已拉取的模型列表，避免误导。 */
   useEffect(() => {
     setModelList([])
     setModelPickerOpen(false)
     setModelListMsg(null)
     setModelListEndpoint('')
+    setBulkSelected(new Set())
   }, [form.baseUrl])
 
   /** 新增或编辑模型的统一保存：先连通测试，成功后按 id 覆盖（编辑）或追加（新增）并立即落盘。 */
@@ -2305,31 +2350,90 @@ export function Settings({ autoOpenModelDialog = 0, guided = false, onModelStepD
               </div>
               {modelPickerOpen && modelList.length > 0 && (
                 <div className="col-span-5 rounded-md border border-border bg-muted/30 px-2 py-1.5">
-                  <Label className="text-[10px] text-muted-foreground">选择已发现的模型</Label>
-                  <div className="mt-1 flex max-h-32 flex-wrap gap-1.5 overflow-y-auto">
-                    {modelList.map((m) => (
-                      <button
-                        key={m.id}
-                        type="button"
-                        onClick={() => setForm({ ...form, modelId: m.id })}
-                        className={cn(
-                          'inline-flex max-w-full items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] font-mono transition-colors',
-                          form.modelId === m.id
-                            ? 'border-primary bg-primary/10 text-primary'
-                            : 'border-border bg-card hover:bg-accent'
-                        )}
-                        title={m.ownedBy ? `${m.id} · owned_by: ${m.ownedBy}` : m.id}
-                      >
-                        <span className="truncate">{m.id}</span>
-                        {m.ownedBy !== undefined && (
-                          <span className="text-[8px] text-muted-foreground">· {m.ownedBy}</span>
-                        )}
-                      </button>
-                    ))}
+                  <div className="flex items-center justify-between">
+                    <Label className="text-[10px] text-muted-foreground">勾选要添加的模型（可多选）</Label>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setBulkSelected((prev) =>
+                          prev.size === modelList.length ? new Set() : new Set(modelList.map((m) => m.id))
+                        )
+                      }
+                      className="text-[10px] text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
+                    >
+                      {bulkSelected.size === modelList.length ? '取消全选' : '全选'}
+                    </button>
                   </div>
-                  <p className="mt-1 text-[9px] text-muted-foreground">
-                    也可以继续手动输入自定义模型 ID；下方测试会按你当前填写的 ID 发起。
-                  </p>
+                  <div className="mt-1 flex max-h-32 flex-wrap gap-1.5 overflow-y-auto">
+                    {modelList.map((m) => {
+                      const alreadyExists = models.some(
+                        (mm) => mm.baseUrl === form.baseUrl && mm.modelId === m.id
+                      )
+                      const checked = bulkSelected.has(m.id)
+                      return (
+                        <button
+                          key={m.id}
+                          type="button"
+                          disabled={alreadyExists}
+                          onClick={() =>
+                            setBulkSelected((prev) => {
+                              const next = new Set(prev)
+                              if (next.has(m.id)) next.delete(m.id)
+                              else next.add(m.id)
+                              return next
+                            })
+                          }
+                          className={cn(
+                            'inline-flex max-w-full items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] font-mono transition-colors',
+                            alreadyExists
+                              ? 'cursor-not-allowed border-border bg-muted/50 text-muted-foreground/60 line-through'
+                              : checked
+                                ? 'border-primary bg-primary/10 text-primary'
+                                : 'border-border bg-card hover:bg-accent'
+                          )}
+                          title={
+                            alreadyExists
+                              ? `${m.id}（已添加）`
+                              : m.ownedBy
+                                ? `${m.id} · owned_by: ${m.ownedBy}`
+                                : m.id
+                          }
+                        >
+                          {!alreadyExists && (
+                            <span
+                              className={cn(
+                                'h-2.5 w-2.5 shrink-0 rounded-[3px] border',
+                                checked ? 'border-primary bg-primary' : 'border-muted-foreground/50'
+                              )}
+                              aria-hidden="true"
+                            />
+                          )}
+                          <span className="truncate">{m.id}</span>
+                          {m.ownedBy !== undefined && (
+                            <span className="text-[8px] text-muted-foreground">· {m.ownedBy}</span>
+                          )}
+                        </button>
+                      )
+                    })}
+                  </div>
+                  <div className="mt-1.5 flex items-center justify-between gap-2">
+                    <p className="text-[9px] text-muted-foreground">
+                      也可以手动输入单个模型 ID；批量添加会跳过已存在项，不做逐条连通测试。
+                    </p>
+                    <Button
+                      size="sm"
+                      className="h-6 shrink-0 px-2 text-[10px]"
+                      onClick={() => void handleBulkAddModels()}
+                      disabled={bulkSelected.size === 0 || bulkAdding}
+                    >
+                      {bulkAdding ? (
+                        <Loader2 className="h-3 w-3 mr-1 animate-spin" />
+                      ) : (
+                        <Plus className="h-3 w-3 mr-1" />
+                      )}
+                      {bulkAdding ? '添加中...' : `批量添加（${bulkSelected.size}）`}
+                    </Button>
+                  </div>
                 </div>
               )}
             </div>
