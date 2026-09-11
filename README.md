@@ -77,7 +77,40 @@
 | **记录 `ledger`** | 成长记录时间线（里程碑 / 论文 / 实验等），本地持久化、可删除 |
 | **会议截稿 `venues`** | ccfddl 会议截稿目录（本地缓存优先、启动自动抓取 + 6h 定时 / 手动刷新，离线可用），领域 / CCF 等级 / 时间窗过滤、倒计时高亮、关注星标；内置 CCF-A 期刊目录 |
 | **插件 `plugins`** | 统一管理技能 / 子代理 / 插件 / Hooks（增删改查 + 启停开关，本地持久化） |
-| **设置 `settings`** | 模型（LLM 管理 · 图像生成端点）/ 外观 / Agent（技能路由 · 身份与默认值 · 长期记忆）/ 科研空间 / 语音与资源 / 关于 |
+| **设置 `settings`** | 模型（LLM 管理 · 图像生成端点 · `/v1/models` 自动发现）/ 外观 / Agent（技能路由 · 身份与默认值 · 长期记忆 · Harness 选择）/ 科研空间 / 语音与资源 / 关于 |
+
+### Agent Harness 层
+
+Agent 执行层抽象为统一的 `HarnessAdapter` 接口，上层业务面向接口编程而非具体实现，默认使用 `Mimir` harness（现有 DeepAgents / LangChain 实现）：
+
+- **Harness 注册表**：`electron/agent/harnessRegistry.ts` 统一注册与切换，`isAvailable()` 判定运行环境，不可用时给出明确提示。
+- **已注册 harness**：`Mimir`（可用）、`Codex` / `Claude Code` / `Pi`（stub 占位，`isAvailable()` 返回 `false`，UI 中灰色标注「即将支持」）。
+- **设置页切换**：「设置 → Agent → Harness」可选择当前 harness，切换不影响已有模型配置。
+- **新增 adapter**：在 `electron/agent/harnesses/` 实现接口并在注册表登记即可。
+
+### 模型自动发现
+
+「设置 → 模型 → 添加模型」支持按 `baseUrl` + API Key 自动拉取 OpenAI 兼容端点的 `/v1/models`：
+
+- **URL 归一化**：自动补齐 / 去重 `/v1`，兼容末尾 `/` 与直接填写完整 `/v1/models` 的情况。
+- **宽松响应解析**：兼容标准 OpenAI 格式、纯数组、`models` 字段等；缺 `id` 的条目自动跳过，空列表给出明确提示。
+- **安全**：API Key 仅通过 `Authorization` 头发送，不写日志、不回显到错误信息。
+- **错误处理**：覆盖无效 URL、网络不可达、401/403、端点不支持、超时、格式异常等情况。
+
+### 本地桥接与插件（Phase 1）
+
+为 Codex / Claude Code / Pi 等外部 harness 提供调用 Mimir 科研能力的本地通道：
+
+```
+外部 Harness → 原生 extension / skill / MCP → Mimir 插件 → HTTP(127.0.0.1) → Mimir Bridge → 领域服务
+```
+
+- **`electron/plugins/bridge.ts`**：本地 HTTP 桥接，仅绑定 `127.0.0.1`，随机端口写入 `~/.mimir/bridge.json`；读操作默认允许，写操作需 `X-Mimir-Confirm` 头。
+- **`electron/plugins/mcpServer.ts`**：基于 stdio 的 MCP server（JSON-RPC 2.0），实现 `tools/list` / `tools/call`，暴露文献库 / 图表 / 组会 / 截稿等只读工具。
+- **`electron/plugins/codex-extension.ts`** / **`claude-code-skill.ts`**：各 harness 插件入口骨架；`pluginRegistry.test.ts` 校验三方工具定义一致。
+- **IPC**：`bridge:start` / `bridge:stop` / `bridge:status`。
+
+> Phase 1 仅含只读能力。写入确认卡片 UI、完整能力暴露（服务器执行 / 论文编辑）与权限策略待后续实现。
 
 ### 插件模块（技能 / 子代理 / 插件 / Hooks）
 
@@ -102,7 +135,9 @@
 | 远程终端 | @xterm/xterm + node-pty |
 | 语音 | sherpa-onnx (SenseVoice) / Web Speech |
 | 数据存储 | 双层 JSON Store（全局设置 + 科研空间）+ arXiv API |
-| 测试 | Vitest（契约 / 网关探测 / 无头冒烟） |
+| 测试 | Vitest（契约 / 网关探测 / 无头冒烟）+ Node/Bun 模块自检 |
+| Agent Harness | 统一 `HarnessAdapter` 抽象（Mimir / Codex / Claude Code / Pi） |
+| 外部集成 | 本地 HTTP Bridge + MCP Server（stdio） |
 
 ---
 
@@ -123,6 +158,11 @@ pnpm typecheck
 
 # 5. 测试（离线契约 + 冒烟，不需要网络与凭据）
 pnpm test
+
+# 6. 各模块自检（离线）
+pnpm test:model-discovery   # /v1/models URL 归一化与响应解析
+pnpm test:harness           # Harness 注册表与切换
+pnpm test:plugins           # 三方插件工具定义一致性
 ```
 
 > 打包平台：`pnpm build:mac` / `pnpm build:win` / `pnpm build:linux`（分别产出 dmg/zip、nsis/portable、AppImage/deb）。
@@ -251,15 +291,25 @@ MIMIR_GW_URL=... MIMIR_GW_KEY=... MIMIR_GW_MODEL=... \
 │   ├── venues/                    # 会议截稿（ccfddl 缓存 + venue_search 工具）
 │   ├── servers/                   # 服务器（SSH / nvidia-smi / 终端）
 │   ├── speech/                    # 语音识别（SenseVoice / sherpa-onnx）
-│   └── agent/                     # DeepAgents 集成
-│       ├── agentService.ts        # Agent 服务
-│       ├── subagentRegistry.ts    # 内置子代理注册（重建 Supervisor）
-│       ├── skillRouter.ts         # 技能分层路由
-│       ├── approval.ts            # 副作用批准卡
-│       ├── fsBackend.ts           # 真实磁盘文件后端（写/改/删前过批准卡）
-│       ├── gatewayProbe.ts        # 网关结构化输出能力探测
-│       ├── trace.ts               # Agent 轨迹日志
-│       └── tools/                 # Agent 工具
+│   ├── modelDiscovery.ts          # /v1/models 自动发现（URL 归一化 + 宽松解析）
+│   ├── agent/                     # DeepAgents 集成
+│   │   ├── agentService.ts        # Agent 服务
+│   │   ├── harness.ts             # HarnessAdapter 统一接口
+│   │   ├── harnessRegistry.ts     # Harness 注册表与激活切换
+│   │   ├── harnesses/             # 各 harness adapter（mimir / codex / claudeCode / pi）
+│   │   ├── subagentRegistry.ts    # 内置子代理注册（重建 Supervisor）
+│   │   ├── skillRouter.ts         # 技能分层路由
+│   │   ├── approval.ts            # 副作用批准卡
+│   │   ├── fsBackend.ts           # 真实磁盘文件后端（写/改/删前过批准卡）
+│   │   ├── gatewayProbe.ts        # 网关结构化输出能力探测
+│   │   ├── trace.ts               # Agent 轨迹日志
+│   │   └── tools/                 # Agent 工具
+│   └── plugins/                   # 外部 harness 集成（Phase 1）
+│       ├── bridge.ts              # 本地 HTTP 桥接（仅 127.0.0.1 + 确认头）
+│       ├── bridgeClient.ts        # 插件共用 HTTP 客户端
+│       ├── mcpServer.ts           # stdio MCP server（tools/list · tools/call）
+│       ├── codex-extension.ts     # Codex 插件入口
+│       └── claude-code-skill.ts   # Claude Code 插件入口
 ├── test/                          # 测试（vitest，无需 Electron 运行时）
 │   ├── contract/                  # 工具名契约（防与内置撞名）
 │   ├── gateway/                   # 网关能力探测（离线判定 + live 矩阵）
