@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Button } from '@/components/ui/button'
-import { Upload, Trash2, Copy, Check, Image, Pencil, FileDown } from 'lucide-react'
+import { Upload, Trash2, Copy, Check, Image, Pencil, FileDown, Sparkles } from 'lucide-react'
 import { RenameFigureDialog } from './figures/RenameFigureDialog'
 import { ImportPdfDialog } from './figures/ImportPdfDialog'
+import { handoffToAgent } from '@/lib/agentContext'
 
 interface Figure {
   id: string
@@ -116,6 +117,25 @@ export function Figures() {
     []
   )
 
+  /** 把图表交给 Agent：携带文件名与 LaTeX 引用片段，便于直接写入论文。 */
+  const handleHandoffToAgent = useCallback((figure: Figure) => {
+    const stem = figure.fileName.replace(/\.[^.]+$/, '')
+    const excerpt = [
+      `图表名称：${figure.name}`,
+      `文件名：${figure.fileName}`,
+      `LaTeX 引用：\\includegraphics[width=0.8\\textwidth]{${figure.fileName}}`,
+      '（图片存放在当前科研空间的 figures 目录，可直接被论文项目引用）'
+    ].join('\n')
+    handoffToAgent({
+      kind: 'figure',
+      refId: figure.id,
+      title: figure.name,
+      excerpt,
+      spacePath: `figures/${figure.fileName}`,
+      meta: { fileName: figure.fileName, sizeBytes: figure.sizeBytes }
+    })
+  }, [])
+
   return (
     <div className="flex h-full flex-col">
       <div className="module-header">
@@ -182,6 +202,13 @@ export function Figures() {
                       title="复制 LaTeX"
                     >
                       {copiedId === figure.id ? <Check className="h-3.5 w-3.5 text-green-600" /> : <Copy className="h-3.5 w-3.5" />}
+                    </button>
+                    <button
+                      onClick={() => handleHandoffToAgent(figure)}
+                      className="flex h-7 w-7 items-center justify-center rounded-md bg-white/90 text-primary hover:bg-white transition-colors"
+                      title="交给 Agent（在对话中引用该图）"
+                    >
+                      <Sparkles className="h-3.5 w-3.5" />
                     </button>
                     <button
                       onClick={() => handleDelete(figure)}

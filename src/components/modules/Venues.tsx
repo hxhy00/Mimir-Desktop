@@ -2,8 +2,9 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
-import { CalendarClock, RefreshCw, Loader2, Star, BookOpen } from 'lucide-react'
+import { CalendarClock, RefreshCw, Loader2, Star, BookOpen, Sparkles } from 'lucide-react'
 import { cn } from '@/lib/utils'
+import { handoffToAgent } from '@/lib/agentContext'
 
 type RankFilter = 'ALL' | 'A' | 'B' | 'C'
 type Mode = 'conferences' | 'journals'
@@ -94,6 +95,31 @@ export function Venues() {
     },
     [api, watched]
   )
+
+  /** 把会议截稿信息交给 Agent：用于规划投稿时间线 / 拆解里程碑。 */
+  const handleHandoffToAgent = useCallback((venue: VenueDeadlineView) => {
+    const days = daysUntilIso(venue.nextDeadlineAt, Date.now())
+    const excerpt = [
+      `会议：${venue.title}`,
+      venue.description !== '' ? `简介：${venue.description}` : '',
+      `CCF 等级：${venue.ccfRank}`,
+      days !== null
+        ? `距最近截稿：${String(days)} 天（${venue.nextDeadlineKind === 'abstract' ? '摘要' : '全文'}）`
+        : '近期无截稿',
+      venue.conf.date !== '' ? `会议时间：${venue.conf.date}` : '',
+      venue.conf.place !== '' ? `地点：${venue.conf.place}` : '',
+      venue.conf.link !== '' ? `官网：${venue.conf.link}` : ''
+    ]
+      .filter((line) => line !== '')
+      .join('\n')
+    handoffToAgent({
+      kind: 'venue',
+      refId: venue.key,
+      title: venue.title,
+      excerpt,
+      meta: { ccfRank: venue.ccfRank, nextDeadlineAt: venue.nextDeadlineAt }
+    })
+  }, [])
 
   const subOptions = useMemo(() => {
     if (mode === 'conferences') {
@@ -311,6 +337,13 @@ export function Venues() {
                         title={isWatched ? '取消关注' : '关注'}
                       >
                         <Star className={cn('h-3.5 w-3.5', isWatched && 'fill-amber-500')} />
+                      </button>
+                      <button
+                        onClick={() => handleHandoffToAgent(venue)}
+                        className="flex h-6 w-6 shrink-0 items-center justify-center rounded text-muted-foreground transition-colors hover:text-primary hover:bg-primary/10"
+                        title="交给 Agent（规划该会议的投稿时间线）"
+                      >
+                        <Sparkles className="h-3.5 w-3.5" />
                       </button>
                     </div>
 

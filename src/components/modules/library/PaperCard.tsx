@@ -38,6 +38,8 @@ interface PaperCardProps {
   onOpenExternal: (url: string) => void
   onScoreRelevance: (paper: PaperRecord) => Promise<void>
   onExportBib: (paper: PaperRecord) => Promise<void>
+  /** 把本篇文献作为上下文投递给 Agent（跳转对话）。 */
+  onHandoffToAgent?: (paper: PaperRecord) => void
 }
 
 export function PaperCard({
@@ -50,7 +52,8 @@ export function PaperCard({
   onOpenPdf,
   onOpenExternal,
   onScoreRelevance,
-  onExportBib
+  onExportBib,
+  onHandoffToAgent
 }: PaperCardProps) {
   const [expanded, setExpanded] = useState(false)
   const [editingTags, setEditingTags] = useState(false)
@@ -219,6 +222,13 @@ export function PaperCard({
               title="打开原文"
             >
               <ExternalLink className="h-3.5 w-3.5" />
+            </button>
+            <button
+              onClick={() => onHandoffToAgent?.(paper)}
+              className="flex h-6 w-6 items-center justify-center rounded text-muted-foreground/50 hover:text-primary transition-colors"
+              title="交给 Agent（在对话中引用本篇文献）"
+            >
+              <Sparkles className="h-3.5 w-3.5" />
             </button>
             <button
               onClick={() => onRemove(paper.arxivId)}

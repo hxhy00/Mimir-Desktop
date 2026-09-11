@@ -211,12 +211,11 @@ interface SettingsProps {
 }
 
 // ─── 设置分页 ────────────────────────────────────────────────────────────────
-type SettingsTab = 'models' | 'appearance' | 'agent' | 'image' | 'spaces' | 'resources' | 'about'
+type SettingsTab = 'models' | 'appearance' | 'agent' | 'spaces' | 'resources' | 'about'
 const SETTINGS_TABS: { id: SettingsTab; label: string; icon: React.ElementType; desc: string }[] = [
-  { id: 'models', label: '模型', icon: Bot, desc: '管理可用的 LLM 模型配置，点击选择当前使用的模型。' },
+  { id: 'models', label: '模型', icon: Bot, desc: '管理可用的 LLM 模型配置与图像生成端点，点击选择当前使用的模型。' },
   { id: 'appearance', label: '外观', icon: Palette, desc: '选择应用主题与工作台背景。' },
   { id: 'agent', label: 'Agent', icon: Sparkles, desc: '技能路由、身份与默认值、长期记忆等 Agent 行为设置。' },
-  { id: 'image', label: '图像生成', icon: Image, desc: '配置 OpenAI 兼容的图片生成端点，组会生成可开启「AI 配图」。' },
   { id: 'spaces', label: '科研空间', icon: FolderKanban, desc: '每个科研空间是一个独立目录，承载论文、实验、图表、组会与对话等数据。' },
   { id: 'resources', label: '语音与资源', icon: Mic, desc: '语音识别引擎与本地组件资源下载。' },
   { id: 'about', label: '关于', icon: Info, desc: '应用信息。' }
@@ -987,7 +986,7 @@ export function Settings({ autoOpenModelDialog = 0, guided = false, onModelStepD
     <div className="flex h-full flex-col">
       <div className="drag-region flex h-12 shrink-0 items-center justify-between px-5">
         <span className="module-title">设置</span>
-        <span className="text-[11px] text-muted-foreground">模型 · 外观 · Agent · 图像生成 · 科研空间 · 语音与资源 · 关于</span>
+        <span className="text-[11px] text-muted-foreground">模型 · 外观 · Agent · 科研空间 · 语音与资源 · 关于</span>
       </div>
       <div className="no-drag flex flex-wrap items-center gap-1.5 border-b border-border px-5 py-2">
         {SETTINGS_TABS.map((t) => {
@@ -1139,6 +1138,54 @@ export function Settings({ autoOpenModelDialog = 0, guided = false, onModelStepD
                 })}
               </div>
             )}
+
+            {/* 图像生成（AI 配图）——并入模型管理 */}
+            <div className="rounded-lg border border-border bg-card p-4 space-y-3 pt-3">
+              <div className="flex items-center gap-2">
+                <Image className="h-4 w-4 text-primary" />
+                <span className="text-[12px] font-medium text-foreground">图像生成</span>
+              </div>
+              <p className="text-[10px] text-muted-foreground">
+                可选：配置 OpenAI 兼容的图片生成端点后，组会生成可开启「AI 配图」为封面与论文生成概念插图（图片存入图表目录可复用）。
+              </p>
+              <div className="space-y-1.5">
+                <Label className="text-[11px] text-muted-foreground">请求地址</Label>
+                <Input
+                  placeholder="https://api.deepseek.com/v1"
+                  value={imgGenBaseUrl}
+                  onChange={(e) => setImgGenBaseUrl(e.target.value)}
+                  className="h-7 text-[12px] font-mono"
+                />
+              </div>
+              <div className="space-y-1.5">
+                <Label className="text-[11px] text-muted-foreground">模型 ID</Label>
+                <Input
+                  placeholder="如 sd-3 / flux-1.1-pro"
+                  value={imgGenModelId}
+                  onChange={(e) => setImgGenModelId(e.target.value)}
+                  className="h-7 text-[12px] font-mono"
+                />
+              </div>
+              <div className="space-y-1.5">
+                <Label className="text-[11px] text-muted-foreground">API Key</Label>
+                <div className="relative">
+                  <Input
+                    type={imgKeyVisible ? 'text' : 'password'}
+                    placeholder="sk-..."
+                    value={imgGenApiKey}
+                    onChange={(e) => setImgGenApiKey(e.target.value)}
+                    className="h-7 text-[12px] font-mono pr-7"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setImgKeyVisible((v) => !v)}
+                    className="absolute right-1.5 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground transition-colors"
+                  >
+                    {imgKeyVisible ? <EyeOff className="h-3 w-3" /> : <Eye className="h-3 w-3" />}
+                  </button>
+                </div>
+              </div>
+            </div>
           </section>
           )}
 
@@ -1262,58 +1309,6 @@ export function Settings({ autoOpenModelDialog = 0, guided = false, onModelStepD
             <SettingsIdentityCard />
             <SettingsMemoryCard />
           </>)}
-
-          {/* 图像生成（AI 配图）Section */}
-          {tab === 'image' && (<section className="space-y-3">
-            <div className="flex items-center gap-2">
-              <Image className="h-4 w-4 text-primary" />
-              <h2 className="text-sm font-semibold text-foreground">图像生成</h2>
-            </div>
-            <p className="text-[11px] text-muted-foreground">
-              可选：配置 OpenAI 兼容的图片生成端点后，组会生成可开启「AI 配图」为封面与论文生成概念插图（图片存入图表目录可复用）。
-            </p>
-
-            <div className="rounded-lg border border-border bg-card p-4 space-y-3">
-              <div className="space-y-1.5">
-                <Label className="text-[11px] text-muted-foreground">请求地址</Label>
-                <Input
-                  placeholder="https://api.deepseek.com/v1"
-                  value={imgGenBaseUrl}
-                  onChange={(e) => setImgGenBaseUrl(e.target.value)}
-                  className="h-7 text-[12px] font-mono"
-                />
-              </div>
-              <div className="space-y-1.5">
-                <Label className="text-[11px] text-muted-foreground">模型 ID</Label>
-                <Input
-                  placeholder="如 sd-3 / flux-1.1-pro"
-                  value={imgGenModelId}
-                  onChange={(e) => setImgGenModelId(e.target.value)}
-                  className="h-7 text-[12px] font-mono"
-                />
-              </div>
-              <div className="space-y-1.5">
-                <Label className="text-[11px] text-muted-foreground">API Key</Label>
-                <div className="relative">
-                  <Input
-                    type={imgKeyVisible ? 'text' : 'password'}
-                    placeholder="sk-..."
-                    value={imgGenApiKey}
-                    onChange={(e) => setImgGenApiKey(e.target.value)}
-                    className="h-7 text-[12px] font-mono pr-7"
-                  />
-                  <button
-                    type="button"
-                    onClick={() => setImgKeyVisible((v) => !v)}
-                    className="absolute right-1.5 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground transition-colors"
-                  >
-                    {imgKeyVisible ? <EyeOff className="h-3 w-3" /> : <Eye className="h-3 w-3" />}
-                  </button>
-                </div>
-              </div>
-            </div>
-          </section>
-          )}
 
           {/* Research Space Section */}
           {tab === 'spaces' && (<section className="space-y-3">

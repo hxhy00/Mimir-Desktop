@@ -97,11 +97,16 @@ export interface ElectronAPI {
     message: string,
     conversationId: string,
     onChunk: (chunk: string) => void,
+    /**
+     * @deprecated 过程事件已改为经 onChunk 的前缀信封（`\u0002MIMIR_AGENT_EVENT\u0002` + JSON）送达，
+     * 渲染层在 ChatView 中拆包。此参数保留仅为兼容历史调用点，传入后不会被回调。
+     */
     onWorkerEvent?: (event: {
       taskId: string
       title: string
       status: 'running' | 'done' | 'error'
       text?: string
+      durationMs?: number
       kind?: 'phase' | 'task' | 'tool' | 'think' | 'think-token'
     }) => void,
     options?: {
@@ -174,6 +179,16 @@ export interface ElectronAPI {
   // Store data
   getStoreValue: <T>(key: string) => Promise<T | undefined>
   setStoreValue: <T>(key: string, value: T) => Promise<void>
+
+  // Ledger（科研记录）
+  ledgerList: () => Promise<{ ok: boolean; entries: unknown[] }>
+  ledgerAppend: (input: {
+    title: string
+    content: string
+    type: 'milestone' | 'progress' | 'paper' | 'experiment'
+    date?: string
+  }) => Promise<{ ok: boolean; entry?: unknown; message?: string }>
+  ledgerRemove: (id: string) => Promise<{ ok: boolean }>
 
   // arXiv search
   searchArxiv: (query: string, maxResults?: number, sortBy?: 'relevance' | 'submittedDate') => Promise<unknown>
@@ -402,6 +417,10 @@ const electronAPI: ElectronAPI = {
 
   getStoreValue: <T>(key: string) => ipcRenderer.invoke('store:get', key),
   setStoreValue: <T>(key: string, value: T) => ipcRenderer.invoke('store:set', key, value),
+
+  ledgerList: () => ipcRenderer.invoke('ledger:list'),
+  ledgerAppend: (input) => ipcRenderer.invoke('ledger:append', input),
+  ledgerRemove: (id) => ipcRenderer.invoke('ledger:remove', id),
 
   searchArxiv: (query, maxResults, sortBy) => ipcRenderer.invoke('arxiv:search', query, maxResults, sortBy),
   fetchPaper: (id) => ipcRenderer.invoke('arxiv:fetchPaper', id),

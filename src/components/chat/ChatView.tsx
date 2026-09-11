@@ -30,6 +30,7 @@ import {
   userCommandToEntry
 } from '@/lib/slash'
 import type { SlashEntry } from '@/lib/slash/types'
+import { registerSpaceFlush } from '@/lib/spaceFlush'
 
 /** Agent 副作用确认（见 electron/agent/approval.ts）。 */
 interface PendingApproval {
@@ -616,6 +617,18 @@ export function ChatView({ rightSidebarCollapsed, onToggleRightSidebar, sidebarC
     }
   }, [])
 
+  // 切空间前同步落盘：会话按空间隔离，防抖写入尚未触发时必须先写回旧空间。
+  // 注册在卸载之前（App 推进 uiSpaceEpoch 会先调用本 flush，再重挂载本组件）。
+  useEffect(() => {
+    return registerSpaceFlush(() => {
+      const latest = latestPersistRef.current
+      window.clearTimeout(persistTimer.current)
+      if (!latest.hydrated) return
+      void persistConversations(latest.conversations)
+      void persistActiveConvId(latest.activeConvId)
+    })
+  }, [])
+
   // 加载自定义技能 / 指令（插件页导入/删除后重新进入本模块即刷新）
   useEffect(() => {
     let alive = true
@@ -1055,6 +1068,21 @@ export function ChatView({ rightSidebarCollapsed, onToggleRightSidebar, sidebarC
     setConversations((prev) => [newConv, ...prev])
     setActiveConvId(newConv.id)
   }, [])
+
+  // 跨模块「交给 Agent」若携带初始提问：会话恢复完成后自动发送一次（读后即清，避免重挂载重发）
+  useEffect(() => {
+    if (!hydrated) return
+    let pendingPrompt: string | null = null
+    try {
+      pendingPrompt = sessionStorage.getItem('mimir:agent-handoff-prompt')
+      if (pendingPrompt !== null) sessionStorage.removeItem('mimir:agent-handoff-prompt')
+    } catch {
+      pendingPrompt = null
+    }
+    if (pendingPrompt !== null && pendingPrompt.trim() !== '') {
+      void handleSend(pendingPrompt)
+    }
+  }, [hydrated, handleSend])
 
   const handleDeleteConv = useCallback(
     (id: string) => {

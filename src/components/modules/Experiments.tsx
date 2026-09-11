@@ -27,9 +27,11 @@ import {
   Pencil,
   Server,
   X,
-  FlaskConical
+  FlaskConical,
+  Sparkles
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
+import { handoffToAgent } from '@/lib/agentContext'
 import {
   type ExperimentRecord,
   type ExperimentStatus,
@@ -162,18 +164,38 @@ export function Experiments() {
   }, [])
 
   // 持久化实验列表
-  const persistExperiments = useCallback(async (next: ExperimentRecord[]) => {
-    setExperiments(next)
-    try {
-      if (window.electronAPI?.setStoreValue) {
-        await window.electronAPI.setStoreValue('experiments:list', next)
-      } else {
-        localStorage.setItem('mimir-experiments', JSON.stringify(next))
+  const persistExperiments = useCallback(
+    async (next: ExperimentRecord[]) => {
+      const prev = experiments
+      setExperiments(next)
+      try {
+        if (window.electronAPI?.setStoreValue) {
+          await window.electronAPI.setStoreValue('experiments:list', next)
+        } else {
+          localStorage.setItem('mimir-experiments', JSON.stringify(next))
+        }
+        // 自动沉淀：新建实验 / 状态由 running 转为终态 → 记入科研记录（幂等按 实验 id+状态）
+        const prevById = new Map(prev.map((e) => [e.id, e]))
+        for (const exp of next) {
+          const before = prevById.get(exp.id)
+          const isNew = before === undefined
+          const justFinished =
+            before !== undefined &&
+            before.status !== exp.status &&
+            (exp.status === 'success' || exp.status === 'failed')
+          if (!isNew && !justFinished) continue
+          await window.electronAPI?.ledgerAppend?.({
+            title: isNew ? `新建实验：${exp.name}` : `实验${exp.status === 'success' ? '成功' : '失败'}：${exp.name}`,
+            content: `状态：${STATUS_STYLE[exp.status].label}`,
+            type: 'experiment'
+          })
+        }
+      } catch {
+        // ignore
       }
-    } catch {
-      // ignore
-    }
-  }, [])
+    },
+    [experiments]
+  )
 
   const openCreate = useCallback(() => {
     setEditing(null)
@@ -262,6 +284,33 @@ export function Experiments() {
     (id: string): string => servers.find((s) => s.id === id)?.name ?? id,
     [servers]
   )
+
+  /** 把实验记录作为上下文交给 Agent：名称/状态/指标/关联服务器。 */
+  const handleHandoffToAgent = useCallback(
+    (exp: ExperimentRecord) => {
+      const metricLines = Object.entries(exp.metrics)
+        .map(([k, v]) => `- ${k}: ${formatMetricValue(v)}`)
+        .join('\n')
+      const excerpt = [
+        `实验名称：${exp.name}`,
+        `状态：${STATUS_STYLE[exp.status].label}`,
+        exp.serverId !== undefined ? `服务器：${serverNameOf(exp.serverId)}` : '',
+        metricLines !== '' ? `指标：\n${metricLines}` : '',
+        `最近更新：${exp.updatedAt}`
+      ]
+        .filter((line) => line !== '')
+        .join('\n')
+      handoffToAgent({
+        kind: 'experiment',
+        refId: exp.id,
+        title: exp.name,
+        excerpt,
+        meta: { status: exp.status, metrics: exp.metrics }
+      })
+    },
+    [serverNameOf]
+  )
+
 
   const chartKeys = numericMetricKeys(experiments)
   const runningCount = experiments.filter((e) => e.status === 'running').length
@@ -357,6 +406,16 @@ export function Experiments() {
                     </div>
 
                     <div className="flex items-center gap-0.5 shrink-0 ml-2">
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          handleHandoffToAgent(exp)
+                        }}
+                        className="flex h-6 w-6 items-center justify-center rounded text-muted-foreground hover:text-primary transition-colors"
+                        title="交给 Agent（在对话中引用本次实验）"
+                      >
+                        <Sparkles className="h-3.5 w-3.5" />
+                      </button>
                       <button
                         onClick={(e) => {
                           e.stopPropagation()

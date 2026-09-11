@@ -1,12 +1,37 @@
 import { useEffect, useState } from 'react'
 import { Card, CardContent } from '@/components/ui/card'
-import { FileText, BookOpen, BarChart3, Image, Server, Clock, ArrowRight, FolderKanban } from 'lucide-react'
+import {
+  FileText,
+  BookOpen,
+  BarChart3,
+  Image,
+  Server,
+  Clock,
+  ArrowRight,
+  FolderKanban,
+  AlertTriangle,
+  Sparkles
+} from 'lucide-react'
+import { cn } from '@/lib/utils'
 import type { ModuleId } from '@/components/layout/Sidebar'
+import { computeActionCards, type ActionCard, type ActionSeverity } from '@/lib/actionCards'
 
 interface StatItem {
   title: string
   value: number
   icon: React.ElementType
+}
+
+/** 行动卡只用到论文的少量字段，此处按需声明以避免 unknown 断言散落在逻辑里。 */
+interface PaperLite {
+  arxivId: string
+  title: string
+  tags?: string[]
+}
+
+interface ProjectLite {
+  name: string
+  updatedAt?: string
 }
 
 interface OverviewProps {
@@ -29,6 +54,13 @@ const QUICK_ACTIONS: QuickAction[] = [
   { label: '记录进展', desc: '成长记录时间线', icon: Clock, target: 'ledger' }
 ]
 
+/** 行动卡严重度对应的配色与图标。 */
+const SEVERITY_STYLE: Record<ActionSeverity, { bar: string; icon: React.ElementType; text: string }> = {
+  urgent: { bar: 'bg-destructive', icon: AlertTriangle, text: 'text-destructive' },
+  warn: { bar: 'bg-amber-500', icon: AlertTriangle, text: 'text-amber-500' },
+  info: { bar: 'bg-primary', icon: Sparkles, text: 'text-primary' }
+}
+
 export function Overview({ onNavigate }: OverviewProps) {
   const [stats, setStats] = useState<StatItem[]>([
     { title: '论文', value: 0, icon: FileText },
@@ -37,6 +69,7 @@ export function Overview({ onNavigate }: OverviewProps) {
     { title: '记录', value: 0, icon: Clock }
   ])
   const [loaded, setLoaded] = useState(false)
+  const [actionCards, setActionCards] = useState<ActionCard[]>([])
 
   useEffect(() => {
     let alive = true
@@ -47,20 +80,73 @@ export function Overview({ onNavigate }: OverviewProps) {
         let experimentCount = 0
         let ledgerCount = 0
         const api = window.electronAPI
+        // 行动卡所需的原始数据
+        let papers: { arxivId: string; title: string; tags: string[] }[] = []
+        let projectsRaw: { name: string; updatedAt?: string }[] = []
+        let experimentsRaw: { status: string; updatedAt: string; name: string }[] = []
+        const watchedVenues: {
+          key: string
+          title: string
+          nextDeadlineAt: string | null
+          nextDeadlineKind: 'abstract' | 'paper' | null
+        }[] = []
+
         if (api?.library) {
           const [papersRes, projectsRes] = await Promise.all([
             api.library.listPapers(),
             api.library.listProjects()
           ])
-          if (papersRes.ok && papersRes.papers) paperCount = papersRes.papers.length
-          if (projectsRes.ok && projectsRes.projects) projectCount = projectsRes.projects.length
+          if (papersRes.ok && papersRes.papers) {
+            const list = papersRes.papers as PaperLite[]
+            paperCount = list.length
+            papers = list.map((p) => ({
+              arxivId: p.arxivId,
+              title: p.title,
+              tags: Array.isArray(p.tags) ? [...p.tags] : []
+            }))
+          }
+          if (projectsRes.ok && projectsRes.projects) {
+            const list = projectsRes.projects as ProjectLite[]
+            projectCount = list.length
+            projectsRaw = list.map((p) => ({
+              name: p.name,
+              ...(p.updatedAt !== undefined ? { updatedAt: p.updatedAt } : {})
+            }))
+          }
         }
+
+        // 关注会议 + 最近截稿：用于 R2 截稿临近规则
+        if (api?.venues) {
+          const watchRes = await api.venues.list()
+          if (watchRes.ok && Array.isArray(watchRes.watched) && Array.isArray(watchRes.venues)) {
+            const watched = new Set(watchRes.watched)
+            for (const v of watchRes.venues) {
+              if (!watched.has(v.key)) continue
+              watchedVenues.push({
+                key: v.key,
+                title: v.title,
+                nextDeadlineAt: v.nextDeadlineAt,
+                nextDeadlineKind: v.nextDeadlineKind
+              })
+            }
+          }
+        }
+
         if (api?.getStoreValue) {
           const [expData, ledgerData] = await Promise.all([
             api.getStoreValue<unknown[]>('experiments:list'),
             api.getStoreValue<unknown[]>('ledger:entries')
           ])
-          if (Array.isArray(expData)) experimentCount = expData.length
+          if (Array.isArray(expData)) {
+            experimentCount = expData.length
+            experimentsRaw = (expData as { status?: string; updatedAt?: string; name?: string }[]).map(
+              (e) => ({
+                status: e.status ?? 'running',
+                updatedAt: e.updatedAt ?? '',
+                name: e.name ?? ''
+              })
+            )
+          }
           if (Array.isArray(ledgerData)) ledgerCount = ledgerData.length
         } else {
           // 浏览器降级
@@ -84,6 +170,15 @@ export function Overview({ onNavigate }: OverviewProps) {
           { title: '实验', value: experimentCount, icon: BarChart3 },
           { title: '记录', value: ledgerCount, icon: Clock }
         ])
+        setActionCards(
+          computeActionCards({
+            experiments: experimentsRaw,
+            watchedVenues,
+            papers,
+            projects: projectsRaw,
+            now: Date.now()
+          })
+        )
         setLoaded(true)
       } catch {
         if (alive) setLoaded(true)
@@ -121,6 +216,39 @@ export function Overview({ onNavigate }: OverviewProps) {
             )
           })}
         </div>
+
+        {/* Action Cards：状态驱动的行动建议，无建议时整块不渲染 */}
+        {actionCards.length > 0 && (
+          <div className="space-y-2">
+            <h3 className="text-[12px] font-semibold">建议下一步</h3>
+            <div className="grid gap-2">
+              {actionCards.map((card) => {
+                const style = SEVERITY_STYLE[card.severity]
+                const CardIcon = style.icon
+                return (
+                  <button
+                    key={card.id}
+                    onClick={() => onNavigate(card.cta.target)}
+                    className="group flex items-stretch gap-0 overflow-hidden rounded-lg border border-border bg-card text-left transition-all hover:border-primary/30 hover:shadow-sm"
+                  >
+                    <div className={cn('w-1 shrink-0', style.bar)} />
+                    <div className="flex flex-1 items-center gap-3 p-3">
+                      <CardIcon className={cn('h-4 w-4 shrink-0', style.text)} />
+                      <div className="min-w-0 flex-1">
+                        <p className="truncate text-[12px] font-medium">{card.title}</p>
+                        <p className="truncate text-[10px] text-muted-foreground">{card.detail}</p>
+                      </div>
+                      <span className="flex shrink-0 items-center gap-0.5 text-[10px] text-muted-foreground transition-colors group-hover:text-primary">
+                        {card.cta.label}
+                        <ArrowRight className="h-3 w-3" />
+                      </span>
+                    </div>
+                  </button>
+                )
+              })}
+            </div>
+          </div>
+        )}
 
         {/* Quick Actions */}
         <Card>

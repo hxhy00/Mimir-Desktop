@@ -13,6 +13,8 @@ interface LedgerEntry {
   content: string
   type: 'milestone' | 'progress' | 'paper' | 'experiment'
   date: string
+  /** 事件驱动自动沉淀的条目：source 标识来源，refKey 用于幂等去重。 */
+  auto?: { source: string; refKey: string }
 }
 
 const TYPE_CONFIG = {
@@ -22,39 +24,23 @@ const TYPE_CONFIG = {
   experiment: { label: '实验', icon: Beaker, dotColor: 'bg-purple-500' }
 }
 
-const STORAGE_KEY = 'ledger:entries'
-
 function todayYmd(): string {
   const now = new Date()
   return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`
 }
 
-async function readEntries(): Promise<LedgerEntry[] | null> {
+/**
+ * 统一走 ledger IPC 读取。
+ * 自动条目由主进程写入同一 store key，渲染层若自行读写会造成双写覆盖，因此不设本地回退。
+ */
+async function readEntries(): Promise<LedgerEntry[]> {
+  const api = window.electronAPI
+  if (api === undefined) return []
   try {
-    if (window.electronAPI?.getStoreValue) {
-      const data = await window.electronAPI.getStoreValue<LedgerEntry[]>(STORAGE_KEY)
-      return Array.isArray(data) ? data : null
-    }
-    const cached = localStorage.getItem('mimir-ledger')
-    if (cached) {
-      const parsed: unknown = JSON.parse(cached)
-      return Array.isArray(parsed) ? (parsed as LedgerEntry[]) : null
-    }
-    return null
+    const res = await api.ledgerList()
+    return res.ok && Array.isArray(res.entries) ? (res.entries as LedgerEntry[]) : []
   } catch {
-    return null
-  }
-}
-
-async function persistEntries(entries: LedgerEntry[]): Promise<void> {
-  try {
-    if (window.electronAPI?.setStoreValue) {
-      await window.electronAPI.setStoreValue(STORAGE_KEY, entries)
-    } else {
-      localStorage.setItem('mimir-ledger', JSON.stringify(entries))
-    }
-  } catch {
-    // ignore
+    return []
   }
 }
 
@@ -69,9 +55,8 @@ export function Ledger() {
     let alive = true
     readEntries()
       .then((list) => {
-        if (alive && list !== null) setEntries(list)
+        if (alive) setEntries(list)
       })
-      .catch(() => {})
       .finally(() => {
         if (alive) setHydrated(true)
       })
@@ -80,24 +65,27 @@ export function Ledger() {
     }
   }, [])
 
-  // 变化即持久化
+  // 切回本模块时重新拉取，避免错过在其它模块产生的自动条目
   useEffect(() => {
-    if (!hydrated) return
-    void persistEntries(entries)
-  }, [entries, hydrated])
+    const onFocus = (): void => {
+      void readEntries().then(setEntries)
+    }
+    window.addEventListener('focus', onFocus)
+    return () => window.removeEventListener('focus', onFocus)
+  }, [])
 
-  const handleAdd = () => {
-    if (!newEntry.title.trim()) return
-    setEntries((prev) => [
-      {
-        id: `entry-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-        title: newEntry.title.trim(),
-        content: newEntry.content.trim(),
-        type: newEntry.type,
-        date: todayYmd()
-      },
-      ...prev
-    ])
+  const handleAdd = async () => {
+    const api = window.electronAPI
+    if (api === undefined || !newEntry.title.trim()) return
+    const res = await api.ledgerAppend({
+      title: newEntry.title.trim(),
+      content: newEntry.content.trim(),
+      type: newEntry.type,
+      date: todayYmd()
+    })
+    if (res.ok && res.entry) {
+      setEntries((prev) => [res.entry as LedgerEntry, ...prev])
+    }
     setNewEntry({ title: '', content: '', type: 'progress' })
     setShowDialog(false)
   }
@@ -105,6 +93,7 @@ export function Ledger() {
   const handleDelete = useCallback((id: string) => {
     if (!window.confirm('确定删除这条记录吗？此操作不可恢复。')) return
     setEntries((prev) => prev.filter((e) => e.id !== id))
+    void window.electronAPI?.ledgerRemove(id)
   }, [])
 
   return (
@@ -150,6 +139,14 @@ export function Ledger() {
                           )}
                         </div>
                         <div className="flex items-center gap-1 shrink-0">
+                          {entry.auto !== undefined && (
+                            <span
+                              className="rounded-sm border border-border px-1 py-px text-[9px] text-muted-foreground"
+                              title={`由 ${entry.auto.source} 自动记录`}
+                            >
+                              自动
+                            </span>
+                          )}
                           <span className="text-[10px] text-muted-foreground">{config.label}</span>
                           <button
                             onClick={() => handleDelete(entry.id)}

@@ -5,6 +5,14 @@ import { Square, Plus, Mic, MicOff, Bot, ArrowUp, X, Paperclip, Loader2, Command
 import { cn } from '@/lib/utils'
 import { filterSlashEntries, SLASH_ENTRIES } from '@/lib/slash'
 import type { SlashEntry } from '@/lib/slash/types'
+import {
+  clearAgentContext,
+  consumeAgentContext,
+  peekAgentContext,
+  serializeAgentContext,
+  SPACE_CHANGED_EVENT,
+  type AgentContextPayload
+} from '@/lib/agentContext'
 
 // ─── Ultra 星屑粒子（方案 C）：开启时输入卡四周散布微光粒子，发送瞬间爆发 ──
 interface UltraStar {
@@ -109,6 +117,16 @@ interface ModelConfig {
   supportsImages: boolean
 }
 
+/** 上下文芯片的类型标签：让用户明确知道带入的是什么对象。 */
+const AGENT_KIND_LABEL: Record<AgentContextPayload['kind'], string> = {
+  paper: '论文',
+  'library-item': '文献',
+  experiment: '实验',
+  figure: '图表',
+  venue: '会议',
+  file: '文件'
+}
+
 // ─── Attachments ────────────────────────────────────────────────────────
 // TODO: 图片附件（非文本文件）的 size 为 -1（未知），因为当前无 fs:stat IPC。
 // 后续需在 preload / ipc 中新增 fs:getFileSize 桥接，或在导入时读取文件头获取大小。
@@ -139,7 +157,21 @@ export function ChatInput({ onSend, onModelChange, onStop, entries, disabled, is
   const [models, setModels] = useState<ModelConfig[]>([])
   const [selectedModelId, setSelectedModelId] = useState<string>('')
   const [attachments, setAttachments] = useState<Attachment[]>([])
+  /** 跨模块投递来的 Agent 上下文（芯片展示）；发送后清空。 */
+  const [contextChip, setContextChip] = useState<AgentContextPayload | null>(() => peekAgentContext())
   const [listening, setListening] = useState(false)
+
+  // 其它模块 handoffToAgent() 后本组件重挂载，需重新读取待投递上下文；
+  // 空间切换会作废上下文（携带旧空间绝对路径）。
+  useEffect(() => {
+    const sync = (): void => {
+      setContextChip(peekAgentContext())
+    }
+    sync()
+    window.addEventListener(SPACE_CHANGED_EVENT, sync)
+    return () => window.removeEventListener(SPACE_CHANGED_EVENT, sync)
+  }, [])
+
   /** Ultra 星屑：常驻微光粒子（开启时渲染）+ 发送瞬间的爆发粒子。 */
   // 跟随 <html class="dark"> 主题切换，浅色用深紫粒子、深色用亮紫/白
   const [isDark, setIsDark] = useState(() =>
@@ -473,7 +505,11 @@ export function ChatInput({ onSend, onModelChange, onStop, entries, disabled, is
       e?.preventDefault()
       if (!value.trim() || disabled) return
       fireBurst()
-      onSend(value, attachments.length > 0 ? attachments : undefined)
+      // 跨模块上下文：发送时序列化为 <context> 前缀注入，随后清空（读后即清）
+      const ctx = consumeAgentContext()
+      const composed = ctx !== null ? `${serializeAgentContext(ctx)}\n\n${value}` : value
+      onSend(composed, attachments.length > 0 ? attachments : undefined)
+      setContextChip(null)
       setValue('')
       setAttachments([])
       setSlash(null)
@@ -619,6 +655,31 @@ export function ChatInput({ onSend, onModelChange, onStop, entries, disabled, is
               )}
             </div>
           </div>
+
+          {/* Agent context chip：其它模块「交给 Agent」投递的对象 */}
+          {contextChip !== null && (
+            <div className="flex flex-wrap gap-1.5 px-4 pb-1 pt-1">
+              <div
+                className="flex items-center gap-1 rounded-md border border-primary/40 bg-primary/10 px-2 py-0.5 text-[11px] text-foreground"
+                title={contextChip.spacePath ?? contextChip.refId}
+              >
+                <Bot className="h-3 w-3 shrink-0 text-primary" />
+                <span className="text-[10px] text-muted-foreground">{AGENT_KIND_LABEL[contextChip.kind]}</span>
+                <span className="max-w-[180px] truncate font-medium">{contextChip.title}</span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    clearAgentContext()
+                    setContextChip(null)
+                  }}
+                  className="ml-0.5 rounded-sm text-muted-foreground/60 hover:text-destructive"
+                  title="取消引用"
+                >
+                  <X className="h-3 w-3" />
+                </button>
+              </div>
+            </div>
+          )}
 
           {/* Attachments strip */}
           {attachments.length > 0 && (

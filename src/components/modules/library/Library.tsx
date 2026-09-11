@@ -16,6 +16,7 @@ import { SearchPanel, type SearchSource } from './SearchPanel'
 import { SubscriptionsBar } from './SubscriptionsBar'
 import { PaperCard } from './PaperCard'
 import { PaperReader } from './PaperReader'
+import { handoffToAgent } from '@/lib/agentContext'
 import type {
   ArxivEntry,
   ArxivSubscriptionView,
@@ -218,6 +219,27 @@ export function Library() {
       setGlobalError(res.message || 'BibTeX 导出失败')
     }
   }
+
+  /** 把文献作为上下文交给 Agent：携带标题/作者/摘要 + PDF 绝对路径。 */
+  const handleHandoffToAgent = useCallback((paper: PaperRecord) => {
+    const excerpt = [
+      `标题：${paper.title}`,
+      paper.authors.length > 0 ? `作者：${paper.authors.join(', ')}` : '',
+      paper.summary.trim() !== '' ? `摘要：${paper.summary}` : '',
+      paper.notes.trim() !== '' ? `已有笔记：${paper.notes}` : '',
+      `arXiv：${paper.arxivId}`
+    ]
+      .filter((line) => line !== '')
+      .join('\n')
+    handoffToAgent({
+      kind: 'library-item',
+      refId: paper.arxivId,
+      title: paper.title,
+      excerpt,
+      ...(paper.pdfPath ? { spacePath: paper.pdfPath } : {}),
+      meta: { url: paper.url, tags: paper.tags }
+    })
+  }, [])
 
   // ─── 项目操作 ────────────────────────────────────────────────────
   const handleCreateProject = async (title: string) => {
@@ -456,6 +478,7 @@ export function Library() {
                 onOpenExternal={handleOpenExternal}
                 onScoreRelevance={handleScoreRelevance}
                 onExportBib={handleExportBib}
+                onHandoffToAgent={handleHandoffToAgent}
               />
             ))}
           </div>

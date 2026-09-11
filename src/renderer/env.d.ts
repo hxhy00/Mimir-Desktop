@@ -8,11 +8,16 @@ interface ElectronAPI {
     message: string,
     conversationId: string,
     onChunk: (chunk: string) => void,
+    /**
+     * @deprecated 过程事件已改为经 onChunk 的前缀信封（`\u0002MIMIR_AGENT_EVENT\u0002` + JSON）送达，
+     * 由 ChatView 拆包。此参数仅为兼容历史调用点保留，传入后不会被回调。
+     */
     onWorkerEvent?: (event: {
       taskId: string
       title: string
       status: 'running' | 'done' | 'error'
       text?: string
+      durationMs?: number
       kind?: 'phase' | 'task' | 'tool' | 'think' | 'think-token'
     }) => void,
     options?: {
@@ -62,6 +67,17 @@ interface ElectronAPI {
   readImageDataUrl: (path: string) => Promise<{ ok: boolean; dataUrl?: string; message?: string }>
   getStoreValue: <T>(key: string) => Promise<T | undefined>
   setStoreValue: <T>(key: string, value: T) => Promise<void>
+  /** 科研记录：读取全部条目（含主进程自动沉淀的条目）。 */
+  ledgerList: () => Promise<{ ok: boolean; entries: unknown[] }>
+  /** 科研记录：追加一条手动记录。 */
+  ledgerAppend: (input: {
+    title: string
+    content: string
+    type: 'milestone' | 'progress' | 'paper' | 'experiment'
+    date?: string
+  }) => Promise<{ ok: boolean; entry?: unknown; message?: string }>
+  /** 科研记录：删除一条记录。 */
+  ledgerRemove: (id: string) => Promise<{ ok: boolean }>
   searchArxiv: (query: string, maxResults?: number, sortBy?: 'relevance' | 'submittedDate') => Promise<unknown>
   fetchPaper: (id: string) => Promise<unknown>
   downloadPdf: (id: string) => Promise<unknown>

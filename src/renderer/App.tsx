@@ -14,6 +14,8 @@ import { FolderOpen, Loader2, Plus, Monitor, Moon, Sun, Check } from 'lucide-rea
 import { cn } from '@/lib/utils'
 import { Sidebar, type ModuleId } from '@/components/layout/Sidebar'
 import { getSettingsSession } from '@/lib/settingsGuard'
+import { AGENT_HANDOFF_EVENT, clearAgentContext, SPACE_CHANGED_EVENT } from '@/lib/agentContext'
+import { flushSessionOnSpaceChange } from '@/lib/spaceFlush'
 import { ChatView } from '@/components/chat/ChatView'
 import { Overview } from '@/components/modules/Overview'
 import { Paper } from '@/components/modules/Paper'
@@ -60,7 +62,8 @@ export default function App() {
   // ── 科研空间 ──────────────────────────────────────────────────────
   const [spaces, setSpaces] = useState<SpaceView[]>([])
   const [activeSpaceId, setActiveSpaceId] = useState<string | null>(null)
-  const [spaceVersion, setSpaceVersion] = useState(0)
+  /** UI 空间纪元：切/建空间时 +1，作为主内容重挂载 key，强制各模块重读新空间数据。 */
+  const [uiSpaceEpoch, setUiSpaceEpoch] = useState(0)
   const [spaceLoading, setSpaceLoading] = useState(true)
   const [gateOpen, setGateOpen] = useState(false)
   const [gateName, setGateName] = useState('我的科研空间')
@@ -113,10 +116,15 @@ export default function App() {
       }
       const res = await api.switch(id)
       if (res.ok) {
+        // 先做空间数据缓存收尾（会话 flush / 上下文作废），再推进 uiSpaceEpoch。
+        // 后者会作为 key 重挂载主内容，让 Chat 等模块从新空间重新读取数据。
+        flushSessionOnSpaceChange()
         setActiveSpaceId(id)
-        // 强制主内容重挂载，使各模块从新空间重新读取数据
-        setSpaceVersion((v) => v + 1)
+        setUiSpaceEpoch((v) => v + 1)
         setRightSidebarCollapsed(true)
+        // 跨空间上下文作废：投递中的 Agent 上下文携带旧空间绝对路径，切空间后必须清空
+        clearAgentContext()
+        window.dispatchEvent(new CustomEvent(SPACE_CHANGED_EVENT))
       }
     },
     [activeSpaceId]
@@ -184,6 +192,9 @@ export default function App() {
       if (res.ok) {
         await syncSpaces()
         if (res.workspace) setActiveSpaceId(res.workspace.id)
+        // 首个空间创建后主内容需按新空间重挂载（此前 Chat 挂在 'no-space' key 下）
+        flushSessionOnSpaceChange()
+        setUiSpaceEpoch((v) => v + 1)
         setGateOpen(false)
         setGateName('我的科研空间')
         setGateDir('')
@@ -215,6 +226,24 @@ export default function App() {
     },
     [activeModule]
   )
+
+  // 跨模块「交给 Agent」：各模块 handoffToAgent() 后跳转到 Chat（经同一离开守卫）
+  useEffect(() => {
+    const onHandoff = (e: Event): void => {
+      const detail = (e as CustomEvent<{ prompt?: string }>).detail
+      void handleNavigate('chat')
+      // 可选：携带初始提问 → 交给 ChatView 消费（通过 sessionStorage 单次传递，避免额外全局状态）
+      if (detail?.prompt) {
+        try {
+          sessionStorage.setItem('mimir:agent-handoff-prompt', detail.prompt)
+        } catch {
+          // ignore
+        }
+      }
+    }
+    window.addEventListener(AGENT_HANDOFF_EVENT, onHandoff)
+    return () => window.removeEventListener(AGENT_HANDOFF_EVENT, onHandoff)
+  }, [handleNavigate])
 
   // Load theme from settings
   useEffect(() => {
@@ -337,7 +366,7 @@ export default function App() {
   const renderModule = () => {
     switch (activeModule) {
       case 'chat':
-        return <ChatView rightSidebarCollapsed={rightSidebarCollapsed} onToggleRightSidebar={toggleRightSidebar} sidebarCollapsed={sidebarCollapsed} onToggleSidebar={toggleSidebar} />
+        return <ChatView key={activeSpaceId ?? 'no-space'} rightSidebarCollapsed={rightSidebarCollapsed} onToggleRightSidebar={toggleRightSidebar} sidebarCollapsed={sidebarCollapsed} onToggleSidebar={toggleSidebar} />
       case 'overview':
         return <Overview onNavigate={handleNavigate} />
       case 'paper':
@@ -368,7 +397,7 @@ export default function App() {
           />
         )
       default:
-        return <ChatView rightSidebarCollapsed={rightSidebarCollapsed} onToggleRightSidebar={toggleRightSidebar} sidebarCollapsed={sidebarCollapsed} onToggleSidebar={toggleSidebar} />
+        return <ChatView key={activeSpaceId ?? 'no-space'} rightSidebarCollapsed={rightSidebarCollapsed} onToggleRightSidebar={toggleRightSidebar} sidebarCollapsed={sidebarCollapsed} onToggleSidebar={toggleSidebar} />
     }
   }
 
@@ -400,7 +429,7 @@ export default function App() {
             />
           </>
         )}
-        <div key={`${activeModule}-${spaceVersion}`} className="relative h-full message-appear">
+        <div key={`${activeModule}-${uiSpaceEpoch}`} className="relative h-full message-appear">
           {spaceLoading ? (
             <div className="flex h-full items-center justify-center text-muted-foreground">
               <Loader2 className="h-5 w-5 animate-spin mr-2" />

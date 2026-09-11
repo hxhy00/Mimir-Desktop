@@ -31,6 +31,11 @@ import {
   setDefaultWorkspace,
 } from '../library/store'
 import * as library from '../library/libraryService'
+import {
+  appendLedger,
+  listLedgerEntries,
+  type LedgerEntryType
+} from '../ledger/ledgerService'
 import { getModelStatus, downloadModel, transcribeAudioBase64, SENSE_VOICE_MODEL } from '../speech/senseVoice'
 import {
   activeMeetingModel,
@@ -206,6 +211,36 @@ export function setupIpcHandlers(winRef: { current: BrowserWindow | null }): voi
   ipcMain.handle('store:set', (_event, key: string, value: unknown) => {
     setStoreValue(key, value)
     return true
+  })
+
+  // ─── 科研记录（Ledger）─────────────────────────────────────────────
+  // 自动条目在主进程各处埋点写入，渲染层统一走这两个 IPC，避免两条读写路径不一致。
+  ipcMain.handle('ledger:list', () => {
+    return { ok: true, entries: listLedgerEntries() }
+  })
+
+  ipcMain.handle(
+    'ledger:append',
+    (
+      _event,
+      input: { title: string; content: string; type: LedgerEntryType; date?: string }
+    ) => {
+      const title = input.title.trim()
+      if (title === '') return { ok: false, message: '标题不能为空' }
+      const entry = appendLedger({
+        title,
+        content: input.content,
+        type: input.type,
+        ...(input.date !== undefined ? { date: input.date } : {})
+      })
+      return { ok: true, entry }
+    }
+  )
+
+  ipcMain.handle('ledger:remove', (_event, id: string) => {
+    const entries = listLedgerEntries().filter((e) => e.id !== id)
+    setStoreValue('ledger:entries', entries)
+    return { ok: true }
   })
 
   // Dialog
@@ -621,7 +656,17 @@ export function setupIpcHandlers(winRef: { current: BrowserWindow | null }): voi
       const engineExecutable = await pickEngineExecutable()
       const result = await compileLatex(projectDir, engineExecutable, LATEX_COMPILE_TIMEOUT_MS)
       // 存在可预览的编译产物（main.pdf）时登记该目录，供 mimir-tex 协议白名单校验
-      if (result.pdfPath !== null) registerLatexPdfDir(projectDir)
+      if (result.pdfPath !== null) {
+        registerLatexPdfDir(projectDir)
+        // 自动沉淀：编译成功记入科研记录（同一项目同一天只记一次，避免频繁编译刷屏）
+        const projectName = basename(projectDir)
+        appendLedger({
+          title: `论文编译成功：${projectName}`,
+          content: `项目目录：${projectDir}`,
+          type: 'paper',
+          auto: { source: 'latex-compile', refKey: `${projectDir}#${new Date().toISOString().slice(0, 10)}` }
+        })
+      }
       return { ok: true, ...result }
     } catch (error) {
       return { ok: false, message: error instanceof Error ? error.message : '编译失败' }
@@ -987,6 +1032,13 @@ Write your abstract here.
   ipcMain.handle('meetings:generate', async (_event, request: GenerateDeckRequest) => {
     try {
       const deck = await generateMeetingDeck(request)
+      // 自动沉淀：组会演示文稿生成成功
+      appendLedger({
+        title: `生成组会演示文稿：${deck.title ?? deck.file}`,
+        content: `文件：${deck.file}`,
+        type: 'milestone',
+        auto: { source: 'meeting-deck', refKey: deck.file }
+      })
       return { ok: true, deck }
     } catch (error) {
       return { ok: false, message: error instanceof Error ? error.message : '生成演示文稿失败' }
@@ -1036,6 +1088,13 @@ Write your abstract here.
   ipcMain.handle('figures:add', async (_event, name: string, dataUrl: string) => {
     try {
       const figure = await importFigure(name, dataUrl)
+      // 自动沉淀：图片入库（按 fileName 幂等）
+      appendLedger({
+        title: `图表入库：${figure.name}`,
+        content: `文件：${figure.fileName}`,
+        type: 'progress',
+        auto: { source: 'figure-import', refKey: figure.fileName }
+      })
       return { ok: true, figure }
     } catch (error) {
       return { ok: false, message: error instanceof Error ? error.message : '保存图片失败' }
