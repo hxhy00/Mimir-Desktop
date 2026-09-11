@@ -10,7 +10,9 @@
     "skipLibCheck": true,
     "resolveJsonModule": true,
     "types": ["node"],
-    "outDir": "out"
+    "outDir": "out",
+    "allowImportingTsExtensions": true,
+    "noEmit": true
   },
   "include": ["electron/**/*.ts", "electron.vite.config.ts"]
 }

@@ -44,3 +44,4 @@ pnpm-debug.log*
 
 # Local plans / docs (not tracked)
 docs/
+pnpm-workspace.yaml

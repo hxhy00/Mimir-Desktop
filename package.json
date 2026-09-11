@@ -20,6 +20,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:gateway": "vitest run test/gateway",
+    "test:model-discovery": "node --experimental-strip-types --no-warnings electron/modelDiscovery.test.ts",
     "start": "electron-vite preview"
   },
   "dependencies": {
