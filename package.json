@@ -17,6 +17,9 @@
     "build:linux": "electron-vite build && electron-builder --linux --publish never",
     "preview": "electron-vite preview",
     "typecheck": "tsc --noEmit -p tsconfig.node.json && tsc --noEmit -p tsconfig.web.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:gateway": "vitest run test/gateway",
     "start": "electron-vite preview"
   },
   "dependencies": {
@@ -71,7 +74,8 @@
     "postcss": "^8.4.47",
     "tailwindcss": "^3.4.13",
     "typescript": "^5.6.2",
-    "vite": "^5.4.8"
+    "vite": "^5.4.8",
+    "vitest": "^2.1.9"
   },
   "pnpm": {
     "onlyBuiltDependencies": [

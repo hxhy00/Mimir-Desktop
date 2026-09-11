@@ -77,7 +77,7 @@
 | **记录 `ledger`** | 成长记录时间线（里程碑 / 论文 / 实验等），本地持久化、可删除 |
 | **会议截稿 `venues`** | ccfddl 会议截稿目录（本地缓存优先、启动自动抓取 + 6h 定时 / 手动刷新，离线可用），领域 / CCF 等级 / 时间窗过滤、倒计时高亮、关注星标；内置 CCF-A 期刊目录 |
 | **插件 `plugins`** | 统一管理技能 / 子代理 / 插件 / Hooks（增删改查 + 启停开关，本地持久化） |
-| **设置 `settings`** | 模型 / 外观 / Agent（技能路由 · 身份与默认值 · 长期记忆）/ 图像生成 / 科研空间 / 语音与资源 / 关于 |
+| **设置 `settings`** | 模型（LLM 管理 · 图像生成端点）/ 外观 / Agent（技能路由 · 身份与默认值 · 长期记忆）/ 科研空间 / 语音与资源 / 关于 |
 
 ### 插件模块（技能 / 子代理 / 插件 / Hooks）
 
@@ -102,6 +102,7 @@
 | 远程终端 | @xterm/xterm + node-pty |
 | 语音 | sherpa-onnx (SenseVoice) / Web Speech |
 | 数据存储 | 双层 JSON Store（全局设置 + 科研空间）+ arXiv API |
+| 测试 | Vitest（契约 / 网关探测 / 无头冒烟） |
 
 ---
 
@@ -119,6 +120,9 @@ pnpm build
 
 # 4. 类型检查
 pnpm typecheck
+
+# 5. 测试（离线契约 + 冒烟，不需要网络与凭据）
+pnpm test
 ```
 
 > 打包平台：`pnpm build:mac` / `pnpm build:win` / `pnpm build:linux`（分别产出 dmg/zip、nsis/portable、AppImage/deb）。
@@ -169,6 +173,58 @@ pnpm typecheck
 
 ---
 
+## 测试
+
+离线测试**不需要网络与 API 凭据**，`pnpm test` 即可跑完（约 2s）；打真实网关的 live 测试默认跳过。
+
+```bash
+pnpm test            # 全量：离线契约 + 冒烟
+pnpm test:watch      # 监听模式
+pnpm test:gateway    # 只跑网关相关（离线判定逻辑 + live 矩阵）
+```
+
+| 用例目录 | 覆盖内容 |
+|---|---|
+| `test/contract` | **工具名契约**——自定义工具不得与 deepagents 内置名（`ls`/`read_file`/`write_file`/`edit_file`/`delete`/`glob`/`grep`/`execute`）及中间件保留名（`task`/`write_todos`/`load_memory`）冲突。撞名会在构建 agent 时抛 `MiddlewareError`，本测试在 CI 阶段即拦截 |
+| `test/gateway` | **网关能力探测**——用注入的 fetch 桩离线验证三通道（`json_schema` / `json_object` / `function_calling`）判定逻辑正确性 |
+| `test/smoke` | **无头冒烟**——用生产同款装配构建 Supervisor（拦截中间件/撞名类错误）；文件后端 + 批准卡全链路（获批落盘 / 拒绝不落盘 / 空间内外读差异 / 超时按拒绝） |
+| `test/unit` | 批准卡握手机制（回填 / 超时 / 并发 / 无发送器保守放行） |
+
+### 网关能力探测（Gateway Probe）
+
+LangChain v1 的 `withStructuredOutput()` **默认优先选 `json_schema`**，而多数「OpenAI 兼容」第三方网关并未实现该能力，会返回 `400 This response_format type is unavailable now` —— 这类问题只在运行时才暴露。
+
+`electron/agent/gatewayProbe.ts` 把「网关支持哪条结构化输出通道」变成**可探测、可缓存的事实**：
+
+```ts
+const caps = await probeGatewayCapabilities({ baseUrl, apiKey, model })
+console.log(formatCapabilityReport(caps))
+// → 选用 method: functionCalling（网关支持 function calling，兼容性最好）
+const { method } = pickStructuredOutputMethod(caps)  // 传给 withStructuredOutput
+```
+
+优先级：`functionCalling` > `jsonMode` > `jsonSchema`（`json_schema` 即便可用也排最后，因在兼容网关上最脆弱）。
+
+### Live 测试（打真实网关）
+
+换网关 / 换模型后跑一次，立刻知道该用哪条通道，并验证「探测结论与真实调用自洽」：
+
+```bash
+MIMIR_GW_URL=https://xxx/v1 \
+MIMIR_GW_KEY=sk-xxx \
+MIMIR_GW_MODEL=deepseek-chat \
+pnpm vitest run test/gateway/liveMatrix.test.ts
+```
+
+`test/smoke/liveAgent.test.ts` 则用真实模型**真的跑一轮 agent**（纯对话 / 写文件全链路 / 读空间外文件），需要如下环境变量启用，未设置时自动跳过：
+
+```bash
+MIMIR_GW_URL=... MIMIR_GW_KEY=... MIMIR_GW_MODEL=... \
+  pnpm vitest run test/smoke/liveAgent.test.ts
+```
+
+---
+
 ## 技能与指令
 
 对话框输入 `/` 弹出「技能与指令」菜单（过滤 + 键盘补全），清单照搬 Mimir 的 commands/skills，展开为任务提示注入 Agent（L0，无文件副作用）：
@@ -200,8 +256,16 @@ pnpm typecheck
 │       ├── subagentRegistry.ts    # 内置子代理注册（重建 Supervisor）
 │       ├── skillRouter.ts         # 技能分层路由
 │       ├── approval.ts            # 副作用批准卡
+│       ├── fsBackend.ts           # 真实磁盘文件后端（写/改/删前过批准卡）
+│       ├── gatewayProbe.ts        # 网关结构化输出能力探测
 │       ├── trace.ts               # Agent 轨迹日志
-│       └── tools/                 # 16 个 Agent 工具
+│       └── tools/                 # Agent 工具
+├── test/                          # 测试（vitest，无需 Electron 运行时）
+│   ├── contract/                  # 工具名契约（防与内置撞名）
+│   ├── gateway/                   # 网关能力探测（离线判定 + live 矩阵）
+│   ├── smoke/                     # 无头冒烟（构建图 / 批准卡全链路 / live agent）
+│   ├── unit/                      # 单元测试（批准卡握手）
+│   └── stubs/                     # electron / electron-store / store 测试桩
 ├── src/
 │   ├── renderer/                  # 渲染进程（React 应用）
 │   │   ├── App.tsx                # 主应用

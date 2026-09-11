@@ -39,5 +39,8 @@ pnpm-debug.log*
 # Local
 .userdata/
 
+# CodeBuddy local working memory
+.codebuddy/
+
 # Local plans / docs (not tracked)
 docs/
