@@ -26,6 +26,11 @@ import type { ArxivEntry } from '../library/types'
 const FETCH_TIMEOUT_MS = 15_000
 const CACHE_TTL_MS = 15 * 60 * 1000
 const MAX_CACHE_ENTRIES = 200
+/**
+ * OpenAlex「礼貌池」标识：在请求里带上可联系的邮箱（mailto），OpenAlex 会把它路由到
+ * 响应更好的礼貌队列，比匿名裸调更稳定（成熟实践）。这是公开的项目联系邮箱，非隐私信息。
+ */
+const OPENALEX_MAILTO = 'hxhy@users.noreply.github.com'
 /** S2 全局最小请求间隔（共享 IP 配额脆弱，主动降频比撞 429 后退避更省时间）。 */
 const S2_MIN_INTERVAL_MS = 1200
 /** S2 429 后的冷却时长。 */
@@ -118,7 +123,7 @@ function toEntryFromOpenAlex(work: OpenAlexWork): ArxivEntry {
 }
 
 async function openAlexSearch(query: string, limit: number): Promise<ArxivEntry[]> {
-  const url = `https://api.openalex.org/works?search=${encodeURIComponent(query)}&per-page=${Math.min(limit, 50)}&select=id,doi,title,display_name,publication_year,publication_date,authorships,primary_location,best_oa_location,abstract_inverted_index`
+  const url = `https://api.openalex.org/works?search=${encodeURIComponent(query)}&per-page=${Math.min(limit, 50)}&mailto=${OPENALEX_MAILTO}&select=id,doi,title,display_name,publication_year,publication_date,authorships,primary_location,best_oa_location,abstract_inverted_index`
   const data = (await getJson(url)) as { results?: OpenAlexWork[] }
   return (data.results ?? []).map(toEntryFromOpenAlex).filter((e) => e.title !== '')
 }
@@ -129,7 +134,7 @@ async function openAlexById(idOrDoi: string): Promise<ArxivEntry | null> {
   const target = /^10\./.test(clean) || clean.startsWith('doi:')
     ? `doi:${clean.replace(/^doi:/, '')}`
     : `arxiv:${clean}`
-  const url = `https://api.openalex.org/works?filter=${encodeURIComponent(target)}&per-page=1&select=id,doi,title,display_name,publication_year,publication_date,authorships,primary_location,best_oa_location,abstract_inverted_index`
+  const url = `https://api.openalex.org/works?filter=${encodeURIComponent(target)}&per-page=1&mailto=${OPENALEX_MAILTO}&select=id,doi,title,display_name,publication_year,publication_date,authorships,primary_location,best_oa_location,abstract_inverted_index`
   try {
     const data = (await getJson(url)) as { results?: OpenAlexWork[] }
     const first = data.results?.[0]

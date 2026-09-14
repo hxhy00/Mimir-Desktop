@@ -39,6 +39,9 @@ test/eval/results/
 npm-debug.log*
 pnpm-debug.log*
 
+# Electron dev 运行时在项目根目录生成的 userData 缓存（Cache/Cookies/Session Storage）
+mimir-desktop/
+
 # Local
 .userdata/
 

@@ -1,5 +1,7 @@
 appId: com.mimir.desktop
-productName: Mimir Desktop
+# productName 决定打包产物名（.app / dmg 标题 / Dock 显示名），刻意用简短的「Mimir」；
+# 文档、README、UA 等品牌展示口径仍统一为「Mimir Desktop」。两者不一致是有意的。
+productName: Mimir
 directories:
   buildResources: build
   output: dist
@@ -28,6 +30,17 @@ mac:
   target:
     - dmg
     - zip
+  # ── 修复「已损坏，无法打开」─────────────────────────────────────────────
+  # 无 Apple Developer 账号（本机自用 / 团队内部分发）时的标准配置：
+  # - identity: null        → 不找钥匙串证书，electron-builder 走 ad-hoc 签名（codesign --sign -）。
+  #   arm64 内核要求可执行文件至少有一个签名，完全无签名的二进制会被直接拒绝、
+  #   Gatekeeper 报「已损坏」而非「未验证开发者」。ad-hoc 签名能让本机直接打开。
+  # - hardenedRuntime: false → 加固运行时需有效签名，无签名时开启反而启动失败。
+  # - gatekeeperAssess: false → 阻止打包后调用 spctl 评估（无正式证书时评估必失败并卡住流程）。
+  # 对外分发要彻底消除提示仍需 Developer ID 签名 + 公证（notarize），届时改这三项并配 notate 钩子。
+  identity: null
+  hardenedRuntime: false
+  gatekeeperAssess: false
 
 win:
   target:

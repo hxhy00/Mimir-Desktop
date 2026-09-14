@@ -145,7 +145,7 @@ Agent 拥有真实磁盘读写，因此权限模型决定「它能不问自取�
 | 远程终端 | @xterm/xterm + node-pty |
 | 语音 | sherpa-onnx (SenseVoice) / Web Speech |
 | 数据存储 | 双层 JSON Store（全局设置 + 科研空间） |
-| 文献检索 | OpenAlex（主源）+ Semantic Scholar（标题精确匹配，辅助）+ arXiv API（新鲜预印本补充 / 最新提交排序） |
+| 文献检索 | OpenAlex（主源，带礼貌池 mailto）+ Semantic Scholar（标题精确匹配，辅助）+ arXiv API（新鲜预印本补充 / 最新提交排序，带节流 / 熔断 / 差异化缓存） |
 | 测试 | Vitest（契约 / 网关探测 / 无头冒烟 / 上下文治理）+ 科研 Agent 评测集（`test/eval`）+ Node 模块自检 |
 | 本地协作 | 只读 HTTP Bridge（仅绑定 `127.0.0.1`，写路由已下线） |
 
@@ -180,6 +180,23 @@ pnpm eval:compare <A.json> <B.json>   # A/B 对比两份报告
 ```
 
 > 打包平台：`pnpm build:mac` / `pnpm build:win` / `pnpm build:linux`（分别产出 dmg/zip、nsis/portable、AppImage/deb）。
+
+### macOS 打包：「已损坏，无法打开」的处理
+
+未配置 Apple 开发者证书时，`electron-builder.yml` 的 `mac:` 段走 **ad-hoc 本地签名**（`identity: null` + `hardenedRuntime: false` + `gatekeeperAssess: false`）：本机构建、本机直接打开没有问题。**从网络下载**的 dmg 会被 macOS 附加 quarantine 隔离属性，Gatekeeper 无法验证 ad-hoc 签名时仍可能报「已损坏」——这是无证书分发的固有行为，用户侧两种解法：
+
+```bash
+# 方法一：清除隔离属性后正常打开
+xattr -cr /Applications/Mimir.app
+
+# 方法二：右键 → 打开（首次绕过 Gatekeeper 的「仍要打开」）
+```
+
+> 对外正式分发要彻底消除提示，需要 Apple Developer 账号做 **Developer ID 签名 + 公证（notarize）**，届时把 `mac:` 段的三项配置换掉并补公证钩子即可。
+
+### 应用图标规范
+
+`build/icon.png` 需符合 Apple 网格：**1024×1024、透明背景、图形内容约占 80% 居中**（四周留 ~10% 安全边距）。内容顶满画布会导致 Dock 里图标视觉上比其它应用偏大——electron-builder 生成 `.icns` 时不会自动补边距。
 
 ### 环境要求
 
@@ -295,7 +312,7 @@ pnpm test:gateway    # 只跑网关相关（离线判定逻辑 + live 矩阵）
 | `test/contract` | **工具名契约**——自定义工具不得与 deepagents 内置名（`ls`/`read_file`/`write_file`/`edit_file`/`delete`/`glob`/`grep`/`execute`）及中间件保留名（`task`/`write_todos`/`load_memory`）冲突。撞名会在构建 agent 时抛 `MiddlewareError`，本测试在 CI 阶段即拦截 |
 | `test/gateway` | **网关能力探测**——用注入的 fetch 桩离线验证三通道（`json_schema` / `json_object` / `function_calling`）判定逻辑正确性 |
 | `test/smoke` | **无头冒烟**——用生产同款装配构建单 Agent 图（拦截中间件/撞名类错误）；文件后端 + 批准卡全链路（获批落盘 / 拒绝不落盘 / 空间内外读差异 / 超时按拒绝） |
-| `test/unit` | 批准卡握手机制（回填 / 超时 / 并发 / 无发送器保守放行）与**档位感知放行**（全权档放行 / 删除除外）、控制平面写保护、上下文治理（窗口/压缩/熔断）、产物识别、评测指标、**文献检索访问层**（多源合并去重 / 缓存 / 失败信息）、**交流语言注入**（热生效 / 前置 / 不污染入参） |
+| `test/unit` | 批准卡握手机制（回填 / 超时 / 并发 / 无发送器保守放行）与**档位感知放行**（全权档放行 / 删除除外）、控制平面写保护、上下文治理（窗口/压缩/熔断）、产物识别、评测指标、**文献检索访问层**（多源合并去重 / 缓存 / 失败信息）、**arXiv 限流加固**（Retry-After 解析 / 差异化 TTL / 熔断状态机）、**交流语言注入**（热生效 / 前置 / 不污染入参） |
 | `test/eval` | **科研 Agent 评测集**——任务集 + 指标 + A/B 对比（详见 `test/eval/README.md`） |
 
 ### 网关能力探测（Gateway Probe）

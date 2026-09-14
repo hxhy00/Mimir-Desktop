@@ -35,7 +35,14 @@ interface ArxivAtomEntry {
  *
  * 仅成功的正常结果（含“未找到”）写入缓存；HTTP 错误/限流/异常不缓存。
  */
-const CACHE_TTL_MS = 15 * 60 * 1000
+/**
+ * 缓存 TTL（L4 差异化）：arXiv 元数据每日午夜才更新，24h 内重复请求同一 query/id
+ * 结果不会变——因此按类型放宽 TTL，减少无谓的排队与限流风险。
+ * - 单篇 id 读取：一旦收录基本不变，给最长（6h）。
+ * - 关键词搜索：受"最新提交"影响，给 1h（远大于旧的 15min，又不至于太陈旧）。
+ */
+const FETCH_CACHE_TTL_MS = 6 * 60 * 60 * 1000
+const SEARCH_CACHE_TTL_MS = 60 * 60 * 1000
 const MAX_CACHE_ENTRIES = 200
 /**
  * 相邻两个 arXiv 请求的最小间隔。
@@ -50,8 +57,36 @@ const INTERVAL_JITTER_MAX_MS = 400
 let arxivCoolUntil = 0
 /** 连续失败后的冷却时长。 */
 const ARXIV_COOL_DOWN_MS = 8_000
+/**
+ * 熔断阈值（L2）：连续 N 次限流后进入 OPEN 态，暂停一段时间不再发请求。
+ * 比"每次撞 429 再退避"更省时间——上游明确在限流时，硬撞只会拉长总耗时。
+ */
+const CIRCUIT_OPEN_THRESHOLD = 3
+/** 熔断打开后的强制冷却时长（ms），到期转 HALF_OPEN 放行一次探测。 */
+const CIRCUIT_OPEN_MS = 180_000
+/** Retry-After 的合理上限：超过则截断，避免异常头把任务挂死。 */
+const RETRY_AFTER_MAX_MS = 60_000
 /** 单个请求的退避等待（ms）：吸收瞬时限流，避免把抖动直接变成任务失败。 */
 const RETRY_WAITS_MS = [5_000, 15_000]
+
+/**
+ * 解析 HTTP `Retry-After` 头为毫秒。支持两种格式：
+ * - 秒数（`Retry-After: 30`）；
+ * - HTTP-date（`Retry-After: Wed, 21 Oct ...`）。
+ * 无法解析返回 undefined（由调用方回落到预设退避）。结果封顶 `RETRY_AFTER_MAX_MS`。
+ */
+export function parseRetryAfterMs(header: string | null): number | undefined {
+  if (header === null) return undefined
+  const secs = Number(header)
+  if (Number.isFinite(secs)) {
+    return Math.min(Math.max(secs, 0) * 1000, RETRY_AFTER_MAX_MS)
+  }
+  const dateMs = Date.parse(header)
+  if (!Number.isNaN(dateMs)) {
+    return Math.min(Math.max(dateMs - Date.now(), 0), RETRY_AFTER_MAX_MS)
+  }
+  return undefined
+}
 /** 带联系方式的 User-Agent（arXiv ToS 要求；缺失也是被限流的常见原因）。 */
 const ARXIV_USER_AGENT =
   'Mimir-Desktop/0.0.1 (research assistant; +https://github.com/hxhy/Mimir-Desktop)'
@@ -64,6 +99,68 @@ const inflight = new Map<string, Promise<string>>()
 let requestTail: Promise<void> = Promise.resolve()
 let lastRequestAt = 0
 
+// ─── L2 熔断器（CLOSED → OPEN → HALF_OPEN）───────────────────────────────
+/**
+ * arXiv 侧连续限流时进入 OPEN 态，暂停发请求一段时间，避免"撞 429→退避→再撞"的空转。
+ * 与既有 `arxivCoolUntil`（单次退避让路）分工不同：coolUntil 管"这一批让路多久"，
+ * 熔断管"上游是否已持续不可用、要不要整体停手"。
+ */
+type CircuitState = 'closed' | 'open' | 'half-open'
+let circuitState: CircuitState = 'closed'
+let circuitConsecutiveFails = 0
+let circuitOpenUntil = 0
+
+/** 熔断是否处于「现在不该发请求」的状态；OPEN 到期自动转 HALF_OPEN 放行探测。 */
+function circuitBlocks(): boolean {
+  if (circuitState === 'closed') return false
+  if (circuitState === 'half-open') return false
+  // open：到冷却时间就转半开，放一条探测流量过去
+  if (Date.now() >= circuitOpenUntil) {
+    circuitState = 'half-open'
+    return false
+  }
+  return true
+}
+
+/** 记录一次成功：重置计数并回到 CLOSED。 */
+function circuitRecordSuccess(): void {
+  circuitConsecutiveFails = 0
+  circuitState = 'closed'
+}
+
+/** 记录一次限流失败：累计到阈值即打开熔断。 */
+function circuitRecordThrottle(): void {
+  circuitConsecutiveFails += 1
+  if (circuitState === 'half-open' || circuitConsecutiveFails >= CIRCUIT_OPEN_THRESHOLD) {
+    circuitState = 'open'
+    circuitOpenUntil = Date.now() + CIRCUIT_OPEN_MS
+    console.warn(`[arxiv] 熔断打开 ${Math.round(CIRCUIT_OPEN_MS / 1000)}s（连续限流 ${circuitConsecutiveFails} 次）`)
+  }
+}
+
+/**
+ * 测试钩子：以受控时钟驱动并读取熔断器状态，验证 CLOSED→OPEN→HALF_OPEN 迁移。
+ * 仅供单测使用，不参与生产调用路径。
+ */
+export const __circuitTestHooks = {
+  reset(): void {
+    circuitState = 'closed'
+    circuitConsecutiveFails = 0
+    circuitOpenUntil = 0
+  },
+  recordSuccess: circuitRecordSuccess,
+  recordThrottle: circuitRecordThrottle,
+  blocks: circuitBlocks,
+  state(): CircuitState {
+    return circuitState
+  },
+  /** 强制把 OPEN 的解除时刻设到给定时间戳，配合 fake timers 测半开迁移。 */
+  setOpenUntil(ms: number): void {
+    circuitState = 'open'
+    circuitOpenUntil = ms
+  }
+}
+
 function arxivCacheKey(parts: Record<string, string | number>): string {
   return Object.keys(parts)
     .sort()
@@ -71,10 +168,15 @@ function arxivCacheKey(parts: Record<string, string | number>): string {
     .join('&')
 }
 
+/** 按缓存 key 的 kind 选择 TTL：单篇 id 读取比关键词搜索更耐久。 */
+export function ttlForKey(key: string): number {
+  return key.includes('kind=fetch') ? FETCH_CACHE_TTL_MS : SEARCH_CACHE_TTL_MS
+}
+
 function readCache(key: string): string | undefined {
   const hit = arxivCache.get(key)
   if (hit === undefined) return undefined
-  if (Date.now() - hit.at > CACHE_TTL_MS) {
+  if (Date.now() - hit.at > ttlForKey(key)) {
     arxivCache.delete(key)
     return undefined
   }
@@ -102,9 +204,13 @@ function writeCache(key: string, value: string): void {
  */
 function runSerialized<T>(fn: () => Promise<T>): Promise<T> {
   const run = requestTail.then(async () => {
+    // L2：熔断 OPEN 时，把"不早于"时刻抬到熔断解除点——排队让路而非硬撞，
+    // 与单次退避让路（arxivCoolUntil）取较晚者，冷却同样不表现为失败。
+    const circuitReadyAt = circuitBlocks() ? circuitOpenUntil : 0
     const earliest = Math.max(
       lastRequestAt + MIN_REQUEST_INTERVAL_MS + Math.random() * INTERVAL_JITTER_MAX_MS,
-      arxivCoolUntil
+      arxivCoolUntil,
+      circuitReadyAt
     )
     const waitMs = earliest - Date.now()
     if (waitMs > 0) await new Promise((resolve) => setTimeout(resolve, waitMs))
@@ -121,6 +227,9 @@ function runSerialized<T>(fn: () => Promise<T>): Promise<T> {
 /**
  * 发一个 arXiv 请求：带 UA、走节流队列、429/503 退避重试。
  *
+ * 退避时长优先采用服务器返回的 `Retry-After`（成熟做法：尊重上游明示的等待时间，
+ * 比固定值更快恢复、也更合规）；无该头时回落到 `RETRY_WAITS_MS` 的指数退避。
+ *
  * @returns 响应体文本
  */
 async function fetchArxiv(url: string): Promise<string> {
@@ -131,11 +240,16 @@ async function fetchArxiv(url: string): Promise<string> {
         headers: { 'User-Agent': ARXIV_USER_AGENT, Accept: 'application/atom+xml' }
       })
     )
-    if (response.ok) return response.text()
+    if (response.ok) {
+      circuitRecordSuccess()
+      return response.text()
+    }
     lastStatus = response.status
     const retryable = response.status === 429 || response.status === 503
-    const wait = RETRY_WAITS_MS[attempt]
+    // 退避基准：Retry-After 优先，否则用预设指数退避；两者都没有则不再重试。
+    const wait = parseRetryAfterMs(response.headers.get('retry-after')) ?? RETRY_WAITS_MS[attempt]
     if (!retryable || wait === undefined) break
+    circuitRecordThrottle()
     // 记冷却截止：让队列里其它请求也一起让路，避免退避后并发再撞限流
     arxivCoolUntil = Date.now() + wait
     console.warn(`[arxiv] HTTP ${response.status}，${Math.round(wait / 1000)}s 后重试（第 ${attempt + 1} 次）`)
