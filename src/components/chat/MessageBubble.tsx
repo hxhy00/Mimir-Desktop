@@ -1,6 +1,7 @@
 import { cn } from '@/lib/utils'
 import type { Message } from './ChatView'
-import { AgentTraceCard } from './SwarmPanel'
+import { AgentTimeline } from './AgentTimeline'
+import { ArtifactCard } from './ArtifactCard'
 import { Bot, User, Copy, Check, RefreshCw } from 'lucide-react'
 import { useState } from 'react'
 import ReactMarkdown from 'react-markdown'
@@ -9,9 +10,11 @@ import remarkGfm from 'remark-gfm'
 interface MessageBubbleProps {
   message: Message
   onRetry?: () => void
+  /** 当前待批准的工具名（标注到对应步骤上）。 */
+  pendingApprovalTool?: string
 }
 
-export function MessageBubble({ message, onRetry }: MessageBubbleProps) {
+export function MessageBubble({ message, onRetry, pendingApprovalTool }: MessageBubbleProps) {
   const isUser = message.role === 'user'
   const isAssistant = message.role === 'assistant'
   const [copied, setCopied] = useState(false)
@@ -46,12 +49,20 @@ export function MessageBubble({ message, onRetry }: MessageBubbleProps) {
               : 'bg-card border border-border'
           )}
         >
-          {/* Agent 执行轨迹：思考/任务/工具调用，气泡内嵌可折叠（豆包/千问式） */}
-          {!isUser && message.trace !== undefined && message.trace.children.length > 0 && (
-            <div className="mb-2">
-              <AgentTraceCard trace={message.trace} isStreaming={message.isStreaming} />
-            </div>
-          )}
+          {/* Agent 执行过程：步骤时间线（工具调用与返回合并成一行；内部阶段默认隐藏）。
+              **只要还在生成就显示**，哪怕一步都还没发生 —— 否则模型写大文件的那几十秒里
+              界面上什么都看不到（用户无法判断"在思考"还是"卡死了"）。 */}
+          {!isUser &&
+            message.run !== undefined &&
+            (message.run.steps.length > 0 || message.isStreaming === true) && (
+              <div className="mb-2">
+                <AgentTimeline
+                  run={message.run}
+                  isStreaming={message.isStreaming}
+                  {...(pendingApprovalTool !== undefined ? { pendingApprovalTool } : {})}
+                />
+              </div>
+            )}
 
           {message.content ? (
             isUser ? (
@@ -70,6 +81,11 @@ export function MessageBubble({ message, onRetry }: MessageBubbleProps) {
           {/* Streaming cursor */}
           {message.isStreaming && message.content && (
             <span className="inline-block w-0.5 h-4 animate-pulse bg-primary ml-0.5 align-text-bottom" />
+          )}
+
+          {/* 产物验收卡：本条回复落盘的文件（打开 / 打开所在文件夹） */}
+          {!isUser && message.artifacts !== undefined && message.artifacts.length > 0 && (
+            <ArtifactCard artifacts={message.artifacts} />
           )}
         </div>
 

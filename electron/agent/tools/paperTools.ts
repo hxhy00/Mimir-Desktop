@@ -2,26 +2,28 @@ import { tool } from 'langchain/tools'
 import { z } from 'zod'
 import { importPaper, updatePaper, listProjects } from '../../library/libraryService'
 import { getStoreValue, currentSpaceEpoch, assertSpaceUnchanged } from '../../library/store'
-import { requireUserApproval } from '../approval'
-import type { ArxivEntry } from '../../library/types'
+import { requireBusinessApproval } from '../approval'
+import { resolvePaperById } from '../paperSearch'
 
 /**
- * paper_fetch 工具：获取一篇 arXiv 论文并自动保存到文献库，
+ * paper_fetch 工具：按 arXiv id / DOI 解析论文并自动保存到文献库，
  * 关联到指定项目（缺省关联最近更新的项目）。
+ *
+ * 元数据解析走统一访问层 `paperSearch`（OpenAlex → Semantic Scholar 回退链），
+ * 不再直连 arXiv API —— 旧实现裸调 export.arxiv.org（无节流、无重试），
+ * 会话早前被限流时这里会连锁失败并误报「paper-not-found」。
  */
 export const paperFetchTool = tool(
   async ({ arxivId, projectId, notes, tags }) => {
     try {
       const epoch = currentSpaceEpoch()
-      const id = arxivId.trim().replace(/^https?:\/\/arxiv\.org\/abs\//, '')
-      if (!id) return '无效的 arXiv id。'
-      const url = `https://export.arxiv.org/api/query?id_list=${encodeURIComponent(id)}&max_results=1`
-      const response = await fetch(url, { signal: AbortSignal.timeout(15_000) })
-      if (!response.ok) return `arXiv API 请求失败: HTTP ${response.status}`
-      const xml = await response.text()
-      const entries = parseArxivFeed(xml)
-      if (entries.length === 0) return `arXiv 中未找到 id 为 '${id}' 的记录。`
-      const entry = entries[0]!
+      let entry
+      try {
+        entry = await resolvePaperById(arxivId)
+      } catch (error) {
+        return `保存论文失败: ${error instanceof Error ? error.message : '未知错误'}`
+      }
+      const id = entry.id
 
       // 解析项目 id：显式指定或最近更新的项目
       let targetProjectId: string | undefined = projectId
@@ -38,10 +40,10 @@ export const paperFetchTool = tool(
       assertSpaceUnchanged(epoch)
 
       // 副作用确认：保存论文到文献库
-      const allowed = await requireUserApproval({
+      const allowed = await requireBusinessApproval({
         tool: 'paper_fetch',
         summary: `保存论文「${entry.title.slice(0, 60)}」到文献库`,
-        detail: `arXiv id: ${id}\n作者: ${entry.authors.join(', ')}${targetProjectId ? `\n关联项目: ${targetProjectId}` : ''}`,
+        detail: `id: ${id}（来源: ${entry.source ?? 'arxiv'}）\n作者: ${entry.authors.join(', ')}${targetProjectId ? `\n关联项目: ${targetProjectId}` : ''}`,
       })
       if (!allowed) return '已取消：保存论文操作未获得用户确认。'
 
@@ -61,7 +63,7 @@ export const paperFetchTool = tool(
         assertSpaceUnchanged(epoch)
       }
 
-      return `论文已保存到文献库: ${entry.title}\n- arXiv id: ${id}\n- 作者: ${entry.authors.join(', ')}\n- 链接: ${entry.url}`
+      return `论文已保存到文献库: ${entry.title}\n- id: ${id}（来源: ${entry.source ?? 'arxiv'}）\n- 作者: ${entry.authors.join(', ')}\n- 链接: ${entry.url}`
     } catch (error) {
       return `保存论文失败: ${error instanceof Error ? error.message : '未知错误'}`
     }
@@ -69,9 +71,9 @@ export const paperFetchTool = tool(
   {
     name: 'paper_fetch',
     description:
-      '获取一篇 arXiv 论文并自动保存到文献库，关联到指定项目（缺省关联最近更新的项目）。可附带笔记和标签。',
+      '按 arXiv id 或 DOI 获取一篇论文并自动保存到文献库（走 OpenAlex/Semantic Scholar，不受 arXiv 限流影响），关联到指定项目（缺省关联最近更新的项目）。可附带笔记和标签。只有标题没有 id 时先用 paper_search/检索拿到 id。',
     schema: z.object({
-      arxivId: z.string().describe('arXiv 论文 id，如 "2301.12345" 或完整链接'),
+      arxivId: z.string().describe('arXiv 论文 id（如 "2301.12345"、完整链接）或 DOI（如 "10.1109/cvpr.2016.90"）'),
       projectId: z.string().optional().describe('要关联的项目 id；缺省使用最近更新的项目'),
       notes: z.string().optional().describe('这篇论文为什么有用；追加到现有笔记'),
       tags: z.array(z.string()).optional().describe('组织标签，合并到论文')
@@ -108,7 +110,7 @@ export const setPaperTool = tool(
       if (tags !== undefined) parts.push(`标签: ${tags.join(', ') || '(清空)'}`)
       if (notes !== undefined) parts.push(`笔记: ${notes ? '已设置' : '(清空)'}`)
       if (projectId !== undefined && relevanceScore !== undefined) parts.push(`项目 ${projectId} 相关性: ${relevanceScore}/10`)
-      const allowed = await requireUserApproval({
+      const allowed = await requireBusinessApproval({
         tool: 'set_paper',
         summary: `更新论文 ${id}`,
         detail: parts.join('\n') || '无变更',
@@ -136,31 +138,6 @@ export const setPaperTool = tool(
     })
   }
 )
-
-/** 解析 arXiv Atom feed（与 library/arxiv.ts 的 parseArxivFeed 一致） */
-function parseArxivFeed(xml: string): ArxivEntry[] {
-  const entries: ArxivEntry[] = []
-  const entryBlocks = xml.match(/<entry>[\s\S]*?<\/entry>/g) ?? []
-  for (const block of entryBlocks) {
-    const getTag = (tag: string) => {
-      const m = block.match(new RegExp(`<${tag}[^>]*>([\\s\\S]*?)<\\/${tag}>`))
-      return m ? m[1].trim().replace(/\s+/g, ' ') : ''
-    }
-    const rawId = getTag('id')
-    const id = rawId.replace(/^https?:\/\/arxiv\.org\/abs\//, '')
-    if (id.length === 0) continue
-    const authors = [...block.matchAll(/<name>([\s\S]*?)<\/name>/g)].map((m) => m[1]!.trim())
-    entries.push({
-      id,
-      title: getTag('title'),
-      authors,
-      summary: getTag('summary'),
-      published: getTag('published'),
-      url: `https://arxiv.org/abs/${id}`,
-    })
-  }
-  return entries
-}
 
 /** 读取论文现有笔记（内部辅助） */
 async function getPaperNotes(arxivId: string): Promise<string> {

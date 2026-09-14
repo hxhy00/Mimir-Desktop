@@ -3,6 +3,7 @@ import { Search, Loader2, Globe, FileText, Bookmark, BookmarkCheck, ExternalLink
 import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
 import { cn } from '@/lib/utils'
+import { isSubmitEnter } from '@/lib/keyboard'
 import type { ArxivEntry, SearchResult, WebSearchEntry } from './types'
 import { isArxivEntry, formatDate } from './types'
 
@@ -61,7 +62,7 @@ export function SearchPanel({
             placeholder={source === 'arxiv' ? '搜索 arXiv 论文...' : '搜索网页文献...'}
             value={query}
             onChange={(e) => onQueryChange(e.target.value)}
-            onKeyDown={(e) => e.key === 'Enter' && onSearch()}
+            onKeyDown={(e) => isSubmitEnter(e) && onSearch()}
             className="pl-8 h-8 text-[13px]"
           />
         </div>

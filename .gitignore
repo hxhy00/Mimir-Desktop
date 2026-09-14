@@ -28,6 +28,9 @@ Thumbs.db
 
 # Env
 .env
+
+# 评测运行产物（test/eval/cli.ts 落盘的报告 JSON；基线与对照请显式另存）
+test/eval/results/
 .env.local
 .env.*.local
 

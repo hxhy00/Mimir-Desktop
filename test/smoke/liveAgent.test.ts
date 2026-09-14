@@ -11,7 +11,7 @@
  *   MIMIR_GW_URL=... MIMIR_GW_KEY=... MIMIR_GW_MODEL=... \
  *     npx vitest run test/smoke/liveAgent.test.ts
  */
-import { describe, expect, it, beforeAll, afterEach } from 'vitest'
+import { describe, expect, it, beforeAll, afterAll } from 'vitest'
 import { mkdtempSync, readFileSync, existsSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -75,7 +75,10 @@ function buildAgent(cfg: GwConfig): {
 }
 
 let workDir: string
-afterEach(() => {
+// 必须用 afterAll 而非 afterEach：workDir 只在 beforeAll 建一次，三条用例共用。
+// 若每用例后删，后两条用例的目标文件就没有落脚的目录 —— 用例 3 用裸 writeFileSync（不建目录）
+// 会直接 ENOENT；用例 2 之所以没暴露，是因为它走 MimirFsBackend（写盘时自动 mkdir）。
+afterAll(() => {
   if (workDir) rmSync(workDir, { recursive: true, force: true })
 })
 

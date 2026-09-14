@@ -14,36 +14,41 @@
 import { tool } from 'langchain/tools'
 import { z } from 'zod'
 import { readdir } from 'fs/promises'
-import { resolve, sep } from 'path'
-import { spaceRoot } from '../../library/store'
-import { requireUserApproval } from '../approval'
+import { resolve } from 'path'
+import { requireUserApprovalDetailed } from '../approval'
+import { evaluate, recordResolution, rememberRoot } from '../permissionService'
 
 /** read_dir 单次最多回显的条目数（防超大目录刷爆响应）。 */
 const DIR_LIST_CAP = 500
-
-/** 目标是否位于当前激活科研空间内。空间内视为用户自有资料（免批准只读），否则进入批准流程。 */
-function isInsideSpace(p: string): boolean {
-  try {
-    const root = resolve(spaceRoot())
-    const target = resolve(p)
-    return target === root || target.startsWith(root + sep)
-  } catch {
-    return false
-  }
-}
 
 export const readDirTool = tool(
   async ({ dir }) => {
     try {
       if (typeof dir !== 'string' || dir.trim() === '') return '读取失败：dir 不能为空（需为目录绝对路径）。'
       const target = resolve(dir.trim())
-      if (!isInsideSpace(target)) {
-        const allowed = await requireUserApproval({
+      // 读权限统一走权限矩阵（evaluate）：全权档 / 空间内 / 已记住目录 → 免批准；
+      // 仅当判定为 ask 才弹卡。此前该工具绕过策略硬弹卡，导致「设了全权档还被反复问」。
+      if (evaluate(target, 'read') === 'ask') {
+        const allowed = await requireUserApprovalDetailed({
           tool: 'read_dir',
           summary: `读取目录 ${target}`,
-          detail: '该目录位于当前科研空间之外。将只读列出文件名与类型，不修改任何内容；目录内容可能含系统/敏感文件。',
+          detail: '该目录位于当前科研空间之外。将只读列出文件名与类型，不修改任何内容；目录内容可能含系统/敏感文件。若信任该目录，可点「允许并记住」以免后续重复确认。',
+          rememberable: true
         })
-        if (!allowed) return '已取消：读取未获得用户确认（或等待超时）。请先向用户说明要读取的目录并再次发起。'
+        if (!allowed.allow) {
+          recordResolution(target, 'read', 'deny')
+          return '已取消：读取未获得用户确认（或等待超时）。请先向用户说明要读取的目录并再次发起。'
+        }
+        // 「允许并记住」必须真正落成策略（写入 allowedReadRoots），否则卡片上的第三个
+        // 按钮是空承诺：用户以为不再问了，下次照样弹卡——批准疲劳没被解决，反而多了一次
+        // 无效点击。落成失败（如目标是主目录本身、不允许进允许列表）降级为「仅本次允许」。
+        if (allowed.remember) {
+          const remembered = rememberRoot(target, 'read')
+          recordResolution(target, 'read', remembered.ok ? 'remember' : 'allow')
+          if (!remembered.ok) console.warn('[read_dir] 记住目录失败：', remembered.message)
+        } else {
+          recordResolution(target, 'read', 'allow')
+        }
       }
       const entries = await readdir(target, { withFileTypes: true })
       const rows = entries.map((e) => ({

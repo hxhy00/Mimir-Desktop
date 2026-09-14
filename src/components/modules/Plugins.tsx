@@ -1,11 +1,11 @@
 /**
  * 插件管理（字段名「插件」）：技能的增删改查迁自「设置 → 技能管理」，
- * 并新增 子代理 / 插件 / Hooks 三个可增删改查的配置集合（均本地持久化）。
+ * 并新增 能力域 / 插件 / Hooks 三个可增删改查的配置集合（均本地持久化）。
  *
  * 现状说明：
  * - 技能：内置 research-* 只读；自定义技能经 /trigger 在对话中实时生效（与原先一致）。
- * - 子代理：本页管理 Supervisor 可委派的模块子代理——内置科研 worker 只读展示（可克隆），
- *   自定义子代理经「重载 Agent」即时生效（主进程 electron/agent/subagentRegistry.ts 消费）。
+ * - 能力域：本页管理 Agent 可按能力域选择的工具分组——内置科研能力域只读展示（可克隆），
+ *   自定义能力域经「重载 Agent」即时生效（主进程 electron/agent/subagentRegistry.ts 消费）。
  * - 插件 / Hooks：本页提供完整的管理（增删改查 + 启用开关）与本地持久化；
  *   作为可管理的配置入口，供后续运行时扩展消费。
  *   TODO: 插件运行时消费尚未接入——配置写入 electron/store 后需在 Agent 调度层读取
@@ -85,7 +85,7 @@ async function storeSet<T>(key: string, value: T): Promise<void> {
   localStorage.setItem(key, JSON.stringify(value))
 }
 
-// ─── 子代理 / 插件 / Hooks 记录模型 ────────────────────────────────────
+// ─── 能力域 / 插件 / Hooks 记录模型 ────────────────────────────────────
 export interface SubagentConfig {
   id: string
   name: string
@@ -779,7 +779,7 @@ function CommandsPanel() {
   )
 }
 
-// ─── 通用集合 CRUD（子代理 / 插件 / Hooks） ─────────────────────────────
+// ─── 通用集合 CRUD（能力域 / 插件 / Hooks） ─────────────────────────────
 type RecordKind = 'subagent' | 'plugin' | 'hook'
 type AnyRecord = Record<string, unknown>
 
@@ -939,10 +939,12 @@ function CollectionPanel({
   )
 }
 
-// ─── 子代理管理（内置只读 + 自定义增删改查；变更后重载 Agent 即时生效） ─────
+// ─── 能力域管理（内置只读 + 自定义增删改查；变更后重载 Agent 即时生效） ─────
 interface BuiltinSubagentMeta {
   id: string
   label: string
+  /** 职业岗位名（委派身份），如「研究员」「运维工程师」。 */
+  role: string
   description: string
   systemPrompt: string
   toolIds: string[]
@@ -950,7 +952,7 @@ interface BuiltinSubagentMeta {
 
 const SUBAGENT_NAME_RE = /^[a-z][a-z0-9-]*$/
 
-/** 归一化一条 store 里的自定义子代理（兼容旧记录缺 toolIds）。 */
+/** 归一化一条 store 里的自定义能力域（兼容旧记录缺 toolIds）。 */
 function normalizeSubagent(rec: AnyRecord): SubagentConfig {
   return {
     id: String(rec.id ?? uid('agent')),
@@ -1000,7 +1002,7 @@ function SubagentsPanel() {
     await storeSet(STORE_SUBAGENTS, next)
   }
 
-  /** 变更后重载 Agent，使子代理注册即时生效。 */
+  /** 变更后重载 Agent，使能力域配置即时生效。 */
   const reloadAfterChange = useCallback(async (): Promise<void> => {
     if (window.electronAPI?.reloadAgent) {
       try {
@@ -1021,7 +1023,7 @@ function SubagentsPanel() {
     if (!SUBAGENT_NAME_RE.test(name)) return 'name 需为小写字母开头，且仅含小写字母/数字/中划线'
     const clashBuiltin = builtins.some((b) => b.id === name)
     const clashCustom = items.some((i) => i.id !== draft.id && i.name === name)
-    if (clashBuiltin || clashCustom) return `name「${name}」已被占用（内置或其它自定义子代理）`
+    if (clashBuiltin || clashCustom) return `name「${name}」已被占用（内置或其它自定义能力域）`
     if (draft.description.trim() === '') return '一句话说明不能为空'
     if (draft.systemPrompt.trim() === '') return '系统提示词不能为空'
     return null
@@ -1058,7 +1060,7 @@ function SubagentsPanel() {
   }
 
   const removeCustom = async (rec: SubagentConfig): Promise<void> => {
-    if (!window.confirm(`删除自定义子代理「${rec.name}」？`)) return
+    if (!window.confirm(`删除自定义能力域「${rec.name}」？`)) return
     await persist(items.filter((r) => r.id !== rec.id))
     if (editing !== null && editing.id === rec.id) setEditing(null)
     await reloadAfterChange()
@@ -1091,7 +1093,7 @@ function SubagentsPanel() {
     setEditing({
       id: uid('agent'),
       name: '',
-      label: `${b.label} · 克隆`,
+      label: `${b.role} · 克隆`,
       description: b.description,
       systemPrompt: b.systemPrompt,
       toolIds: [...b.toolIds],
@@ -1100,11 +1102,11 @@ function SubagentsPanel() {
     })
   }
 
-  /** 一句话职责描述 → AI 生成子代理草稿并打开编辑框。 */
+  /** 一句话职责描述 → AI 生成能力域草稿并打开编辑框。 */
   const generate = async (): Promise<void> => {
     const p = genText.trim()
     if (p === '') {
-      setGenErr('请先描述子代理职责（一句话即可）。')
+      setGenErr('请先描述能力域职责（一句话即可）。')
       return
     }
     if (window.electronAPI?.generateSubagent === undefined) {
@@ -1123,7 +1125,7 @@ function SubagentsPanel() {
       setEditing({ id: uid('agent'), ...res.draft, enabled: true, createdAt: nowIso() })
       setGenOpen(false)
       setGenText('')
-      setNotice({ kind: 'ok', text: 'AI 已生成子代理草稿（name/说明/提示词/工具已填），检查无误后点「保存并重载」生效。' })
+      setNotice({ kind: 'ok', text: 'AI 已生成能力域草稿（name/说明/提示词/工具已填），检查无误后点「保存并重载」生效。' })
     } catch (error) {
       setGenErr(`生成失败：${error instanceof Error ? error.message : '未知错误'}`)
     } finally {
@@ -1138,13 +1140,14 @@ function SubagentsPanel() {
       <div className="rounded-lg border border-border bg-card p-4">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div>
-            <p className="text-[12px] font-medium text-foreground">子代理</p>
+            <p className="text-[12px] font-medium text-foreground">能力域</p>
             <p className="mt-0.5 text-[10px] text-muted-foreground">
-              内置 {builtins.length} 个（只读种子）· 我的 {items.length} 个 · 变更保存后自动重载 Agent 即时生效
+              内置 {builtins.length} 个（只读种子）· 我的 {items.length} 个 · 每个能力域都会注册成一个**可被委派的子代理**，
+              主 Agent 按任务自行决定直接调用工具或委派给它 · 变更保存后自动重载 Agent 即时生效
             </p>
           </div>
           <div className="flex items-center gap-1.5">
-            <Button variant="outline" size="sm" className="h-7" onClick={() => void reloadAfterChange()} title="重新初始化 Supervisor（按最新子代理注册）">
+            <Button variant="outline" size="sm" className="h-7" onClick={() => void reloadAfterChange()} title="重新初始化 Agent（按最新能力域配置）">
               <RefreshCw className="h-3.5 w-3.5 mr-1" />重载 Agent
             </Button>
             <Button
@@ -1152,7 +1155,7 @@ function SubagentsPanel() {
               size="sm"
               className="h-7 border-violet-500/30 text-violet-600 hover:bg-violet-500/10 dark:text-violet-300"
               onClick={() => { setGenErr(null); setGenText(''); setGenOpen(true) }}
-              title="用一句话职责描述让 AI 生成子代理草稿"
+              title="用一句话职责描述让 AI 生成能力域草稿"
             >
               <Sparkles className="h-3.5 w-3.5 mr-1" />AI 生成
             </Button>
@@ -1168,7 +1171,7 @@ function SubagentsPanel() {
         )}
       </div>
 
-      {/* 内置子代理（只读种子 + 克隆） */}
+      {/* 内置能力域（只读种子 + 克隆） */}
       {builtins.length > 0 && (
         <div>
           <p className="mb-1 text-[10px] font-medium text-muted-foreground">内置（只读）· {builtins.length}</p>
@@ -1179,10 +1182,14 @@ function SubagentsPanel() {
                   <Lock className="h-3 w-3" />
                 </span>
                 <div className="min-w-0 flex-1">
-                  <p className="truncate text-[12px] font-medium text-foreground">{b.label} <span className="ml-1 font-mono text-[10px] text-muted-foreground">{b.id}</span></p>
+                  <p className="truncate text-[12px] font-medium text-foreground">
+                    {b.role}
+                    <span className="ml-1.5 font-mono text-[10px] text-muted-foreground">{b.id}</span>
+                    <span className="ml-1.5 rounded bg-violet-500/10 px-1 py-px text-[9px] text-violet-600 dark:text-violet-300">可委派</span>
+                  </p>
                   <p className="mt-0.5 truncate text-[10px] text-muted-foreground">{b.description} · {b.toolIds.length} 个工具</p>
                 </div>
-                <Button variant="ghost" size="sm" className="h-6 px-1.5 text-[10px]" onClick={() => startClone(b)} title="克隆为自定义子代理（改 name / 提示词 / 工具后另存）">
+                <Button variant="ghost" size="sm" className="h-6 px-1.5 text-[10px]" onClick={() => startClone(b)} title="克隆为自定义能力域（改 name / 提示词 / 工具后另存）">
                   <CopyPlus className="h-3 w-3 mr-1" />克隆
                 </Button>
               </div>
@@ -1191,13 +1198,13 @@ function SubagentsPanel() {
         </div>
       )}
 
-      {/* 自定义子代理（增删改查 + 启停） */}
+      {/* 自定义能力域（增删改查 + 启停） */}
       <div>
-        <p className="mb-1 text-[10px] font-medium text-muted-foreground">我的自定义子代理 · {items.length}</p>
+        <p className="mb-1 text-[10px] font-medium text-muted-foreground">我的自定义能力域 · {items.length}</p>
         {items.length === 0 ? (
           <div className="flex flex-col items-center justify-center rounded-lg border border-dashed border-border py-7 text-center text-muted-foreground">
             <Bot className="mb-1.5 h-5 w-5 opacity-50" />
-            <p className="text-[11px]">还没有自定义子代理。「克隆」内置子代理或点右上角「新增」创建，即可成为 Supervisor 可委派的模块。</p>
+            <p className="text-[11px]">还没有自定义能力域。「克隆」内置能力域或点右上角「新增」创建，即可成为 Agent 可按能力域选择的工具分组。</p>
           </div>
         ) : (
           <div className="space-y-1.5">
@@ -1207,8 +1214,10 @@ function SubagentsPanel() {
                 <div className="min-w-0 flex-1">
                   <p className="truncate text-[12px] font-medium text-foreground">
                     {rec.label !== '' ? rec.label : rec.name}
-                    <span className="ml-1.5 font-mono text-[10px] text-muted-foreground">/agent:{rec.name}</span>
-                    {rec.enabled === false && <span className="ml-1.5 rounded bg-muted px-1 py-px text-[9px] text-muted-foreground">已停用</span>}
+                    <span className="ml-1.5 font-mono text-[10px] text-muted-foreground">subagent_type: {rec.name}</span>
+                    {rec.enabled === false
+                      ? <span className="ml-1.5 rounded bg-muted px-1 py-px text-[9px] text-muted-foreground">已停用</span>
+                      : <span className="ml-1.5 rounded bg-violet-500/10 px-1 py-px text-[9px] text-violet-600 dark:text-violet-300">可委派</span>}
                   </p>
                   {rec.description !== '' && (
                     <p className="mt-0.5 truncate text-[10px] text-muted-foreground">{rec.description} · {rec.toolIds.length} 个工具</p>
@@ -1226,11 +1235,11 @@ function SubagentsPanel() {
         )}
       </div>
 
-      {/* AI 一句话生成子代理草稿 */}
+      {/* AI 一句话生成能力域草稿 */}
       <Dialog open={genOpen} onOpenChange={(open) => { if (!genBusy) { setGenOpen(open); setGenErr(null) } }}>
         <DialogContent className="sm:max-w-md">
           <DialogHeader>
-            <DialogTitle>AI 生成子代理</DialogTitle>
+            <DialogTitle>AI 生成能力域</DialogTitle>
             <DialogDescription>
               用一句话描述职责，AI 会生成 name / 一句话说明 / 系统提示词 / 工具白名单草稿；你可在编辑框检查后保存。
             </DialogDescription>
@@ -1260,9 +1269,9 @@ function SubagentsPanel() {
       <Dialog open={editing !== null} onOpenChange={(open) => { if (!open) setEditing(null) }}>
         <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-2xl">
           <DialogHeader>
-            <DialogTitle>{isEditingNew ? '新增自定义子代理' : '编辑子代理'}</DialogTitle>
+            <DialogTitle>{isEditingNew ? '新增自定义能力域' : '编辑能力域'}</DialogTitle>
             <DialogDescription>
-              name 是 Supervisor 委派标识（小写字母数字-，全局唯一）；label/说明/提示词决定何时委派与如何执行；工具只能从内置白名单勾选。
+              name 是能力域标识（小写字母数字-，全局唯一，即委派时的 subagent_type）；说明会作为「何时委派给它」的判断依据，提示词则是子代理的角色设定；工具只能从内置白名单勾选。
             </DialogDescription>
           </DialogHeader>
           {editing !== null && (
@@ -1277,11 +1286,11 @@ function SubagentsPanel() {
               </div>
               <div className="col-span-2 space-y-1">
                 <Label className="text-[11px]">一句话说明 *</Label>
-                <Input className="h-7 text-[12px]" value={editing.description} onChange={(e) => setEditing({ ...editing, description: e.target.value })} placeholder="给 Supervisor 判断何时委派：负责什么、能力边界…" />
+                <Input className="h-7 text-[12px]" value={editing.description} onChange={(e) => setEditing({ ...editing, description: e.target.value })} placeholder="供 Agent 判断何时选用：负责什么、能力边界…" />
               </div>
               <div className="col-span-2 space-y-1">
                 <Label className="text-[11px]">系统提示词 *</Label>
-                <Textarea rows={6} className="text-[12px]" value={editing.systemPrompt} onChange={(e) => setEditing({ ...editing, systemPrompt: e.target.value })} placeholder="该子代理的角色、职责、纪律、输出格式…" />
+                <Textarea rows={6} className="text-[12px]" value={editing.systemPrompt} onChange={(e) => setEditing({ ...editing, systemPrompt: e.target.value })} placeholder="该能力域的角色、职责、纪律、输出格式…" />
               </div>
               <div className="col-span-2 space-y-1.5">
                 <Label className="text-[11px]">工具集（内置白名单勾选 · {editing.toolIds.length} 个）</Label>
@@ -1331,7 +1340,7 @@ type PluginsTab = 'skills' | 'commands' | 'subagents' | 'plugins' | 'hooks'
 const TABS: { id: PluginsTab; label: string; icon: React.ElementType; desc: string }[] = [
   { id: 'commands', label: '指令', icon: ListOrdered, desc: '内置只读 + 自定义指令增删改查（指令在对话时展开为任务提示）' },
   { id: 'skills', label: '技能', icon: Command, desc: '内置只读 + 自定义技能增删改查' },
-  { id: 'subagents', label: '子代理', icon: Bot, desc: 'Supervisor 可委派的模块子代理注册（增删改查 + 启停）' },
+  { id: 'subagents', label: '能力域', icon: Bot, desc: 'Agent 可按能力域选择的工具分组（增删改查 + 启停）' },
   { id: 'plugins', label: '插件', icon: Puzzle, desc: '插件注册（增删改查 + 启停；配置留待运行时扩展消费）' },
   { id: 'hooks', label: 'Hooks', icon: Cable, desc: '事件钩子注册（增删改查 + 启停；留待运行时扩展消费）' }
 ]
@@ -1343,7 +1352,7 @@ export function Plugins() {
     <div className="flex h-full flex-col">
       <div className="drag-region flex h-12 shrink-0 items-center justify-between px-5">
         <span className="module-title">插件</span>
-        <span className="text-[11px] text-muted-foreground">技能 · 子代理 · 插件 · Hooks 统一管理</span>
+        <span className="text-[11px] text-muted-foreground">技能 · 能力域 · 插件 · Hooks 统一管理</span>
       </div>
       <div className="no-drag flex flex-wrap items-center gap-1.5 border-b border-border px-5 py-2">
         {TABS.map((t) => {

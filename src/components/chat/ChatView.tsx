@@ -3,6 +3,15 @@ import { ScrollArea } from '@/components/ui/scroll-area'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { MessageBubble } from './MessageBubble'
+import {
+  applyRunEvent,
+  cancelRun,
+  createRun,
+  fromLegacyTrace,
+  type AgentRun,
+  type LegacyTraceNode,
+  type RunEvent
+} from './agentRun'
 import { ChatInput, type Attachment } from './ChatInput'
 import { RightSidebar, RightSidebarExpandButton } from '@/components/layout/RightSidebar'
 import {
@@ -17,9 +26,11 @@ import {
   PanelLeftOpen,
   ShieldQuestion,
   Sparkles,
-  ChevronDown
+  ChevronDown,
+  Loader2
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
+import { isSubmitEnter } from '@/lib/keyboard'
 import {
   COMMAND_ENTRIES,
   SKILL_ENTRIES,
@@ -32,8 +43,9 @@ import {
 import type { SlashEntry } from '@/lib/slash/types'
 import { registerSpaceFlush } from '@/lib/spaceFlush'
 
-/** Agent 副作用确认（见 electron/agent/approval.ts）。 */
+/** Agent 副作用确认（见 electron/agent/approval.ts）。字段名与 IPC 数据结构、主进程 approval.ts 对齐，勿改名。 */
 interface ApprovalSourceInfo {
+  /** 发起方：main = 主 Agent；subagent = 能力域（字段名保留以兼容 IPC 与历史数据）。 */
   origin: 'main' | 'subagent'
   subagentId?: string
   subagentLabel?: string
@@ -43,25 +55,18 @@ interface PendingApproval {
   tool: string
   summary: string
   detail?: string
-  /** C3：发起方来源（主 agent / 子代理），用于批准卡展示「谁在申请」。 */
+  /** C3：发起方来源（主 Agent / 能力域），用于批准卡展示「谁在申请」。 */
   source?: ApprovalSourceInfo
+  /** 是否支持「允许并记住」（可落成策略时才为 true，如文件后端记住目录）。 */
+  rememberable?: boolean
 }
 
-/** Agent 执行事件树节点（run 根 / 阶段 / 任务 / 思考 / 工具行）。 */
-export interface SwarmEventNode {
-  key: string
-  kind: 'run' | 'phase' | 'task' | 'think' | 'tool'
-  title: string
-  status?: 'running' | 'done' | 'error' | 'canceled'
-  /** 叶子完整文本（思考全文 / 工具调用与返回摘要）；超过单行展示上限时在 UI 折叠。 */
-  text?: string
-  /** 工具执行耗时（毫秒，由主进程在返回/出错时填充）。 */
-  durationMs?: number
-}
-
-export interface SwarmTreeNodeItem {
-  node: SwarmEventNode
-  children: SwarmTreeNodeItem[]
+/** 对话内产物引用（主进程从工具返回中解析，渲染层做验收卡展示）。 */
+export interface ChatArtifact {
+  path: string
+  name: string
+  ext: string
+  sizeBytes?: number
 }
 
 /** Agent 过程事件信封前缀（与主进程 ipc/index.ts 保持一致）。 */
@@ -73,8 +78,18 @@ export interface Message {
   content: string
   timestamp: Date
   isStreaming?: boolean
-  /** 生成本条回复时的事件树（Supervisor 与模块子 Agent 统一；气泡内折叠展示，历史可回看）。 */
-  trace?: SwarmTreeNodeItem
+  /**
+   * 本条回复的执行过程（步骤时间线）。新数据一律写这个字段，
+   * 语义全部来自结构化字段，见 `agentRun.ts`。
+   */
+  run?: AgentRun
+  /**
+   * **旧数据兼容（只读）**：改造前落盘的事件树。读取历史会话时用
+   * `fromLegacyTrace` 转换一次后即按 `run` 处理；不再写入。
+   */
+  trace?: LegacyTraceNode
+  /** 本条回复过程中落盘的产物（气泡下方验收卡：打开 / 打开所在文件夹）。 */
+  artifacts?: ChatArtifact[]
 }
 
 interface Conversation {
@@ -87,7 +102,7 @@ interface Conversation {
 
 const WELCOME_MESSAGE = `你好，我是 **Mimir**，你的科研助手。
 
-我采用 **Supervisor 编排**：主管 Agent 会把文献检索、论文编译、实验、组会 PPT、GPU 服务器等专业任务自动委派给相应的模块专家协作完成。
+我直接调度文献检索、论文编译、实验管理、组会 PPT、GPU 服务器等专业工具，自己规划、自己执行。
 
 我可以帮你：
 
@@ -99,12 +114,14 @@ const WELCOME_MESSAGE = `你好，我是 **Mimir**，你的科研助手。
 
 有什么需要帮忙的？`
 
-// ── Ultra 增强策略（UI 层枚举；与主进程 electron/agent/agentService.ts 保持一致）─────
-type UltraStrategy = 'plain' | 'multi_expert' | 'critique_reflect' | 'hybrid_mix' | 'self_consistency_vote'
+// ── Ultra 增强策略（UI 层枚举；与主进程 electron/agent/ultra.ts 保持一致）─────
+// 注意：这里**没有**「普通增强（plain）」。它曾是一段纯提示词式的「长程规划约束」，
+// 2026-09 的 A/B 实测为负收益（0 例修复 / 1 例回归，token +43.4%、工具调用 +85.7%），
+// 已从策略库移除。自动选型现在会在不需要增强时直接不介入。
+type UltraStrategy = 'multi_expert' | 'critique_reflect' | 'hybrid_mix' | 'self_consistency_vote'
 type UltraPick = 'auto' | UltraStrategy
 const ULTRA_OPTIONS: { value: UltraPick; label: string; desc: string; badge?: string }[] = [
-  { value: 'auto', label: '自动选择', desc: 'Ultra 分析任务类型与复杂度自动挑选策略', badge: '推荐' },
-  { value: 'plain', label: '普通增强', desc: '长程规划约束，不启用多专家合议' },
+  { value: 'auto', label: '自动选择', desc: 'Ultra 分析任务类型与复杂度自动挑选策略；不需要增强时不会介入', badge: '推荐' },
   { value: 'multi_expert', label: '多专家合议', desc: '多视角对抗：K 路并行推演 + 共识/分歧输出' },
   { value: 'critique_reflect', label: '批判迭代', desc: '方案 → 批判挑错 → 修订，循环 N 轮' },
   { value: 'hybrid_mix', label: '混合增强', desc: '关键判断点触发合议，其余走批判反思' },
@@ -126,58 +143,11 @@ const CONVERSATIONS_KEY = 'chat:conversations'
 /** 当前激活会话 id 的持久化 key：切模块重挂载后恢复到切走前的对话。 */
 const ACTIVE_CONV_KEY = 'chat:activeConvId'
 
-// ── 上下文治理（M2/M3）：发给 Agent 的历史滑动窗口 + 超限摘要压缩 + 失效对象提醒 ──
+// ── 上下文治理（已下沉主进程）────────────────────────────────────────────
+// 滑动窗口、分段摘要压缩、压缩熔断、原文归档、失效对象提醒、压缩后能力声明重建，
+// 全部由 `electron/agent/contextManager.ts` 完成（按真实 token 计量）。
+// 渲染层在这里只做一件事：把「本会话的 user/assistant 正文历史」原样交给主进程。
 type HistoryMsg = { role: 'user' | 'assistant'; content: string }
-/** 历史总字符阈值：超过则对最旧部分压缩（SS 估算，避免把长会话整包塞进 prompt）。 */
-const MAX_CONTEXT_CHARS = 60_000
-/** 压缩后仍保留的「最近原文窗口」字符数。 */
-const KEEP_TAIL_CHARS = 32_000
-/** 单次压缩请求的最大字符数（B2）：超长一次调用易被网关拒绝/超时，分段压缩提高成功率。 */
-const COMPRESS_CHUNK_CHARS = 8_000
-/** 归档 store key 前缀：被压缩掉的旧轮原文，key = chat:archive:<convId>。 */
-const HISTORY_ARCHIVE_PREFIX = 'chat:archive:'
-/** 失效对象提醒 store key 前缀：key = chat:reminders:<convId>（治理 M3）。 */
-const REMINDER_STORE_PREFIX = 'chat:reminders:'
-/** 压缩熔断 store key 前缀：key = chat:compressFail:<convId>（治理 B3）。 */
-const COMPRESS_FAIL_PREFIX = 'chat:compressFail:'
-/** 同一会话连续压缩失败熔断阈值（治理 B3）：达到后本轮直接截断，不再重试。 */
-const COMPRESS_FAIL_LIMIT = 3
-
-/**
- * 压缩后能力声明（B1）：上下文被压缩后，早期历史里出现过的「可委派子代理 / 技能与指令」
- * 会一起消失，模型会「失忆」到只记得摘要里的内容，从而不再主动委派或建议技能。
- *
- * 关键设计：声明**不硬编码能力清单**，而是从当前真实注册表实时派生——
- * 内置 + 自定义子代理来自 IPC `agent:getSubagentCatalog`（= 主进程 `subagentRegistry`，
- * 含 deepagents 内置 fs 工具与批准卡说明），技能来自渲染层同一份 `slashEntries`
- * （= `src/lib/slash/registry.ts`）。这样文档删改 harness / 增删技能或子代理时，
- * 声明自动同步，不会像静态常量那样漂移成「已删除但仍被宣称」的幻觉来源。
- */
-const BUILTIN_FS_CAPABILITY_LINE =
-  '- 内置文件工具：read_file/write_file/edit_file/glob/grep/ls/execute（写盘与读空间外路径会先弹批准卡）。'
-
-/** 能力声明正文（不含标题）：子代理来自主进程真实注册表，技能来自本进程 slash 目录。 */
-interface CapabilityContext {
-  subagents: { id: string; label: string; description: string }[]
-  skills: { trigger: string; title: string }[]
-}
-
-function buildCapabilityDeclaration(ctx: CapabilityContext): string {
-  const subs = ctx.subagents.filter((s) => s.id !== 'files') // files 能力由内置 fs 工具说明覆盖
-  const lines: string[] = [
-    BUILTIN_FS_CAPABILITY_LINE,
-    subs.length > 0
-      ? `- 可委派子代理：${subs.map((s) => `${s.label}(${s.id})`).join('、')}。`
-      : '- 可委派子代理：见系统提示词中的委派清单。',
-    ctx.skills.length > 0
-      ? `- 技能与指令：${ctx.skills.map((s) => `/${s.trigger}`).join('、')}；用户以「/触发词 参数」调用时，完整说明会随该消息附带。`
-      : '- 技能与指令：用户可随时以「/触发词 参数」形式调用。',
-    '若任务匹配某技能或某个子代理的职责（如文献综述、查新、实验设计、回复审稿、文件产出），优先按对应能力推进，不要因为早期记录被压缩而遗忘。'
-  ]
-  return lines.join('\n')
-}
-/** 破坏性动作特征词：命中则认为会话内对象可能已失效（删除/改名/覆盖等）。 */
-const DESTRUCTIVE_ACTION_RE = /(删除|移除|改名|重命名|覆盖|清除|回退)/
 
 /** 只取 user/assistant 的正文历史；剔除空消息/流式中消息（不携带 trace、附件全文等）。 */
 function toHistoryMessages(list: Message[]): HistoryMsg[] {
@@ -191,225 +161,6 @@ function toHistoryMessages(list: Message[]): HistoryMsg[] {
     out.push({ role: m.role, content: m.content })
   }
   return out
-}
-
-/** 从一次工具事件中抽取「对象已失效」提醒文本；非破坏性完成事件返回 null（治理 M3）。 */
-function reminderTextFromEvent(event: {
-  taskId: string
-  title: string
-  status: string
-  text?: string
-  kind?: string
-}): string | null {
-  if (event.kind !== 'tool' || event.status !== 'done') return null
-  const raw = event.text ?? ''
-  const sep = ' 返回：'
-  const at = raw.indexOf(sep)
-  if (at === -1) return null
-  const toolName = raw.slice(0, at).trim()
-  const out = raw.slice(at + sep.length).replace(/\s+/g, ' ').trim()
-  if (!DESTRUCTIVE_ACTION_RE.test(out)) return null
-  const note = out.length > 60 ? `${out.slice(0, 60)}…` : out
-  return `${toolName} 于 ${new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })} 执行后：${note}（若相关对象已被删除/改名/覆盖，后续请忽略其旧描述）`
-}
-
-/** 读取该会话已累积的失效提醒（最新在前，至多 N 条）。 */
-async function loadConversationReminders(convId: string): Promise<string[]> {
-  const api = window.electronAPI
-  if (!api?.getStoreValue) return []
-  try {
-    const list = (await api.getStoreValue<string[]>(`${REMINDER_STORE_PREFIX}${convId}`)) ?? []
-    return list.slice(-8).reverse()
-  } catch {
-    return []
-  }
-}
-
-/** 把一条失效提醒异步写入该会话（去重、上限 20 条；尽力而为）。 */
-async function addConversationReminder(convId: string, text: string): Promise<void> {
-  const api = window.electronAPI
-  if (!api?.getStoreValue || !api.setStoreValue) return
-  try {
-    const key = `${REMINDER_STORE_PREFIX}${convId}`
-    const prev = (await api.getStoreValue<string[]>(key)) ?? []
-    if (prev.length > 0 && prev[prev.length - 1] === text) return // 去重连续同款
-    const next = [...prev, text]
-    await api.setStoreValue(key, next.length > 20 ? next.slice(next.length - 20) : next)
-  } catch {
-    // ignore
-  }
-}
-
-/**
- * 压缩汇总（B1 前置）：把「子代理注册表 + 技能目录」收敛成一条可复用的能力声明正文。
- * 子代理取自主进程真实注册表（IPC），技能取自渲染层同一份 slash 目录（调用方传入）。
- * 取不到时返回 null（调用方跳过，不阻断发送）。
- * @param entries 当前生效的斜杠目录（内置 + 自定义），与 `resolveSlashInput` 用的是同一份
- */
-async function loadCapabilityContext(entries: readonly SlashEntry[]): Promise<CapabilityContext | null> {
-  const api = window.electronAPI
-  try {
-    const catalog = (await api?.getSubagentCatalog?.()) ?? null
-    return {
-      subagents: (catalog?.builtin ?? []).map((b) => ({ id: b.id, label: b.label, description: b.description })),
-      skills: entries.map((e) => ({ trigger: e.trigger, title: e.title }))
-    }
-  } catch {
-    return null
-  }
-}
-
-/**
- * 组装发送给 Agent 的对话历史：
- * 0) 前置本会话的「失效对象提醒」（M3：删除/改名/覆盖后防止跨轮复述旧描述）；
- * 1) 总长 ≤ 阈值 → 直接原样返回（滑动窗口无需触发）；
- * 2) 超过阈值 → 逐段压缩更早部分（每段上限 8k 字 + 熔断），摘要置于队首，
- *    并用能力声明（B1）重建被压掉的能力感知；单条摘要失败即中断压缩、降级为截断窗口。
- * 被压缩原文异步归档到 store（chat:archive:<convId>）供回看，不回灌模型。
- * @param capability B1 能力声明：压缩生效时追加，避免模型压缩后「失忆」到不再委派/建议技能
- */
-async function buildOutgoingHistory(
-  conv: Conversation,
-  capability: CapabilityContext | null
-): Promise<HistoryMsg[]> {
-  const api = window.electronAPI
-  // M3：本会话失效对象提醒（删除/改名/覆盖）作为轻量 assistant 消息前置，防止跨轮复述旧描述
-  const reminders = await loadConversationReminders(conv.id)
-  const reminderMsgs: HistoryMsg[] = reminders.map((text) => ({ role: 'assistant', content: text }))
-  const all = [...reminderMsgs, ...toHistoryMessages(conv.messages)]
-  if (all.length === 0) return all
-  if (!api?.compressConversation) return all
-  // B3 熔断：同一会话连续压缩失败 ≥3 次则本轮直接走截断窗口，
-  // 不再烧 token 重试（避免无限失败静默消耗），并提示模型上下文被截断。
-  const failKey = `${COMPRESS_FAIL_PREFIX}${conv.id}`
-  let failCount = 0
-  try {
-    failCount = ((await api.getStoreValue<number>(failKey)) ?? 0) as number
-  } catch {
-    // ignore
-  }
-  const total = all.reduce((sum, m) => sum + m.content.length, 0)
-  if (total <= MAX_CONTEXT_CHARS) {
-    // 有余量即重置熔断计数，下次超限可重试压缩
-    if (failCount > 0) void api.setStoreValue(failKey, 0).catch(() => {})
-    return all
-  }
-  if (failCount >= COMPRESS_FAIL_LIMIT) {
-    return truncateToTail(all, KEEP_TAIL_CHARS, true)
-  }
-
-  // 找到「最近 KEEP_TAIL_CHARS」对应的起始索引，之前部分进入压缩。
-  // B1/B2 断点保护：边界只落在 user 消息上，尾窗口不会从半轮（只有 assistant）开始。
-  const start = findChunkStart(all, all.length, KEEP_TAIL_CHARS)
-  if (start === 0) return all // 单条消息就超长：不循环压缩同一条，原样返回
-  const head = all.slice(0, start)
-  const tail = all.slice(start)
-
-  // ── B2 断点保护：分段压缩，每段独立限额 + 独立熔断 ────────────────────────
-  // 原实现把整段 head 一次性丢给 LLM：超长时大概率请求失败/被网关拒绝，退化为
-  // 纯截断（旧信息全丢）。改为从最新往旧逐段压缩，每段上限 COMPRESS_CHUNK_CHARS：
-  // ① 单段失败只丢该段，更旧的不再尝试（避免连环烧 token），已成功段落照常保留；
-  // ② 段间边界只落在 user 消息上，不会把一轮问答拆散（B1/B2 断点保护）。
-  const summaries: string[] = []
-  let cursor = head.length
-  let compressedAny = false
-  let segmentFail = 0
-  while (cursor > 0) {
-    const chunkStart = findChunkStart(head, cursor, COMPRESS_CHUNK_CHARS)
-    const chunk = head.slice(chunkStart, cursor)
-    cursor = chunkStart
-    if (chunk.length === 0) break
-    let res: { ok: boolean; summary?: string; message?: string }
-    try {
-      res = await api.compressConversation(chunk)
-    } catch {
-      res = { ok: false }
-    }
-    if (res.ok && res.summary !== undefined && res.summary.trim() !== '') {
-      summaries.unshift(`【对话片段摘要】\n${res.summary.trim()}`)
-      compressedAny = true
-      segmentFail = 0
-      // 该段原文归档（尽力而为，失败不阻塞主流程）
-      try {
-        const key = `${HISTORY_ARCHIVE_PREFIX}${conv.id}`
-        const prev = (await api.getStoreValue<unknown[]>(key)) ?? []
-        await api.setStoreValue(key, [...prev, { at: new Date().toISOString(), head: chunk }])
-      } catch {
-        // ignore archive error
-      }
-    } else {
-      segmentFail += 1
-      if (segmentFail >= COMPRESS_FAIL_LIMIT) break // B3 段级熔断：连续失败即停止继续压缩旧段
-    }
-  }
-
-  if (compressedAny) {
-    // 压缩成功：重置会话级熔断计数
-    if (failCount > 0) void api.setStoreValue(failKey, 0).catch(() => {})
-    // B1：压缩后重建能力声明——被压掉的历史里可能出现过 /技能 与子代理委派记录，
-    // 模型压缩后容易「失忆」到不再主动委派/建议技能。声明由真实注册表派生（非硬编码）。
-    const head0: HistoryMsg[] = [
-      { role: 'assistant', content: `【更早对话摘要（已压缩）】\n${summaries.join('\n\n')}` }
-    ]
-    if (capability !== null) {
-      head0.push({
-        role: 'assistant',
-        content: `【能力提醒（历史已压缩，此为按当前注册表生成的固定声明）】\n${buildCapabilityDeclaration(capability)}`
-      })
-    }
-    return [...head0, ...tail]
-  }
-  // 全部段压缩失败降级：仅保留最近窗口，并累计失败次数供熔断
-  try {
-    await api.setStoreValue(failKey, failCount + 1)
-  } catch {
-    // ignore
-  }
-  return truncateToTail(all, KEEP_TAIL_CHARS, false)
-}
-
-/**
- * B1/B2 断点保护：从 end 往前取一段「≤ maxChars」的历史，边界只落在 user 消息上，
- * 保证不把一轮问答（user+assistant）拆散——拆散会让摘要丢上下文、让尾窗口从半轮开始。
- * 若 end 之前没有任何 user 边界（整段都属于一轮），则整段返回，不硬切。
- */
-function findChunkStart(all: HistoryMsg[], end: number, maxChars: number): number {
-  let acc = 0
-  let idx = end
-  while (idx > 0) {
-    const len = all[idx - 1].content.length
-    if (acc + len > maxChars) break
-    acc += len
-    idx -= 1
-    if (all[idx].role === 'user') return idx // 落在 user 边界，收束
-  }
-  return idx
-}
-
-/**
- * 截断保留最近 keepChars 字符的尾部历史（B3 降级路径共用）。
- * @param noticeTruncated 为 true 时在队首加一条 assistant 提示，告知模型更早内容被截断。
- */
-function truncateToTail(all: HistoryMsg[], keepChars: number, noticeTruncated: boolean): HistoryMsg[] {
-  const cut: HistoryMsg[] = []
-  let budget = keepChars
-  for (let i = all.length - 1; i >= 0; i--) {
-    if (budget <= 0) break
-    const content = all[i].content
-    if (content.length > budget) {
-      cut.unshift({ ...all[i], content: content.slice(-budget) })
-      break
-    }
-    budget -= content.length
-    cut.unshift(all[i])
-  }
-  if (noticeTruncated) {
-    cut.unshift({
-      role: 'assistant',
-      content: '【注意】更早的对话历史因上下文超限且压缩多次失败而被截断，缺失部分可能影响连续性；如需关键细节请向用户确认。'
-    })
-  }
-  return cut
 }
 
 function makeWelcomeConversation(): Conversation {
@@ -457,7 +208,8 @@ async function persistConversations(list: Conversation[]): Promise<void> {
         role: m.role,
         content: m.content,
         timestamp: m.timestamp.toISOString(),
-        ...(m.trace !== undefined ? { trace: m.trace } : {})
+        ...(m.run !== undefined ? { run: m.run } : {}),
+        ...(m.artifacts !== undefined && m.artifacts.length > 0 ? { artifacts: m.artifacts } : {})
       }))
     }))
     if (window.electronAPI?.setStoreValue) {
@@ -515,7 +267,15 @@ function reviveConversations(raw: unknown): Conversation[] | null {
           role,
           content: typeof m.content === 'string' ? m.content : '',
           timestamp: toDate(m.timestamp),
-          ...(m.trace !== undefined && typeof m.trace === 'object' ? { trace: m.trace as SwarmTreeNodeItem } : {})
+          // 新数据直读 run；旧数据（事件树）转换一次后按 run 处理（只读兼容，见 Message.trace）
+          ...(m.run !== undefined && typeof m.run === 'object'
+            ? { run: m.run as AgentRun }
+            : m.trace !== undefined && typeof m.trace === 'object'
+              ? { run: fromLegacyTrace(m.trace as LegacyTraceNode) }
+              : {}),
+          ...(Array.isArray(m.artifacts) && m.artifacts.length > 0
+            ? { artifacts: m.artifacts as ChatArtifact[] }
+            : {})
         })
       }
     }
@@ -533,8 +293,14 @@ function reviveConversations(raw: unknown): Conversation[] | null {
 export function ChatView({ rightSidebarCollapsed, onToggleRightSidebar, sidebarCollapsed, onToggleSidebar }: ChatViewProps) {
   const [conversations, setConversations] = useState<Conversation[]>(() => [makeWelcomeConversation()])
   const [activeConvId, setActiveConvId] = useState<string>(() => conversations[0]?.id ?? '')
-  const [isStreaming, setIsStreaming] = useState(false)
-  /** Ultra 增强控制器（Supervisor 之上的可选增强层）：开启后本条及后续请求先经增强，成本更高，默认关。 */
+  /**
+   * 正在生成回复的会话 id 集合（多会话并行）。
+   *
+   * 原先是单个全局 isStreaming：同一时刻只能有一个会话在跑。改为按会话登记后，
+   * 可在会话 A 生成时切到会话 B 继续提问，两者互不阻塞；侧栏据此显示运行态。
+   */
+  const [streamingConvIds, setStreamingConvIds] = useState<ReadonlySet<string>>(() => new Set())
+  /** Ultra 增强控制器（Agent 之上的可选增强层）：开启后本条及后续请求先经增强，成本更高，默认关。 */
   const [ultraEnabled, setUltraEnabled] = useState(false)
   /** Ultra 增强策略：auto = Ultra 按任务自动选；其余为用户手动指定。 */
   const [ultraStrategy, setUltraStrategy] = useState<UltraPick>('auto')
@@ -546,11 +312,22 @@ export function ChatView({ rightSidebarCollapsed, onToggleRightSidebar, sidebarC
   const [hydrated, setHydrated] = useState(false)
   const [pendingApproval, setPendingApproval] = useState<PendingApproval | null>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
-  /** 发送纪元：每次发送自增取号。停止即 +1，让旧回复的所有 chunk/事件/看门狗失效；
-   *  新发送再取新号，二者互不干扰，杜绝"停后再发导致旧流复活"。 */
-  const sendEpochRef = useRef(0)
-  /** 发送锁：防止快速双击等场景下并发调用 streamMessage（React setState 异步，isStreaming 守卫不可靠）。 */
-  const sendingRef = useRef(false)
+  /**
+   * 发送纪元（按会话）：每次发送自增取号。停止即 +1，让「该会话」旧回复的所有
+   * chunk/事件/看门狗失效；新发送再取新号，二者互不干扰，杜绝"停后再发导致旧流复活"。
+   * 按会话隔离后，会话 A 的停止不会误伤会话 B 正在进行的回复。
+   */
+  const epochByConvRef = useRef<Map<string, number>>(new Map())
+  /** 取下一条纪元号（该会话）。 */
+  const nextEpoch = useCallback((convId: string): number => {
+    const next = (epochByConvRef.current.get(convId) ?? 0) + 1
+    epochByConvRef.current.set(convId, next)
+    return next
+  }, [])
+  /** 读当前纪元号（该会话）；不存在视为 0。 */
+  const currentEpoch = useCallback((convId: string): number => epochByConvRef.current.get(convId) ?? 0, [])
+  /** 发送锁（按会话）：防止同一会话快速双击并发调用 streamMessage；不同会话互不阻塞。 */
+  const sendingRefs = useRef<Set<string>>(new Set())
 
   // ── 斜杠「技能与指令」：内置注册表 + 自定义技能 / 指令 ──
   const [customSkillEntries, setCustomSkillEntries] = useState<readonly SlashEntry[]>([])
@@ -560,165 +337,72 @@ export function ChatView({ rightSidebarCollapsed, onToggleRightSidebar, sidebarC
     [customSkillEntries, customCommandEntries]
   )
 
-  // ── Agent 执行 trace：事件树挂在生成中的助手消息上（message.trace），历史可回看 ──
-  /** 事件树内行节点序号（同一消息树内保证 key 唯一；每次发送归零）。 */
-  const swarmEventSeq = useRef(0)
+  // ── Agent 执行过程：步骤时间线挂在生成中的助手消息上（message.run），历史可回看 ──
+  /**
+   * 步骤 id 序号按**消息**计数，而不是全局单值。
+   *
+   * 原实现是一个共享的 `runSeq` ref：每次发送把它归零，事件到达时自增取号。多会话并行时
+   * 这会串号 —— 会话 A 生成中，用户切到 B 发送，B 的 `runSeq.current = 0` 把 A 的计数器
+   * 打回原点，A 接下来的步骤 id 与已有步骤重复；`phase:${n}` 这类纯序号 id 冲突后，
+   * `applyRunEvent` 里按 id 定位/收尾的分支会认错行（表现为步骤错并、该收的没收）。
+   *
+   * 改为以「该消息已有步骤数」为基数取自增号：天然按消息隔离，且不依赖调用时机，
+   * 并发多少会话都各算各的。id 只要求**同一次运行内唯一**，此口径已足够。
+   */
+  const nextStepSeq = useRef<Map<string, number>>(new Map())
 
-  type SwarmEvent = {
-    taskId: string
-    title: string
-    status: 'running' | 'done' | 'error'
-    text?: string
-    durationMs?: number
-    kind?: 'phase' | 'task' | 'tool' | 'think' | 'think-token'
-  }
-
-  /** 事件应用：不可变更新该助手消息上挂的事件树（Supervisor 与模块子 Agent 统一）。 */
-  const applyTraceEvent = useCallback((convId: string, messageId: string, event: SwarmEvent): void => {
+  /**
+   * 事件应用：把一条主进程事件并入该助手消息的执行记录。
+   *
+   * 事件语义全部交给 `agentRun.applyRunEvent`（纯函数、有单测）处理 ——
+   * 这里只负责「找到哪条消息」与「产物累加」，**不做任何文案解析**。
+   */
+  const applyTraceEvent = useCallback((convId: string, messageId: string, event: RunEvent): void => {
     setConversations((prev) =>
       prev.map((c) => {
         if (c.id !== convId) return c
         return {
           ...c,
           messages: c.messages.map((m) => {
-            if (m.id !== messageId || m.trace === undefined) return m
-            return { ...m, trace: applyOne(m.trace, event) }
+            if (m.id !== messageId) return m
+            const base = m.run ?? createRun()
+            // 该消息专属的 id 序号：键用 messageId，并发会话互不影响（见 nextStepSeq 说明）。
+            const seqKey = m.id
+            const withRun: Message = {
+              ...m,
+              run: applyRunEvent(base, event, () => {
+                const next = (nextStepSeq.current.get(seqKey) ?? 0) + 1
+                nextStepSeq.current.set(seqKey, next)
+                return next
+              })
+            }
+            if (event.artifacts === undefined || event.artifacts.length === 0) return withRun
+            // 产物按绝对路径去重后累加（同一次回复内多次写入同一文件只展示一次）
+            const existing = new Map((m.artifacts ?? []).map((a) => [a.path, a]))
+            for (const art of event.artifacts) {
+              const path = art.path ?? ''
+              if (path === '') continue
+              existing.set(path, {
+                path,
+                name: art.name ?? path.split('/').pop() ?? path,
+                ext: art.ext ?? '',
+                ...(art.sizeBytes !== undefined ? { sizeBytes: art.sizeBytes } : {})
+              })
+            }
+            return { ...withRun, artifacts: [...existing.values()] }
           })
         }
       })
     )
   }, [])
 
-  /** 单个事件对一棵事件树的不可变应用（纯树更新，key 生成引用外部序号）。 */
-  function applyOne(run: SwarmTreeNodeItem, event: SwarmEvent): SwarmTreeNodeItem {
-    const piece = event.text ?? ''
-    const isPhase =
-      event.kind === 'phase' || event.taskId === 'scheduler' || event.taskId === 'aggregate'
-    const index = run.children.findIndex((item) => item.node.key === event.taskId)
-
-    // 1) 思考逐字 token → 追加到该任务下最后一条运行中思考（文本保留可展开全文）
-    if (event.kind === 'think-token') {
-      if (piece === '' || index === -1) return run
-      return {
-        ...run,
-        children: run.children.map((item, i) => {
-          if (i !== index) return item
-          const last = item.children[item.children.length - 1]
-          if (last !== undefined && last.node.kind === 'think' && last.node.status === 'running') {
-            return {
-              ...item,
-              children: [
-                ...item.children.slice(0, -1),
-                { ...last, node: { ...last.node, text: (last.node.text ?? '') + piece } }
-              ]
-            }
-          }
-          swarmEventSeq.current += 1
-          return {
-            ...item,
-            children: [
-              ...item.children,
-              {
-                node: {
-                  key: `${event.taskId}:think:${swarmEventSeq.current}`,
-                  kind: 'think',
-                  title: '思考',
-                  status: 'running',
-                  text: piece
-                },
-                children: []
-              }
-            ]
-          }
-        })
-      }
-    }
-
-    // 2) 工具行（调用/返回/出错）→ 追加到该任务下；容器缺失（普通模式"主 Agent"）先补建
-    if (event.kind === 'tool') {
-      const container: SwarmTreeNodeItem = {
-        node: {
-          key: event.taskId,
-          kind: isPhase ? 'phase' : 'task',
-          title: event.title || 'Agent'
-        },
-        children: []
-      }
-      const baseChildren = index === -1 ? [...run.children, container] : run.children
-      const targetIndex = index === -1 ? baseChildren.length - 1 : index
-      const toolTitle = piece.startsWith('调用')
-        ? '工具调用'
-        : piece.includes('返回') || piece.includes('出错')
-          ? '工具返回'
-          : '工具'
-      swarmEventSeq.current += 1
-      return {
-        ...run,
-        children: baseChildren.map((item, i) => {
-          if (i !== targetIndex) return item
-          return {
-            ...item,
-            children: [
-              ...item.children,
-              {
-                node: {
-                  key: `${event.taskId}:e:${swarmEventSeq.current}`,
-                  kind: 'tool',
-                  title: toolTitle,
-                  status: piece.includes('出错') ? 'error' : undefined,
-                  text: piece,
-                  durationMs: event.durationMs
-                },
-                children: []
-              }
-            ]
-          }
-        })
-      }
-    }
-
-    // 3) 阶段 / 任务事件 → 根下节点 upsert（收尾时把最后一条思考置为完成态）
-    const base: SwarmTreeNodeItem =
-      index >= 0
-        ? run.children[index]
-        : {
-            node: {
-              key: event.taskId,
-              kind: isPhase ? 'phase' : 'task',
-              title: event.title
-            },
-            children: []
-          }
-    let node: SwarmTreeNodeItem = {
-      ...base,
-      node: { ...base.node, title: event.title, status: event.status, text: piece || base.node.text }
-    }
-
-    // 任务收尾：把最后一条思考置为完成态（文本保留可展开）
-    if (
-      node.node.kind === 'task' &&
-      (event.status === 'done' || event.status === 'error') &&
-      node.children.length > 0
-    ) {
-      const tail = node.children[node.children.length - 1]
-      if (tail.node.kind === 'think' && tail.node.status === 'running') {
-        node = {
-          ...node,
-          children: [...node.children.slice(0, -1), { ...tail, node: { ...tail.node, status: 'done' } }]
-        }
-      }
-    }
-
-    const children =
-      index >= 0 ? run.children.map((item, i) => (i === index ? node : item)) : [...run.children, node]
-    return { ...run, children }
-  }
-
   const activeConv = conversations.find((c) => c.id === activeConvId) || conversations[0]
   /** 活跃会话镜像（ref）：handleSend 内读最新消息构建历史，避免 useCallback 闭包过期。 */
   const activeConvRef = useRef<Conversation>(activeConv)
   activeConvRef.current = activeConv
   const displayMessages = activeConv.messages.filter((m) => m.role !== 'system')
+  /** 当前活跃会话是否正在生成（输入区禁用 / 停止按钮据此显示；其它会话的后台任务不阻塞本会话输入）。 */
+  const isStreaming = streamingConvIds.has(activeConv.id)
 
   // 启动时从 store 恢复会话历史（并恢复到切走前激活的对话）
   useEffect(() => {
@@ -822,9 +506,11 @@ export function ChatView({ rightSidebarCollapsed, onToggleRightSidebar, sidebarC
   }, [pendingApproval])
 
   const respondApproval = useCallback(
-    (allow: boolean) => {
+    (allow: boolean, remember = false) => {
       if (pendingApproval === null) return
-      window.electronAPI?.approvalRespond?.(pendingApproval.id, allow)
+      // remember=true → 主进程把这次放行升级为「这一类允许」（如记住该目录），
+      // 目的是压低批准卡频次：只给「允许一次」会把人训练成无脑点是。
+      window.electronAPI?.approvalRespond?.(pendingApproval.id, allow, remember)
       setPendingApproval(null)
     },
     [pendingApproval],
@@ -841,40 +527,51 @@ export function ChatView({ rightSidebarCollapsed, onToggleRightSidebar, sidebarC
     return () => document.removeEventListener('mousedown', handleClickOutside)
   }, [])
 
-  /** 把树中所有运行中的节点置为「已取消」（用户主动停止时调用）。 */
-  const cancelRunningNodes = (tree: SwarmTreeNodeItem): SwarmTreeNodeItem => ({
-    ...tree,
-    node: tree.node.status === 'running' ? { ...tree.node, status: 'canceled' } : tree.node,
-    children: tree.children.map(cancelRunningNodes)
-  })
+  /** 标记某会话进入 / 退出生成态（驱动侧栏运行标记与输入区禁用）。 */
+  const setConvStreaming = useCallback((convId: string, running: boolean): void => {
+    setStreamingConvIds((prev) => {
+      const next = new Set(prev)
+      if (running) next.add(convId)
+      else next.delete(convId)
+      return next
+    })
+  }, [])
 
   /**
-   * 停止当前生成：立即本地收尾（UI 即刻可交互），并通知主进程 abort。
-   * 后续到达的文本/事件 chunk 会被 stoppedReplyRef 丢弃，不会出现"停后又冒出内容"。
+   * 停止指定会话的生成（缺省为当前活跃会话）：立即本地收尾（UI 即刻可交互），并通知主进程 abort 该会话。
+   * 多会话并行下，停止只影响目标会话，其它会话的后台任务继续。
    */
-  const handleStop = useCallback(() => {
-    // 纪元 +1：本回复后续所有 chunk / 事件 / 看门狗回调全部失效
-    sendEpochRef.current += 1
-    setIsStreaming(false)
-    // 立即释放发送锁：旧流被 abort 后 finally 因纪元不匹配不会重置，这里主动释放避免卡死
-    sendingRef.current = false
-    void window.electronAPI?.stopMessage?.()
-    // 遍历所有会话，终止任何正在流式生成的消息（用户可能在流式过程中切走了会话）
-    setConversations((prev) =>
-      prev.map((c) => ({
-        ...c,
-        messages: c.messages.map((m) =>
-          m.isStreaming === true
-            ? {
-                ...m,
-                isStreaming: false,
-                trace: m.trace !== undefined ? cancelRunningNodes(m.trace) : m.trace
+  const handleStop = useCallback(
+    (convId: string = activeConvId) => {
+      // 纪元 +1：该会话本回复后续所有 chunk / 事件 / 看门狗回调全部失效
+      nextEpoch(convId)
+      setConvStreaming(convId, false)
+      // 立即释放发送锁：旧流被 abort 后 finally 因纪元不匹配不会重置，这里主动释放避免卡死
+      sendingRefs.current.delete(convId)
+      void window.electronAPI?.stopMessage?.(convId)
+      // 终止该会话内任何正在流式生成的消息
+      setConversations((prev) =>
+        prev.map((c) =>
+          c.id !== convId
+            ? c
+            : {
+                ...c,
+                messages: c.messages.map((m) => {
+                  if (m.isStreaming !== true) return m
+                  // 该消息已定稿，回收其步骤序号（与正常收尾一致的清理）
+                  nextStepSeq.current.delete(m.id)
+                  return {
+                    ...m,
+                    isStreaming: false,
+                    run: m.run !== undefined ? cancelRun(m.run) : m.run
+                  }
+                })
               }
-            : m
         )
-      }))
-    )
-  }, [])
+      )
+    },
+    [activeConvId, setConvStreaming]
+  )
 
   const scrollToBottom = useCallback(() => {
     if (scrollRef.current) {
@@ -885,9 +582,20 @@ export function ChatView({ rightSidebarCollapsed, onToggleRightSidebar, sidebarC
     }
   }, [])
 
+  /** 视口是否已贴着底部（用户没往上翻）。 */
+  const isNearBottom = useCallback((): boolean => {
+    const viewport = scrollRef.current?.querySelector('[data-radix-scroll-area-viewport]')
+    if (viewport === null || viewport === undefined) return true
+    return viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight < 80
+  }, [])
+
+  /**
+   * 流式期间自动跟随，但**不抢用户的手**：只有当视口本来就在底部时才跟随滚动。
+   * 否则用户往上翻去看前面的内容时，每个 token 都会被强行拽回底部（历史行为）。
+   */
   useEffect(() => {
-    scrollToBottom()
-  }, [displayMessages, scrollToBottom])
+    if (isNearBottom()) scrollToBottom()
+  }, [displayMessages, scrollToBottom, isNearBottom])
 
   const updateMessage = useCallback((convId: string, messageId: string, updater: (m: Message) => Message) => {
     setConversations((prev) =>
@@ -902,18 +610,20 @@ export function ChatView({ rightSidebarCollapsed, onToggleRightSidebar, sidebarC
   const handleSend = useCallback(
     async (content: string, attachments?: Attachment[]) => {
       const trimmed = content.trim()
-      if (!trimmed || isStreaming) return
-      if (sendingRef.current) return // 并发发送守卫：防止快速双击等场景下同时发起两次流式请求
-      sendingRef.current = true
-
-      // 最早捕获目标会话 id，防止后续 await（如历史压缩）期间用户切会话导致消息落到错误会话
+      // 目标会话：最早捕获，防止后续 await（如历史压缩）期间用户切会话导致消息落到错误会话
       const convId = activeConvId
+      if (!trimmed) return
+      // 同一会话已在生成则忽略（不同会话可并行）
+      if (sendingRefs.current.has(convId)) return
+      sendingRefs.current.add(convId)
 
       // 斜杠「技能与指令」解析（统一在最前面做）
       const slashMatch = resolveSlashInput(trimmed, slashEntries)
 
       // 客户端特殊指令：由 clientAction 标记决定前端行为
       if (slashMatch?.entry.clientAction === 'clear') {
+        // 清空治理状态（失效提醒 + 压缩熔断计数）：归档保留，供用户回看
+        void window.electronAPI?.resetConversationContext?.(convId)
         const fresh = makeWelcomeConversation()
         setConversations((prev) =>
           prev.map((c) =>
@@ -922,7 +632,7 @@ export function ChatView({ rightSidebarCollapsed, onToggleRightSidebar, sidebarC
               : c
           )
         )
-        sendingRef.current = false
+        sendingRefs.current.delete(convId)
         return
       }
 
@@ -965,24 +675,24 @@ export function ChatView({ rightSidebarCollapsed, onToggleRightSidebar, sidebarC
               : c
           )
         )
-        sendingRef.current = false
+        sendingRefs.current.delete(convId)
         return
       }
 
-      // 取本次回复的纪元号（同一时刻只允许一路流式）
-      const sendId = ++sendEpochRef.current
+      // 取本次回复的纪元号（按会话：多会话并行时各会话的纪元互不干扰）
+      const sendId = nextEpoch(convId)
 
       // 指令/技能需要参数但用户没给
       if (slashMatch !== null && slashMatch.entry.requiresArg && slashMatch.args === '') {
         window.alert(`「/${slashMatch.entry.trigger}」需要参数。\n用法：${slashMatch.entry.usage}`)
-        sendingRef.current = false
+        sendingRefs.current.delete(convId)
         return
       }
 
-      // 上下文治理（M2）：滑动窗口历史 + 超限时对最旧部分摘要压缩（大会话才触发 LLM 压缩）；
-      // B1：能力声明由真实注册表派生（子代理目录 + 技能目录），压缩生效时随摘要注入
-      const capabilityCtx = await loadCapabilityContext(slashEntries)
-      const outgoingHistory = await buildOutgoingHistory(activeConvRef.current, capabilityCtx)
+      // 上下文治理（主进程侧）：这里只交「本会话正文历史 + 技能目录」，不在这里做任何治理。
+      // 滑动窗口、分段摘要压缩、熔断降级、失效对象提醒、压缩后能力声明重建由主进程完成。
+      const outgoingHistory = toHistoryMessages(activeConvRef.current.messages)
+      const skillRefs = slashEntries.map((e) => ({ trigger: e.trigger, title: e.title }))
 
       // Build full message with attachments
       let fullMessage = slashMatch === null ? trimmed : slashMatch.expanded
@@ -1004,7 +714,7 @@ export function ChatView({ rightSidebarCollapsed, onToggleRightSidebar, sidebarC
         content: trimmed + (attachments && attachments.length > 0 ? `\n\n📎 ${attachments.length}个附件` : ''),
         timestamp: new Date()
       }
-      // 每条助手回复都预先挂一棵空事件树：Supervisor / 模块子 Agent 的事件都长在这棵树上，
+      // 每条助手回复都预先挂一份空的执行记录：Agent 及其工具调用的事件都并入它，
       // 完成后内嵌在气泡里展示并随会话持久化（历史消息仍可点开复盘）。
       const assistantMessage: Message = {
         id: `assistant-${Date.now()}`,
@@ -1012,14 +722,7 @@ export function ChatView({ rightSidebarCollapsed, onToggleRightSidebar, sidebarC
         content: '',
         timestamp: new Date(),
         isStreaming: true,
-        trace: {
-          node: {
-            key: `trace:run:${Date.now()}`,
-            kind: 'run',
-            title: 'Agent 执行过程'
-          },
-          children: []
-        }
+        run: createRun()
       }
 
       setConversations((prev) =>
@@ -1034,64 +737,48 @@ export function ChatView({ rightSidebarCollapsed, onToggleRightSidebar, sidebarC
         )
       )
 
-      // 一次新回复：重置行节点序号（执行树在 assistantMessage.trace 上逐条生长）
-      swarmEventSeq.current = 0
+      // 新回复的步骤序号无需手工归零：序号按消息 id 计数（见 nextStepSeq），
+      // 新消息自然从 0 起算，且不会影响其它并行会话的计数。
 
-      setIsStreaming(true)
+      setConvStreaming(convId, true)
 
-      // 看门狗：滚动超时——收到正文 token 或 Agent 过程事件即重置计时，只有连续 stallMs
-      // 无任何产出才中止。此前为固定 120s 一次性定时：长回复/工具往返一超时即被误杀
-      // （表现为主进程"回复被中止，已收到 N 字符"，正文正常流却被腰斩）。
-      // Supervisor 一次回复要经历 委派→模块子 Agent（可能限流自动退避重试）→汇总，放宽到 120s；
-      // Ultra 增强还要先跑策略子图（合议/批判迭代），正文迟迟未开始，再放宽到 360s。
-      const stallMs = ultraEnabled ? 360_000 : 120_000
-      const stallMsg = ultraEnabled
-        ? '错误: Ultra 增强在 6 分钟内未开始产出正文（增强子图可能较慢或失败）。可能原因：① 接口配额/网络不稳定，策略子图或模块 Agent 委派触发限流/超时；② 模型接口兼容问题。建议：先在「设置 → 模型管理」测试连接，等 1 分钟后再试，或临时关闭 Ultra / 换用「普通增强」。'
-        : '错误: Supervisor 在 2 分钟内未开始回复。可能原因：① 接口配额/网络不稳定，模块子 Agent 委派触发了限流或超时；② 模型接口兼容问题。建议：先在「设置 → 模型管理」测试连接，等 1 分钟后再试。'
-      let stallTimer: number | undefined
-      const stallFire = (): void => {
-        // 已被停止/已开启新一轮回复：本次回复不再处理
-        if (sendEpochRef.current !== sendId) return
-        updateMessage(convId, assistantMessage.id, (m) => {
-          if (m.content !== '') return m
-          return {
-            ...m,
-            content: stallMsg,
-          }
-        })
-        // 超时中止同样把执行树里运行中的节点标为已取消
-        setConversations((prev) =>
-          prev.map((c) =>
-            c.id === convId
-              ? {
-                  ...c,
-                  messages: c.messages.map((m) =>
-                    m.id === assistantMessage.id && m.trace !== undefined
-                      ? { ...m, trace: cancelRunningNodes(m.trace) }
-                      : m
-                  )
-                }
-              : c
-          )
+      // 说明：**不做任何超时中止**。此前有一层「滚动看门狗」（连续 120s/360s 无正文或
+      // 过程事件即判定卡死并中止整条回复），实践证伪：Agent 一轮回复包含多轮工具调用，
+      // 其中论文下载、arXiv 限流退避（5s/15s 重试）、大文件写入等都会长时间**无事件产出**，
+      // 这是正常长任务而非卡死，却被看门狗腰斩（现象：「跑着跑着就不动了，然后就中止了」）。
+      // 且主进程工具的 HTTP 超时、审批超时本就各有兜底，渲染层再加一层只会误杀。
+      // 现在唯一的终止路径是**用户手动点停止**（handleStop 会 abort 该会话并释放锁）。
+
+      // 流式正文缓冲 + 合并刷新（节流到 ~40ms）。声明在 try 之外：finally 要做最后一次刷尾。
+      //
+      // 为什么必须节流：模型每个 token 都经 IPC 单独送达（见 ipc/index.ts 的 chunk 通道），
+      // 而这里每收一个 token 都做一次 updateMessage（= 全量会话状态拷贝 + 整列表重渲染 +
+      // 强制滚动）。一旦渲染速度低于 token 到达速度，渲染进程的事件队列就**无界增长** ——
+      // 独立通道送来的批准请求会排在队尾，表现就是「界面说要弹批准卡，却等好久好久才弹」。
+      const STREAM_FLUSH_MS = 40
+      let fullContent = ''
+      let flushTimer: number | undefined
+      const flushContent = (): void => {
+        window.clearTimeout(flushTimer)
+        flushTimer = undefined
+        if (fullContent === '') return
+        updateMessage(convId, assistantMessage.id, (m) =>
+          m.content === fullContent ? m : { ...m, content: fullContent }
         )
-        void window.electronAPI?.stopMessage?.()
       }
-      /** 重新武装看门狗：正文 token 或 Agent 过程事件到达都视为"有进展"，重置计时。 */
-      const armStall = (): void => {
-        window.clearTimeout(stallTimer)
-        stallTimer = window.setTimeout(stallFire, stallMs)
+      const scheduleFlush = (): void => {
+        if (flushTimer !== undefined) return
+        flushTimer = window.setTimeout(flushContent, STREAM_FLUSH_MS)
       }
-      armStall()
 
       try {
         if (window.electronAPI) {
-          let fullContent = ''
           await window.electronAPI.streamMessage(
             fullMessage,
             convId,
             (chunk: string) => {
               // 已被停止/已开启新一轮回复：丢弃本回复剩余所有文本/事件 chunk
-              if (sendEpochRef.current !== sendId) return
+              if (currentEpoch(convId) !== sendId) return
               // Agent 过程事件经同一 chunk 通道送达（前缀信封）：拆包应用到该回复消息的事件树，不进入正文。
               if (chunk.startsWith(AGENT_EVENT_PREFIX)) {
                 try {
@@ -1099,20 +786,24 @@ export function ChatView({ rightSidebarCollapsed, onToggleRightSidebar, sidebarC
                     chunk.slice(AGENT_EVENT_PREFIX.length)
                   ) as Parameters<typeof applyTraceEvent>[2]
                   applyTraceEvent(convId, assistantMessage.id, event)
-                  // M3：破坏性工具完成时记录「失效提醒」，供后续轮次过滤旧描述
-                  const reminder = reminderTextFromEvent(event)
-                  if (reminder !== null) void addConversationReminder(convId, reminder)
-                  // Agent 侧有活动（工具执行/阶段推进）也算进展，重置看门狗
-                  armStall()
+                  // 注：破坏性工具完成时的「失效提醒」已在主进程观测并登记（contextManager），
+                  // 渲染层不再重复处理。
                 } catch {
                   // 忽略无法解析的行程
                 }
                 return
               }
               fullContent += chunk
-              // 收到正文 token：有进展，重置看门狗
-              armStall()
-              updateMessage(convId, assistantMessage.id, (m) => ({ ...m, content: fullContent }))
+              // 正文开始流出 = 本轮「思考结束」的一手信号：把运行中的思考步骤收尾，
+              // 否则最后一段思考会永远转圈（applyRunEvent 只在 tool/阶段事件时关闭 think 行，
+              // 而最终回复前往往没有新工具调用）。纯文本 chunk 无 kind、不碰 run，需显式派发。
+              applyTraceEvent(convId, assistantMessage.id, {
+                taskId: 'content-start',
+                title: 'Mimir',
+                status: 'running'
+              })
+              // 正文渲染改为合并刷新（见上方注释），不再每 token 触发一次全量状态更新
+              scheduleFlush()
             },
             undefined,
             {
@@ -1120,7 +811,7 @@ export function ChatView({ rightSidebarCollapsed, onToggleRightSidebar, sidebarC
               ultra: ultraEnabled ? { enabled: true, strategy: ultraStrategy } : undefined,
               // 手动 / 技能直通：跳过 Agent 自动技能路由（正文已注入）
               manual: slashMatch !== null,
-              ...(outgoingHistory.length > 0 ? { history: outgoingHistory } : {})
+              ...(outgoingHistory.length > 0 ? { history: outgoingHistory, skills: skillRefs } : {})
             }
           )
         } else {
@@ -1146,7 +837,7 @@ export function ChatView({ rightSidebarCollapsed, onToggleRightSidebar, sidebarC
           }
 
           const systemPrompt =
-            '你是 Mimir，一个以 Supervisor 编排架构工作的科研 Agent：复杂任务先拆解规划，需要工具或专业知识时委派给模块子 Agent，汇总后给出最终回答。使用中文回复，保持专业且友好的语气。'
+            '你是 Mimir，一个直接持有全部科研工具的科研 Agent：复杂任务先拆解规划，自己按需调用文献检索、论文编译、实验管理、组会 PPT、GPU 服务器等工具，汇总后给出最终回答。使用中文回复，保持专业且友好的语气。'
           const baseUrl = (selected.baseUrl as string) || 'https://api.deepseek.com/v1'
           const apiUrl = baseUrl.replace(/\/+$/, '') + '/chat/completions'
 
@@ -1183,23 +874,36 @@ export function ChatView({ rightSidebarCollapsed, onToggleRightSidebar, sidebarC
           content: `错误: ${error instanceof Error ? error.message : '未知错误'}`
         }))
       } finally {
-        window.clearTimeout(stallTimer)
+        // 刷尾：把节流窗口内最后一段正文落定，再标记流式结束（否则末尾几十 ms 会被丢掉）
+        flushContent()
+        // 本条消息已定稿，回收它的步骤序号（否则 nextStepSeq 会随会话增长长期留存）。
+        nextStepSeq.current.delete(assistantMessage.id)
         // 标记本条助手消息流式结束（无论纪元是否已过期都需执行，确保单条消息状态正确）
         updateMessage(convId, assistantMessage.id, (m) => ({ ...m, isStreaming: false }))
-        // 仅当本流仍是当前纪元时才重置全局流状态——若用户已停止并发起新流，不得覆盖新流的状态
-        if (sendEpochRef.current === sendId) {
-          setIsStreaming(false)
-          sendingRef.current = false
+        // 仅当本流仍是该会话当前纪元时才重置流状态——若用户已停止并发起新流，不得覆盖新流的状态
+        if (currentEpoch(convId) === sendId) {
+          setConvStreaming(convId, false)
+          sendingRefs.current.delete(convId)
         }
       }
     },
-    [isStreaming, activeConvId, updateMessage, slashEntries, applyTraceEvent, ultraEnabled, ultraStrategy]
+    [
+      activeConvId,
+      updateMessage,
+      slashEntries,
+      applyTraceEvent,
+      ultraEnabled,
+      ultraStrategy,
+      nextEpoch,
+      currentEpoch,
+      setConvStreaming
+    ]
   )
 
   /** 重试：移除该条失败的助手消息，重新发送其前一条用户消息。 */
   const retryMessage = useCallback(
     (assistantId: string) => {
-      if (isStreaming) return
+      if (activeConvId === '' || isStreaming) return
       const conv = conversations.find((c) => c.id === activeConvId)
       if (conv === undefined) return
       const index = conv.messages.findIndex((m) => m.id === assistantId)
@@ -1243,12 +947,10 @@ export function ChatView({ rightSidebarCollapsed, onToggleRightSidebar, sidebarC
 
   const handleDeleteConv = useCallback(
     (id: string) => {
-      // 异步清理该会话的归档历史与失效提醒键（跨空间串键 + 敏感内容残留）
-      const api = window.electronAPI
-      if (api?.setStoreValue) {
-        void api.setStoreValue(`${HISTORY_ARCHIVE_PREFIX}${id}`, [] as unknown[]).catch(() => {})
-        void api.setStoreValue(`${REMINDER_STORE_PREFIX}${id}`, [] as string[]).catch(() => {})
-      }
+      // 清理该会话在主进程侧的治理数据（失效提醒 + 熔断计数 + 归档原文）。
+      // 走主进程 API 而不是直接写 store 键：治理数据的键名与结构由 contextManager 拥有，
+      // 渲染层不应重复实现（避免两条读写路径不一致）。
+      void window.electronAPI?.resetConversationContext?.(id, true)
       setConversations((prev) => {
         const filtered = prev.filter((c) => c.id !== id)
         if (filtered.length === 0) {
@@ -1323,7 +1025,7 @@ export function ChatView({ rightSidebarCollapsed, onToggleRightSidebar, sidebarC
                   value={renameValue}
                   onChange={(e) => setRenameValue(e.target.value)}
                   onKeyDown={(e) => {
-                    if (e.key === 'Enter') handleConfirmRename()
+                    if (isSubmitEnter(e)) handleConfirmRename()
                     if (e.key === 'Escape') setRenamingId(null)
                   }}
                   className="h-6 text-[11px] px-1.5"
@@ -1339,6 +1041,10 @@ export function ChatView({ rightSidebarCollapsed, onToggleRightSidebar, sidebarC
             ) : (
               <>
                 <span className="flex-1 truncate text-[11px]">{conv.title}</span>
+                {/* 后台任务标记：该会话正在生成回复（即使当前未打开，也能看到它在跑） */}
+                {streamingConvIds.has(conv.id) && (
+                  <Loader2 className="h-3 w-3 shrink-0 animate-spin text-primary" aria-label="生成中" />
+                )}
                 <button
                   onClick={(e) => {
                     e.stopPropagation()
@@ -1466,7 +1172,7 @@ export function ChatView({ rightSidebarCollapsed, onToggleRightSidebar, sidebarC
               title={
                 ultraEnabled
                   ? 'Ultra 增强已开启（策略：' + ULTRA_LABEL[ultraStrategy] + '）。点击关闭增强。'
-                  : 'Ultra：Supervisor 之上的增强层——长程规划 + 增强策略调度（多专家合议只是可选项之一）。开启成本更高。'
+                  : 'Ultra：Agent 之上的增强层——长程规划 + 增强策略调度（多专家合议只是可选项之一）。开启成本更高。'
               }
             >
               <Sparkles className={cn('h-3.5 w-3.5', ultraEnabled && 'animate-pulse')} />
@@ -1495,6 +1201,8 @@ export function ChatView({ rightSidebarCollapsed, onToggleRightSidebar, sidebarC
                       ? () => retryMessage(message.id)
                       : undefined
                   }
+                  // 待批准的工具名 → 时间线上对应步骤标「等待批准」（批准入口仍在输入区上方）
+                  {...(pendingApproval !== null ? { pendingApprovalTool: pendingApproval.tool } : {})}
                 />
               </div>
             ))}
@@ -1513,9 +1221,9 @@ export function ChatView({ rightSidebarCollapsed, onToggleRightSidebar, sidebarC
                   {pendingApproval.source?.origin === 'subagent' && (
                     <span
                       className="rounded bg-sky-500/15 px-1.5 py-px text-[9px] font-medium text-sky-700"
-                      title={pendingApproval.source.subagentId !== undefined ? `子代理 id：${pendingApproval.source.subagentId}` : undefined}
+                      title={pendingApproval.source.subagentId !== undefined ? `能力域 id：${pendingApproval.source.subagentId}` : undefined}
                     >
-                      来自子代理：{pendingApproval.source.subagentLabel ?? pendingApproval.source.subagentId ?? '未命名'}
+                      来自能力域：{pendingApproval.source.subagentLabel ?? pendingApproval.source.subagentId ?? '未命名'}
                     </span>
                   )}
                 </div>
@@ -1544,13 +1252,33 @@ export function ChatView({ rightSidebarCollapsed, onToggleRightSidebar, sidebarC
                   onClick={() => respondApproval(true)}
                 >
                   <Check className="h-3.5 w-3.5 mr-1" />
-                  允许
+                  允许一次
                 </Button>
+                {pendingApproval.rememberable === true && (
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    className="h-7 text-[11px] border-amber-500/40 text-amber-700 hover:bg-amber-500/10 dark:text-amber-300"
+                    title="把这次放行升级为「这个目录以后免问」（可在「设置 → 权限与安全」撤销）"
+                    onClick={() => respondApproval(true, true)}
+                  >
+                    允许并记住此目录
+                  </Button>
+                )}
               </div>
             </div>
           </div>
         )}
-        <ChatInput onSend={handleSend} onStop={handleStop} entries={slashEntries} disabled={isStreaming} isStreaming={isStreaming} ultraEnabled={ultraEnabled} ultraStrategyLabel={ULTRA_LABEL[ultraStrategy]} />
+        <ChatInput
+          onSend={handleSend}
+          onStop={() => handleStop(activeConv.id)}
+          entries={slashEntries}
+          disabled={isStreaming}
+          isStreaming={isStreaming}
+          ultraEnabled={ultraEnabled}
+          ultraStrategyLabel={ULTRA_LABEL[ultraStrategy]}
+        />
       </div>
 
       {/* Right Sidebar - Conversation list */}

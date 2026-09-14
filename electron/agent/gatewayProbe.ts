@@ -40,6 +40,28 @@ export interface GatewayCapabilities {
 /** `withStructuredOutput` 支持的 method（与 LangChain 对齐）。 */
 export type StructuredOutputMethod = 'jsonSchema' | 'jsonMode' | 'functionCalling'
 
+/**
+ * 选择结构化输出通道——**必须避开思考模式与 `tool_choice` 的冲突**。
+ *
+ * 真实踩坑：DeepSeek 思考模式（`thinking:{type:'enabled'}`）**明确拒绝 `tool_choice`**，
+ * 无论取值是 `"auto"` / `"required"` / 具名函数，一律返回：
+ *   400 "Thinking mode does not support this tool_choice"
+ * 而 LangChain 的 `withStructuredOutput(schema, { method: 'functionCalling' })` 恰恰会在
+ * 请求里注入 `tool_choice: {type:'function', function:{name}}`（强制模型调用该 schema 函数）。
+ * 结果：一开思考模式，技能路由 / 合议 / 能力域生成等所有结构化调用全部 400。
+ * （已确认为上游限制：non-thinking 模式下才支持 tool_choice。）
+ *
+ * 解法：通道按「是否开启思考」二选一——
+ * - 思考开启 → `jsonMode`（DeepSeek 支持 JSON Output；**不发 `tool_choice`**，只靠提示词约束 JSON）；
+ * - 思考关闭 → `functionCalling`（兼容性最好，见 {@link pickStructuredOutputMethod} 的结论）。
+ *
+ * 前提：`jsonMode` 要求提示词中出现 “json” 字样并给出字段说明；各调用点的 system 提示
+ * 均已显式要求「只输出 JSON」并逐字段说明，满足该约束。
+ */
+export function pickStructuredMethod(reasoningOn: boolean): StructuredOutputMethod {
+  return reasoningOn ? 'jsonMode' : 'functionCalling'
+}
+
 export interface ProbeOptions {
   baseUrl: string
   apiKey: string

@@ -3,6 +3,7 @@ import { Bell, BellPlus, BellRing, Loader2, Trash2, Check, X, RefreshCw, Externa
 import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
 import { cn } from '@/lib/utils'
+import { isSubmitEnter } from '@/lib/keyboard'
 import type { ArxivSubscriptionView, SubscriptionCheckOutcome } from './types'
 import { formatDate } from './types'
 
@@ -98,7 +99,7 @@ export function SubscriptionsBar({
                 value={newQuery}
                 onChange={(e) => setNewQuery(e.target.value)}
                 onKeyDown={(e) => {
-                  if (e.key === 'Enter') submitAdd()
+                  if (isSubmitEnter(e)) submitAdd()
                   if (e.key === 'Escape') setAdding(false)
                 }}
                 placeholder="订阅关键词，如 large language models"

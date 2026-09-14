@@ -9,7 +9,7 @@ import { existsSync } from 'fs'
 import { compileLatex } from '../../latex'
 import { pickEngineExecutable } from '../../latex/runtime'
 import { registerLatexPdfDir } from '../../latex'
-import { requireUserApproval } from '../approval'
+import { requireBusinessApproval } from '../approval'
 
 const LATEX_COMPILE_TIMEOUT_MS = 120_000
 
@@ -22,7 +22,7 @@ export const latexCompileTool = tool(
       if (!existsSync(projectDir)) return `编译失败：目录不存在：${projectDir}`
 
       // 副作用确认：真实编译（可长耗时、会生成产物）需用户放行
-      const allowed = await requireUserApproval({
+      const allowed = await requireBusinessApproval({
         tool: 'latex_compile',
         summary: `编译 LaTeX 项目 ${projectDir.trim()}`,
         detail: '将调用本机 latexmk/Tectonic 编译 main.tex（最长 120 秒），产物 PDF 会同步到「论文」模块预览。不修改你的源文件。',

@@ -126,7 +126,7 @@ export const BUILTIN_SKILLS: SkillMetaRecord[] = [
     category: 'literature',
     tags: ['literature', 'review', 'survey', 'search'],
     applicableBoundary: '系统性梳理某方向文献并入库、逐篇写解读。',
-    notSuitable: '只查一两篇是否存在（用 arxiv_search），或查新判定新颖性（novelty-check）。',
+    notSuitable: '只查一两篇是否存在（用 paper_search），或查新判定新颖性（novelty-check）。',
     positiveExamples: ['帮我系统综述一下“视频生成模型一致性”这个方向', '调研近三年 RLHF 的数据偏好建模工作'],
     negativeExamples: ['查一下 2301.12345 是什么', '判断我这个 idea 有没有人做过'],
     costLevel: 'high',

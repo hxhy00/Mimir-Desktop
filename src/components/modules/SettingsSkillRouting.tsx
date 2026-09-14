@@ -1,16 +1,19 @@
 import { useEffect, useState } from 'react'
 import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
 import { Workflow, Save, Check } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
 /**
  * Skill 分层路由开关（设置 → 技能路由）。
- * skillRouting：每轮是否自动「召回+精排 → top-K 候选」注入 Supervisor（默认开）。
- * skillRerank：候选超过阈值时是否叠加 LLM 精排（默认开；关闭则用规则排序）。
+ * skillRouting：每轮是否自动「召回+精排 → top-K 候选」注入 Agent（默认开）。
+ * skillRerank：候选超过阈值时是否叠加向量精排（默认开；关闭则用规则排序）。
+ * embeddingModel：向量精排用的 embedding 模型名；复用当前 chat 模型的 baseUrl / apiKey。
  */
 export function SettingsSkillRoutingCard() {
   const [routing, setRouting] = useState(true)
   const [rerank, setRerank] = useState(true)
+  const [embeddingModel, setEmbeddingModel] = useState('')
   const [saving, setSaving] = useState(false)
   const [msg, setMsg] = useState<{ type: 'ok' | 'error'; text: string } | null>(null)
 
@@ -22,6 +25,7 @@ export function SettingsSkillRoutingCard() {
         if (!alive) return
         setRouting(settings.skillRouting !== false)
         setRerank(settings.skillRerank !== false)
+        setEmbeddingModel(typeof settings.embeddingModel === 'string' ? settings.embeddingModel : '')
       })
       .catch(() => {})
     return () => {
@@ -34,7 +38,12 @@ export function SettingsSkillRoutingCard() {
     setMsg(null)
     try {
       const settings = ((await window.electronAPI?.getSettings?.()) ?? {}) as Record<string, unknown>
-      await window.electronAPI?.setSettings?.({ ...settings, skillRouting: routing, skillRerank: rerank })
+      await window.electronAPI?.setSettings?.({
+        ...settings,
+        skillRouting: routing,
+        skillRerank: rerank,
+        embeddingModel: embeddingModel.trim()
+      })
       setMsg({ type: 'ok', text: '已保存技能路由设置。' })
     } catch (error) {
       setMsg({ type: 'error', text: `保存失败：${error instanceof Error ? error.message : '未知错误'}` })
@@ -81,7 +90,7 @@ export function SettingsSkillRoutingCard() {
         <h2 className="text-sm font-semibold text-foreground">技能路由</h2>
       </div>
       <p className="text-[11px] text-muted-foreground">
-        Mimir 的技能采用「分层路由」：先目录/标签/硬规则粗召回，再精排后只把 top-K 候选注入 Supervisor，
+        Mimir 的技能采用「分层路由」：先目录/标签/硬规则粗召回，再精排后只把 top-K 候选注入 Agent，
         而不是把全量技能目录塞进每次请求。手动 <code className="rounded bg-muted px-1 font-mono text-[10px]">/技能</code> 直通、不走路由。
       </p>
 
@@ -96,9 +105,23 @@ export function SettingsSkillRoutingCard() {
         {toggleRow(
           rerank,
           setRerank,
-          'LLM 精排',
-          '候选较多时用 LLM 对候选打分排序（更准，多一次小调用）；关闭则仅按规则排序。'
+          '向量精排',
+          '候选较多时用 embedding 相似度对候选排序（比 LLM 打分更快更省，不额外消耗对话 token）；关闭则仅按规则排序。'
         )}
+        <div className="border-t border-border/60" />
+        <div className="space-y-1.5">
+          <div className="text-[12px] font-medium text-foreground/90">Embedding 模型名</div>
+          <Input
+            value={embeddingModel}
+            onChange={(e) => setEmbeddingModel(e.target.value)}
+            placeholder="text-embedding-3-small"
+            className="h-8 text-[11px]"
+          />
+          <p className="text-[10px] text-muted-foreground">
+            复用当前对话模型的接口地址与 API Key，仅需填写网关支持的 embedding 模型名；留空用默认值。
+            若网关不提供 embeddings 接口，精排会自动回退为规则排序，不影响正常对话。
+          </p>
+        </div>
         <div className="flex items-center justify-between pt-1">
           <p className="text-[10px] text-muted-foreground/70">
             内置技能以路由元数据注册；自定义技能缺字段会自动推导，关键字段缺失会被拒绝注册。

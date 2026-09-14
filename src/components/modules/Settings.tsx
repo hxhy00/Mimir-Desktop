@@ -37,11 +37,13 @@ import {
   Pencil,
   Sparkles,
   Settings2,
-  ListChecks
+  ChevronDown,
+  ShieldCheck
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { Textarea } from '@/components/ui/textarea'
 import { SettingsMemoryCard } from './SettingsMemory'
+import { SettingsPermissionsCard } from './SettingsPermissions'
 import { SettingsIdentityCard } from './SettingsIdentity'
 import { SettingsSkillRoutingCard } from './SettingsSkillRouting'
 import {
@@ -63,13 +65,17 @@ interface ModelConfig {
   modelId: string
   apiKey: string
   supportsImages: boolean
+  /** 是否开启「思考模式」：开启后请求体注入 thinking/reasoning_effort，
+   *  模型返回的推理内容会显示在对话的「正在思考…」里。第三方代理可能不透传该参数。 */
+  supportsReasoning: boolean
 }
 
 const EMPTY_MODEL_FORM = {
   baseUrl: '',
   modelId: '',
   apiKey: '',
-  supportsImages: false
+  supportsImages: false,
+  supportsReasoning: false
 }
 
 /** 「导入技能」手动表单的空白草稿。 */
@@ -212,11 +218,12 @@ interface SettingsProps {
 }
 
 // ─── 设置分页 ────────────────────────────────────────────────────────────────
-type SettingsTab = 'models' | 'appearance' | 'agent' | 'spaces' | 'resources' | 'about'
+type SettingsTab = 'models' | 'appearance' | 'agent' | 'permissions' | 'spaces' | 'resources' | 'about'
 const SETTINGS_TABS: { id: SettingsTab; label: string; icon: React.ElementType; desc: string }[] = [
   { id: 'models', label: '模型', icon: Bot, desc: '管理可用的 LLM 模型配置与图像生成端点，点击选择当前使用的模型。' },
   { id: 'appearance', label: '外观', icon: Palette, desc: '选择应用主题与工作台背景。' },
   { id: 'agent', label: 'Agent', icon: Sparkles, desc: '技能路由、身份与默认值、长期记忆等 Agent 行为设置。' },
+  { id: 'permissions', label: '权限与安全', icon: ShieldCheck, desc: '沙箱档位、已记住的免批准目录，以及 Agent 的文件访问审计日志。' },
   { id: 'spaces', label: '科研空间', icon: FolderKanban, desc: '每个科研空间是一个独立目录，承载论文、实验、图表、组会与对话等数据。' },
   { id: 'resources', label: '语音与资源', icon: Mic, desc: '语音识别引擎与本地组件资源下载。' },
   { id: 'about', label: '关于', icon: Info, desc: '应用信息。' }
@@ -239,15 +246,18 @@ export function Settings({ autoOpenModelDialog = 0, guided = false, onModelStepD
   const [showApiKeyInForm, setShowApiKeyInForm] = useState(false)
   const [testing, setTesting] = useState(false)
   const [testResult, setTestResult] = useState<{ ok: boolean; message: string } | null>(null)
-  // 模型发现（Issue 2）：按 baseUrl + apiKey 拉取 /v1/models，结果展示为下拉。
+  // 模型发现：按 baseUrl + apiKey 拉取 /v1/models，结果收进「模型」组合框的下拉候选里。
+  // 不再有独立的「获取模型列表」按钮——地址 + Key 填齐后自动探测（防抖），下拉内也可手动重试。
   const [listingModels, setListingModels] = useState(false)
   const [modelList, setModelList] = useState<{ id: string; ownedBy?: string }[]>([])
   const [modelListEndpoint, setModelListEndpoint] = useState('')
   const [modelListMsg, setModelListMsg] = useState<{ type: 'ok' | 'error'; text: string } | null>(null)
+  /** 组合框下拉是否展开。 */
   const [modelPickerOpen, setModelPickerOpen] = useState(false)
-  // 模型多选批量添加（Issue 8）：从发现结果中勾选多个模型一次性写入。
-  const [bulkSelected, setBulkSelected] = useState<Set<string>>(new Set())
-  const [bulkAdding, setBulkAdding] = useState(false)
+  /** 下拉内的搜索关键字（仅过滤候选列表，不改动已填的模型 ID）。 */
+  const [modelQuery, setModelQuery] = useState('')
+  /** 高亮的候选项下标，供 ↑↓ 键盘导航使用；-1 表示无高亮。 */
+  const [modelHighlight, setModelHighlight] = useState(-1)
   // ── Harness 选择（Issue 1）─────────────────────────────────────────
 
   const [speechEngine, setSpeechEngine] = useState<'local' | 'web'>('web')
@@ -719,7 +729,8 @@ export function Settings({ autoOpenModelDialog = 0, guided = false, onModelStepD
     setModelListMsg(null)
     setModelListEndpoint('')
     setModelPickerOpen(false)
-    setBulkSelected(new Set())
+    setModelQuery('')
+    setModelHighlight(-1)
   }, [])
 
   /** 进入「编辑模型」：预填现有字段并保留 id，复用同一弹窗。 */
@@ -729,98 +740,114 @@ export function Settings({ autoOpenModelDialog = 0, guided = false, onModelStepD
       baseUrl: model.baseUrl,
       modelId: model.modelId,
       apiKey: model.apiKey,
-      supportsImages: model.supportsImages === true
+      supportsImages: model.supportsImages === true,
+      supportsReasoning: model.supportsReasoning === true
     })
     setTestResult(null)
     setDialogOpen(true)
   }, [])
 
-  /** 拉取 /v1/models：供「获取模型列表」按钮使用，复用 issue 2 规范的 URL 归一化。
-   *  baseUrl / apiKey 为空时直接给出错误提示，不会发送请求。 */
-  const handleFetchModels = useCallback(async () => {
-    if (!form.baseUrl || !form.apiKey) {
-      setModelListMsg({ type: 'error', text: '请先填写请求地址和 API Key。' })
-      setModelList([])
-      setModelPickerOpen(false)
-      return
-    }
-    if (!window.electronAPI?.listModels) {
-      setModelListMsg({ type: 'error', text: '当前环境未暴露模型发现接口（preload 缺失）。' })
-      return
-    }
-    setListingModels(true)
-    setModelListMsg(null)
-    setModelList([])
-    setModelPickerOpen(false)
-    try {
-      const res = await window.electronAPI.listModels({ baseUrl: form.baseUrl, apiKey: form.apiKey })
-      if (res.endpoint) setModelListEndpoint(res.endpoint)
-      if (!res.ok || !res.models) {
-        setModelListMsg({ type: 'error', text: res.message ?? '获取模型列表失败' })
+  /**
+   * 拉取 /v1/models。由两条路径触发：
+   *   1) 地址 + Key 填齐后自动防抖探测（见下方 useEffect），让用户无需记忆按钮；
+   *   2) 下拉内的「重新发现」入口，用于失败后手动重试。
+   * 结果只填进 `modelList` 供下拉展示，不自动改写用户已填的模型 ID。
+   */
+  const handleFetchModels = useCallback(
+    async (opts?: { silent?: boolean }) => {
+      const { silent = false } = opts ?? {}
+      if (!form.baseUrl || !form.apiKey) {
+        if (!silent) setModelListMsg({ type: 'error', text: '请先填写请求地址和 API Key。' })
+        setModelList([])
         return
       }
-      setModelList(res.models)
-      setModelPickerOpen(res.models.length > 0)
-      setModelListMsg({
-        type: 'ok',
-        text: res.endpoint
-          ? `已发现 ${res.models.length} 个模型（来源：${res.endpoint}）`
-          : `已发现 ${res.models.length} 个模型`
-      })
-    } catch (error) {
-      setModelListMsg({ type: 'error', text: error instanceof Error ? error.message : '请求失败' })
-    } finally {
-      setListingModels(false)
-    }
-  }, [form.baseUrl, form.apiKey])
+      if (!window.electronAPI?.listModels) {
+        if (!silent) setModelListMsg({ type: 'error', text: '当前环境未暴露模型发现接口（preload 缺失）。' })
+        return
+      }
+      setListingModels(true)
+      try {
+        const res = await window.electronAPI.listModels({ baseUrl: form.baseUrl, apiKey: form.apiKey })
+        if (res.endpoint) setModelListEndpoint(res.endpoint)
+        if (!res.ok || !res.models) {
+          setModelListMsg({ type: 'error', text: res.message ?? '获取模型列表失败' })
+          setModelList([])
+          return
+        }
+        // 已添加过的模型仍展示，但标注为「已添加」并禁止重复选中。
+        setModelList(res.models)
+        setModelListMsg({
+          type: 'ok',
+          text: `已发现 ${res.models.length} 个模型`
+        })
+      } catch (error) {
+        setModelListMsg({ type: 'error', text: error instanceof Error ? error.message : '请求失败' })
+        setModelList([])
+      } finally {
+        setListingModels(false)
+      }
+    },
+    [form.baseUrl, form.apiKey]
+  )
+
+  /** 选中一个候选模型：写回「模型」字段并收起下拉（选项已存在时不允许选中）。 */
+  const pickModel = useCallback((id: string) => {
+    setForm((prev) => ({ ...prev, modelId: id }))
+    setModelPickerOpen(false)
+    setModelQuery('')
+    setModelHighlight(-1)
+  }, [])
 
   /**
-   * 批量添加（Issue 8）：把勾选的已发现模型一次性写入。
-   * 按 baseUrl+modelId 去重（跳过已存在的），跳过逐条连通测试——发现列表本身就证明
-   * 网关可达、Key 有效；写入后立即落盘并广播，ChatInput 下拉自动同步。
+   * 下拉候选：发现结果经「当前输入关键字」过滤，并标注该 baseUrl 下是否已添加过。
+   * 已添加项仍展示（让用户看到全集）但禁止选中，避免重复写入。
    */
-  const handleBulkAddModels = useCallback(async () => {
-    const ids = [...bulkSelected]
-    if (ids.length === 0 || !form.baseUrl || !form.apiKey) return
-    setBulkAdding(true)
-    try {
-      const existing = new Set(models.map((m) => `${m.baseUrl}::${m.modelId}`))
-      const toAdd: ModelConfig[] = ids
-        .filter((mid) => !existing.has(`${form.baseUrl}::${mid}`))
-        .map((mid, i) => ({
-          id: `model-${Date.now()}-${i}`,
-          baseUrl: form.baseUrl,
-          modelId: mid,
-          apiKey: form.apiKey,
-          supportsImages: form.supportsImages
-        }))
-      if (toAdd.length === 0) {
-        setModelListMsg({ type: 'error', text: '所选模型均已存在，未添加任何模型。' })
-        return
-      }
-      const updated = [...models, ...toAdd]
-      // 仅当当前没有选中模型时，默认选中第一个新添加的
-      const selectedAfter = selectedModelId === '' ? toAdd[0].id : selectedModelId
-      setModels(updated)
-      if (selectedModelId === '') setSelectedModelId(toAdd[0].id)
-      await persistModelsNow(updated, selectedAfter)
-      setModelListMsg({ type: 'ok', text: `已批量添加 ${toAdd.length} 个模型。` })
-      setBulkSelected(new Set())
-      // 关闭弹窗并重置
-      setDialogOpen(false)
-      resetModelDialog()
-    } finally {
-      setBulkAdding(false)
-    }
-  }, [bulkSelected, form, models, selectedModelId, persistModelsNow, resetModelDialog])
+  const filteredModelCandidates = useMemo(() => {
+    const q = modelQuery.trim().toLowerCase()
+    const existing = new Set(models.map((m) => `${m.baseUrl}::${m.modelId}`))
+    return modelList
+      .filter((m) => q === '' || m.id.toLowerCase().includes(q))
+      .map((m) => ({ ...m, alreadyExists: existing.has(`${form.baseUrl}::${m.id}`) }))
+  }, [modelList, modelQuery, models, form.baseUrl])
 
-  /** 关闭「添加/编辑」弹窗或切换 baseUrl 时清空已拉取的模型列表，避免误导。 */
+  /** 点击弹窗其它区域时收起下拉（组合框内点击不触发，故用容器级监听）。 */
+  const comboboxRef = useRef<HTMLDivElement | null>(null)
   useEffect(() => {
-    setModelList([])
+    if (!modelPickerOpen) return
+    const onPointerDown = (e: MouseEvent) => {
+      if (comboboxRef.current && !comboboxRef.current.contains(e.target as Node)) {
+        setModelPickerOpen(false)
+      }
+    }
+    document.addEventListener('mousedown', onPointerDown)
+    return () => document.removeEventListener('mousedown', onPointerDown)
+  }, [modelPickerOpen])
+
+  /**
+   * 自动发现模型：地址与 Key 填齐后静默探测一次（防抖 600ms，避免逐字符打字时连发请求）。
+   * 用户若正在下拉中操作则不打扰；发现失败只在「模型」下方留一行小字提示，不弹错。
+   */
+  useEffect(() => {
+    if (!dialogOpen) return
+    if (!form.baseUrl.trim() || !form.apiKey.trim()) {
+      setModelList([])
+      setModelListMsg(null)
+      setModelListEndpoint('')
+      return
+    }
+    const timer = setTimeout(() => {
+      void handleFetchModels({ silent: true })
+    }, 600)
+    return () => clearTimeout(timer)
+    // 仅在连接信息变化时重新探测；handleFetchModels 已由 baseUrl/apiKey 派生。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [form.baseUrl, form.apiKey, dialogOpen])
+
+  /** 切换 baseUrl 时清掉旧的候选与搜索态，避免展示上一个端点的模型。 */
+  useEffect(() => {
     setModelPickerOpen(false)
-    setModelListMsg(null)
-    setModelListEndpoint('')
-    setBulkSelected(new Set())
+    setModelQuery('')
+    setModelHighlight(-1)
   }, [form.baseUrl])
 
   /** 新增或编辑模型的统一保存：先连通测试，成功后按 id 覆盖（编辑）或追加（新增）并立即落盘。 */
@@ -877,7 +904,8 @@ export function Settings({ autoOpenModelDialog = 0, guided = false, onModelStepD
                 baseUrl: form.baseUrl,
                 modelId: form.modelId,
                 apiKey: form.apiKey,
-                supportsImages: form.supportsImages === true
+                supportsImages: form.supportsImages === true,
+                supportsReasoning: form.supportsReasoning === true
               }
             : m
         )
@@ -894,7 +922,8 @@ export function Settings({ autoOpenModelDialog = 0, guided = false, onModelStepD
         baseUrl: form.baseUrl,
         modelId: form.modelId,
         apiKey: form.apiKey,
-        supportsImages: form.supportsImages
+        supportsImages: form.supportsImages,
+        supportsReasoning: form.supportsReasoning
       }
 
       const updated = [...models, newModel]
@@ -1091,7 +1120,7 @@ export function Settings({ autoOpenModelDialog = 0, guided = false, onModelStepD
     <div className="flex h-full flex-col">
       <div className="drag-region flex h-12 shrink-0 items-center justify-between px-5">
         <span className="module-title">设置</span>
-        <span className="text-[11px] text-muted-foreground">模型 · 外观 · Agent · 科研空间 · 语音与资源 · 关于</span>
+        <span className="text-[11px] text-muted-foreground">模型 · 外观 · Agent · 权限与安全 · 科研空间 · 语音与资源 · 关于</span>
       </div>
       <div className="no-drag flex flex-wrap items-center gap-1.5 border-b border-border px-5 py-2">
         {SETTINGS_TABS.map((t) => {
@@ -1415,6 +1444,9 @@ export function Settings({ autoOpenModelDialog = 0, guided = false, onModelStepD
             <SettingsIdentityCard />
             <SettingsMemoryCard />
           </>)}
+
+          {/* Permissions Section：沙箱档位 + 已记住目录 + 审计日志 */}
+          {tab === 'permissions' && <SettingsPermissionsCard />}
 
           {/* Research Space Section */}
           {tab === 'spaces' && (<section className="space-y-3">
@@ -2210,162 +2242,197 @@ export function Settings({ autoOpenModelDialog = 0, guided = false, onModelStepD
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-2.5">
-            {/* Row 1: 请求地址 + 模型ID */}
-            <div className="grid grid-cols-5 gap-2">
-              <div className="col-span-3 space-y-1">
-                <Label className="text-[11px]">请求地址 *</Label>
+            {/* 填写动线：地址 → API密钥 → 模型（按从上到下顺序填充，填完地址+Key 自动发现模型） */}
+            <div className="space-y-1">
+              <Label className="text-[11px]">请求地址 *</Label>
+              <Input
+                placeholder="https://api.deepseek.com/v1"
+                value={form.baseUrl}
+                onChange={(e) => setForm({ ...form, baseUrl: e.target.value })}
+                className="h-7 text-[12px] font-mono"
+                autoFocus
+              />
+            </div>
+
+            <div className="space-y-1">
+              <Label className="text-[11px]">API密钥 *</Label>
+              <div className="relative">
                 <Input
-                  placeholder="https://api.deepseek.com/v1"
-                  value={form.baseUrl}
-                  onChange={(e) => setForm({ ...form, baseUrl: e.target.value })}
-                  className="h-7 text-[12px] font-mono"
-                  autoFocus
+                  type={showApiKeyInForm ? 'text' : 'password'}
+                  placeholder="sk-..."
+                  value={form.apiKey}
+                  onChange={(e) => setForm({ ...form, apiKey: e.target.value })}
+                  className="h-7 text-[12px] font-mono pr-7"
                 />
-              </div>
-              <div className="col-span-2 space-y-1">
-                <Label className="text-[11px]">模型ID *</Label>
-                <Input
-                  placeholder="deepseek-chat"
-                  value={form.modelId}
-                  onChange={(e) => setForm({ ...form, modelId: e.target.value })}
-                  className="h-7 text-[12px] font-mono"
-                />
-              </div>
-              <div className="col-span-5 -mt-1.5 flex items-center justify-between gap-2">
                 <button
                   type="button"
-                  onClick={() => void handleFetchModels()}
-                  disabled={listingModels || !form.baseUrl || !form.apiKey}
-                  className="inline-flex h-6 items-center gap-1 rounded-md border border-border bg-card px-2 text-[11px] text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
-                  title="按当前请求地址 + API Key 拉取可用模型"
+                  onClick={() => setShowApiKeyInForm(!showApiKeyInForm)}
+                  className="absolute right-1.5 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground transition-colors"
                 >
-                  {listingModels ? <Loader2 className="h-3 w-3 animate-spin" /> : <ListChecks className="h-3 w-3" />}
-                  {listingModels ? '获取中...' : '获取模型列表'}
+                  {showApiKeyInForm ? <EyeOff className="h-3 w-3" /> : <Eye className="h-3 w-3" />}
                 </button>
-                {modelListMsg !== null && (
-                  <span
-                    className={cn(
-                      'truncate text-[10px]',
-                      modelListMsg.type === 'error' ? 'text-destructive' : 'text-muted-foreground'
-                    )}
-                    title={modelListMsg.text}
-                  >
-                    {modelListMsg.text}
+              </div>
+            </div>
+
+            {/* 模型：可搜索下拉（来自 /v1/models 发现结果）+ 可自由输入自定义 ID */}
+            <div className="space-y-1">
+              <div className="flex items-center justify-between">
+                <Label className="text-[11px]">模型 *</Label>
+                {listingModels && (
+                  <span className="flex items-center gap-1 text-[10px] text-muted-foreground">
+                    <Loader2 className="h-2.5 w-2.5 animate-spin" />
+                    正在发现模型…
                   </span>
                 )}
               </div>
-              {modelPickerOpen && modelList.length > 0 && (
-                <div className="col-span-5 rounded-md border border-border bg-muted/30 px-2 py-1.5">
-                  <div className="flex items-center justify-between">
-                    <Label className="text-[10px] text-muted-foreground">勾选要添加的模型（可多选）</Label>
-                    <button
-                      type="button"
-                      onClick={() =>
-                        setBulkSelected((prev) =>
-                          prev.size === modelList.length ? new Set() : new Set(modelList.map((m) => m.id))
-                        )
+              <div className="relative" ref={comboboxRef}>
+                <Input
+                  role="combobox"
+                  aria-expanded={modelPickerOpen}
+                  aria-controls="model-combobox-list"
+                  placeholder={
+                    listingModels
+                      ? '正在发现可用模型…'
+                      : modelList.length > 0
+                        ? `已发现 ${modelList.length} 个模型，点击选择或直接输入`
+                        : '直接输入模型 ID（填完地址与密钥后自动发现）'
+                  }
+                  value={form.modelId}
+                  onChange={(e) => {
+                    setForm({ ...form, modelId: e.target.value })
+                    // 打字即进入「搜索/自定义」态：展开下拉并用输入内容过滤候选。
+                    setModelQuery(e.target.value)
+                    setModelPickerOpen(true)
+                    setModelHighlight(-1)
+                  }}
+                  onFocus={() => {
+                    if (modelList.length > 0) {
+                      setModelQuery('')
+                      setModelPickerOpen(true)
+                    }
+                  }}
+                  onKeyDown={(e) => {
+                    const filtered = modelList.filter(
+                      (m) => modelQuery.trim() === '' || m.id.toLowerCase().includes(modelQuery.trim().toLowerCase())
+                    )
+                    if (e.key === 'ArrowDown') {
+                      e.preventDefault()
+                      if (!modelPickerOpen && modelList.length > 0) {
+                        setModelPickerOpen(true)
+                        return
                       }
-                      className="text-[10px] text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
-                    >
-                      {bulkSelected.size === modelList.length ? '取消全选' : '全选'}
-                    </button>
-                  </div>
-                  <div className="mt-1 flex max-h-32 flex-wrap gap-1.5 overflow-y-auto">
-                    {modelList.map((m) => {
-                      const alreadyExists = models.some(
-                        (mm) => mm.baseUrl === form.baseUrl && mm.modelId === m.id
-                      )
-                      const checked = bulkSelected.has(m.id)
-                      return (
+                      setModelHighlight((h) => Math.min(h + 1, filtered.length - 1))
+                    } else if (e.key === 'ArrowUp') {
+                      e.preventDefault()
+                      setModelHighlight((h) => Math.max(h - 1, -1))
+                    } else if (e.key === 'Enter') {
+                      if (modelPickerOpen && modelHighlight >= 0 && filtered[modelHighlight]) {
+                        e.preventDefault()
+                        pickModel(filtered[modelHighlight].id)
+                      }
+                    } else if (e.key === 'Escape') {
+                      setModelPickerOpen(false)
+                    }
+                  }}
+                  className="h-7 pr-7 text-[12px] font-mono"
+                />
+                <button
+                  type="button"
+                  tabIndex={-1}
+                  onClick={() => {
+                    if (modelPickerOpen) {
+                      setModelPickerOpen(false)
+                    } else {
+                      setModelQuery('')
+                      setModelPickerOpen(true)
+                      if (modelList.length === 0 && form.baseUrl && form.apiKey) {
+                        void handleFetchModels({ silent: true })
+                      }
+                    }
+                  }}
+                  className="absolute right-1.5 top-1/2 -translate-y-1/2 text-muted-foreground transition-colors hover:text-foreground"
+                  title="展开可用模型列表"
+                >
+                  <ChevronDown className={cn('h-3 w-3 transition-transform', modelPickerOpen && 'rotate-180')} />
+                </button>
+
+                {modelPickerOpen && (
+                  <div
+                    id="model-combobox-list"
+                    role="listbox"
+                    className="absolute left-0 right-0 top-full z-50 mt-1 overflow-hidden rounded-md border border-border bg-popover shadow-md"
+                  >
+                    <div className="max-h-44 overflow-y-auto py-0.5">
+                      {filteredModelCandidates.map((m, i) => (
                         <button
                           key={m.id}
                           type="button"
-                          disabled={alreadyExists}
-                          onClick={() =>
-                            setBulkSelected((prev) => {
-                              const next = new Set(prev)
-                              if (next.has(m.id)) next.delete(m.id)
-                              else next.add(m.id)
-                              return next
-                            })
-                          }
+                          role="option"
+                          aria-selected={m.id === form.modelId}
+                          onMouseEnter={() => setModelHighlight(i)}
+                          onClick={() => {
+                            if (!m.alreadyExists) pickModel(m.id)
+                          }}
                           className={cn(
-                            'inline-flex max-w-full items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] font-mono transition-colors',
-                            alreadyExists
-                              ? 'cursor-not-allowed border-border bg-muted/50 text-muted-foreground/60 line-through'
-                              : checked
-                                ? 'border-primary bg-primary/10 text-primary'
-                                : 'border-border bg-card hover:bg-accent'
+                            'flex w-full items-center gap-2 px-2.5 py-1.5 text-left text-[11px] transition-colors',
+                            m.alreadyExists
+                              ? 'cursor-not-allowed text-muted-foreground/60'
+                              : i === modelHighlight
+                                ? 'bg-accent'
+                                : 'hover:bg-accent/60'
                           )}
-                          title={
-                            alreadyExists
-                              ? `${m.id}（已添加）`
-                              : m.ownedBy
-                                ? `${m.id} · owned_by: ${m.ownedBy}`
-                                : m.id
-                          }
                         >
-                          {!alreadyExists && (
-                            <span
-                              className={cn(
-                                'h-2.5 w-2.5 shrink-0 rounded-[3px] border',
-                                checked ? 'border-primary bg-primary' : 'border-muted-foreground/50'
-                              )}
-                              aria-hidden="true"
-                            />
-                          )}
-                          <span className="truncate">{m.id}</span>
+                          <Check
+                            className={cn(
+                              'h-3 w-3 shrink-0',
+                              m.id === form.modelId ? 'text-primary opacity-100' : 'opacity-0'
+                            )}
+                          />
+                          <span className="truncate font-mono">{m.id}</span>
                           {m.ownedBy !== undefined && (
-                            <span className="text-[8px] text-muted-foreground">· {m.ownedBy}</span>
+                            <span className="shrink-0 text-[9px] text-muted-foreground">{m.ownedBy}</span>
+                          )}
+                          {m.alreadyExists && (
+                            <span className="ml-auto shrink-0 text-[9px] text-muted-foreground">已添加</span>
                           )}
                         </button>
-                      )
-                    })}
-                  </div>
-                  <div className="mt-1.5 flex items-center justify-between gap-2">
-                    <p className="text-[9px] text-muted-foreground">
-                      也可以手动输入单个模型 ID；批量添加会跳过已存在项，不做逐条连通测试。
-                    </p>
-                    <Button
-                      size="sm"
-                      className="h-6 shrink-0 px-2 text-[10px]"
-                      onClick={() => void handleBulkAddModels()}
-                      disabled={bulkSelected.size === 0 || bulkAdding}
-                    >
-                      {bulkAdding ? (
-                        <Loader2 className="h-3 w-3 mr-1 animate-spin" />
-                      ) : (
-                        <Plus className="h-3 w-3 mr-1" />
+                      ))}
+                      {filteredModelCandidates.length === 0 && (
+                        <div className="px-2.5 py-2 text-[11px] text-muted-foreground">
+                          {listingModels
+                            ? '正在发现模型…'
+                            : modelList.length === 0
+                              ? '尚未发现模型。填好请求地址与 API 密钥后会自动发现；也可直接输入模型 ID。'
+                              : `没有匹配「${modelQuery}」的模型，回车可直接使用该 ID。`}
+                        </div>
                       )}
-                      {bulkAdding ? '添加中...' : `批量添加（${bulkSelected.size}）`}
-                    </Button>
+                    </div>
+                    <div className="flex items-center justify-between gap-2 border-t border-border px-2.5 py-1.5">
+                      <span className="truncate text-[9px] text-muted-foreground" title={modelListMsg?.text}>
+                        {modelListMsg?.text ?? (modelListEndpoint ? `来源：${modelListEndpoint}` : '')}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => void handleFetchModels()}
+                        disabled={listingModels || !form.baseUrl || !form.apiKey}
+                        className="shrink-0 text-[9px] text-muted-foreground underline-offset-2 hover:text-foreground hover:underline disabled:cursor-not-allowed disabled:opacity-50"
+                      >
+                        {listingModels ? '发现中…' : '重新发现'}
+                      </button>
+                    </div>
                   </div>
-                </div>
+                )}
+              </div>
+              {modelListMsg?.type === 'error' && (
+                <p className="text-[10px] text-destructive" title={modelListMsg.text}>
+                  {modelListMsg.text}（可手动输入模型 ID）
+                </p>
               )}
             </div>
 
-            {/* Row 2: API密钥 + 支持图片 */}
+            {/* Row: 支持图片 + 支持推理（并排，均为模型能力声明） */}
             <div className="grid grid-cols-4 gap-2">
               <div className="col-span-3 space-y-1">
-                <Label className="text-[11px]">API密钥 *</Label>
-                <div className="relative">
-                  <Input
-                    type={showApiKeyInForm ? 'text' : 'password'}
-                    placeholder="sk-..."
-                    value={form.apiKey}
-                    onChange={(e) => setForm({ ...form, apiKey: e.target.value })}
-                    className="h-7 text-[12px] font-mono pr-7"
-                  />
-                  <button
-                    type="button"
-                    onClick={() => setShowApiKeyInForm(!showApiKeyInForm)}
-                    className="absolute right-1.5 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground transition-colors"
-                  >
-                    {showApiKeyInForm ? <EyeOff className="h-3 w-3" /> : <Eye className="h-3 w-3" />}
-                  </button>
-                </div>
-              </div>
-              <div className="space-y-1">
                 <Label className="text-[11px]">支持图片</Label>
                 <div className="flex gap-3 h-7 items-center">
                   <label className="flex items-center gap-1 cursor-pointer">
@@ -2390,7 +2457,23 @@ export function Settings({ autoOpenModelDialog = 0, guided = false, onModelStepD
                   </label>
                 </div>
               </div>
+              <div className="space-y-1">
+                <Label className="text-[11px]">支持推理</Label>
+                <label className="flex h-7 cursor-pointer items-center gap-1.5">
+                  <input
+                    type="checkbox"
+                    className="h-3.5 w-3.5 rounded accent-primary"
+                    checked={form.supportsReasoning === true}
+                    onChange={(e) => setForm({ ...form, supportsReasoning: e.target.checked })}
+                  />
+                  <span className="text-[11px]">开启</span>
+                </label>
+              </div>
             </div>
+            <p className="text-[11px] text-muted-foreground">
+              思考模式需模型与端点支持：官方 DeepSeek / OpenAI 可用；第三方中转代理可能不透传该参数。
+            </p>
+
           </div>
           <DialogFooter>
             <Button

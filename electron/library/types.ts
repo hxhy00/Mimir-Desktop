@@ -4,12 +4,15 @@
 
 /** 一篇 arXiv 论文条目（搜索结果 / 订阅新论文共用） */
 export interface ArxivEntry {
+  /** 主键：裸 arXiv id（如 1512.03385）；非 arXiv 出版物为 `doi:xxx` */
   id: string
   title: string
   authors: string[]
   summary: string
   published: string
   url: string
+  /** 来源标识（统一访问层填充：openalex / semantic-scholar / arxiv），展示与排障用 */
+  source?: 'openalex' | 'semantic-scholar' | 'arxiv'
 }
 
 /** 一条网页搜索结果 */
@@ -31,12 +34,14 @@ export interface PaperRelevance {
 
 /** 文献库中的论文记录 */
 export interface PaperRecord {
-  /** 裸 arXiv id（可带版本后缀，如 2103.00020v2） */
+  /** 裸 arXiv id（可带版本后缀，如 2103.00020v2）；非 arXiv 出版物为 `doi:xxx` */
   arxivId: string
   title: string
   authors: string[]
   summary: string
   url: string
+  /** 来源标识（openalex / semantic-scholar / arxiv），展示与排障用 */
+  source?: 'openalex' | 'semantic-scholar' | 'arxiv'
   /** 自由格式的工作笔记（阅读笔记以 [YYYY-MM-DD HH:mm] 块追加） */
   notes: string
   /** 组织标签 */

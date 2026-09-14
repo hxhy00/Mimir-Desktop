@@ -19,6 +19,7 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
 import { cn } from '@/lib/utils'
+import { isSubmitEnter } from '@/lib/keyboard'
 import type { PaperRecord, ProjectRecord } from './types'
 import { formatDate, parseReadingNotes } from './types'
 
@@ -294,7 +295,7 @@ export function PaperCard({
                   placeholder="逗号分隔，如 survey, llm"
                   className="h-7 text-[11px] flex-1"
                   autoFocus
-                  onKeyDown={(e) => e.key === 'Enter' && saveTags()}
+                  onKeyDown={(e) => isSubmitEnter(e) && saveTags()}
                 />
                 <Button size="sm" className="h-7 text-[10px]" onClick={saveTags}>保存</Button>
                 <Button size="sm" variant="ghost" className="h-7 text-[10px]" onClick={() => setEditingTags(false)}>取消</Button>

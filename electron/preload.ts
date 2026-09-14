@@ -108,31 +108,67 @@ export interface ElectronAPI {
       text?: string
       durationMs?: number
       kind?: 'phase' | 'task' | 'tool' | 'think' | 'think-token'
+      /** 结构化步骤（调用/返回共享 callId）；见主进程 AgentWorkerEvent.step。 */
+      step?: {
+        callId: string
+        name: string
+        label?: string
+        stage: 'call' | 'result' | 'error'
+        argsSummary?: string
+        resultSummary?: string
+        /** 文件动作（内置文件工具才有）：时间线显示「写入 model.py +387」。 */
+        file?: { path: string; action: 'read' | 'write' | 'edit' | 'delete'; added?: number; removed?: number }
+      }
+      /** 内部工程阶段标记 → 时间线默认隐藏。 */
+      phase?: 'context' | 'routing' | 'main' | 'ultra'
     }) => void,
     options?: {
       ultra?: {
         enabled: boolean
-        strategy?: 'auto' | 'plain' | 'multi_expert' | 'critique_reflect' | 'hybrid_mix' | 'self_consistency_vote'
+        strategy?: 'auto' | 'multi_expert' | 'critique_reflect' | 'hybrid_mix' | 'self_consistency_vote'
       }
+      /**
+       * 本会话历史**原文**（仅 user/assistant 纯文本）。
+       * 滑动窗口、分段摘要压缩、熔断降级、失效对象提醒、压缩后能力声明均由主进程
+       * contextManager 统一处理，渲染层不再自行治理。
+       */
       history?: { role: 'user' | 'assistant'; content: string }[]
+      /** 当前 slash 目录（技能/指令）触发词与标题，供压缩后重建能力声明。 */
+      skills?: { trigger: string; title: string }[]
       manual?: boolean
     }
   ) => Promise<string>
-  /** 对较早对话历史做结构化摘要压缩（治理 Phase 1）。 */
+  /** 对较早对话历史做结构化摘要压缩（治理路径内部已不使用，保留为独立能力）。 */
   compressConversation: (history: { role: 'user' | 'assistant'; content: string }[]) => Promise<{
     ok: boolean
     summary?: string
     message?: string
   }>
-  stopMessage: () => Promise<boolean>
-  /** 「插件 → 子代理」只读目录：工具白名单 + 内置子代理元数据（展示 / 克隆用）。 */
+  /**
+   * 重置某会话的上下文治理状态（清失效提醒与压缩熔断计数；`/clear` 时调用）。
+   * @param includeArchive 连归档原文一并清除（删除会话时传 true）。
+   */
+  resetConversationContext: (conversationId: string, includeArchive?: boolean) => Promise<boolean>
+  /** 停止生成；传入会话 id 则只停该会话（多会话并行时避免误停其它会话）。 */
+  stopMessage: (conversationId?: string) => Promise<boolean>
+  /** 当前在跑的会话任务 id 列表（侧栏「后台任务」态）。 */
+  getRunningTasks: () => Promise<string[]>
+  /** 「插件 → 能力域」只读目录：工具白名单 + 内置能力域元数据（展示 / 克隆用）。 */
   getSubagentCatalog: () => Promise<{
     tools: { id: string; label: string; description: string }[]
-    builtin: { id: string; label: string; description: string; systemPrompt: string; toolIds: string[] }[]
+    builtin: {
+      id: string
+      label: string
+      /** 职业岗位名（委派身份），如「研究员」「运维工程师」。 */
+      role: string
+      description: string
+      systemPrompt: string
+      toolIds: string[]
+    }[]
   }>
-  /** 按最新子代理注册重新初始化 Agent（增删改查后免重启生效）。 */
+  /** 按最新能力域配置重新初始化 Agent（增删改查后免重启生效）。 */
   reloadAgent: () => Promise<{ ok: boolean; message: string }>
-  /** 一句话职责描述 → AI 生成自定义子代理草稿（name/说明/提示词/工具白名单）。 */
+  /** 一句话职责描述 → AI 生成自定义能力域草稿（name/说明/纪律/工具白名单）。 */
   generateSubagent: (
     prompt: string,
     takenNames: string[]
@@ -208,6 +244,10 @@ export interface ElectronAPI {
   fetchPaper: (id: string) => Promise<unknown>
   downloadPdf: (id: string) => Promise<unknown>
   openPath: (path: string) => Promise<void>
+  /** 在系统文件管理器中定位到该文件（对话内产物「打开所在文件夹」）。 */
+  revealPath: (path: string) => Promise<void>
+  /** 用系统浏览器打开 http(s) 外链（执行过程里的来源链接）。其它协议一律拒绝。 */
+  openExternal: (url: string) => Promise<boolean>
 
   // Terminal
   createTerminal: (
@@ -229,9 +269,19 @@ export interface ElectronAPI {
     gpus: { name: string; utilizationPct: number; memoryUsedMb: number; memoryTotalMb: number }[]
   }>
 
-  // Agent 副作用确认
+  // Agent 副作用确认（三态）
   onApprovalRequest: (callback: (request: { id: string; tool: string; summary: string; detail?: string; source?: { origin: 'main' | 'subagent'; subagentId?: string; subagentLabel?: string } }) => void) => () => void
-  approvalRespond: (id: string, allow: boolean) => Promise<boolean>
+  /** `remember=true` 表示「允许并记住」：主进程把这一次放行升级为这一类允许（如记住该目录）。 */
+  approvalRespond: (id: string, allow: boolean, remember?: boolean) => Promise<boolean>
+
+  // 权限与安全（沙箱档位 + 已记住目录 + 审计日志）
+  permissions: {
+    get: () => Promise<unknown>
+    set: (patch: Record<string, unknown>) => Promise<unknown>
+    allowRoot: (dir: string, action: 'read' | 'write') => Promise<{ ok: boolean; message: string }>
+    revokeRoot: (dir: string) => Promise<{ ok: boolean; message: string }>
+    audit: () => Promise<unknown>
+  }
 
   // ─── 文献库（Library）────────────────────────────────────────────
   library: {
@@ -397,7 +447,10 @@ const electronAPI: ElectronAPI = {
     })
   },
   compressConversation: (history) => ipcRenderer.invoke('agent:compress', history),
-  stopMessage: () => ipcRenderer.invoke('agent:stop'),
+  resetConversationContext: (conversationId, includeArchive) =>
+    ipcRenderer.invoke('agent:resetContext', conversationId, includeArchive),
+  stopMessage: (conversationId) => ipcRenderer.invoke('agent:stop', conversationId),
+  getRunningTasks: () => ipcRenderer.invoke('agent:runningTasks'),
   getSubagentCatalog: () => ipcRenderer.invoke('agent:subagentCatalog'),
   reloadAgent: () => ipcRenderer.invoke('agent:reload'),
   generateSubagent: (prompt, takenNames) => ipcRenderer.invoke('agent:subagentGenerate', prompt, takenNames),
@@ -447,6 +500,8 @@ const electronAPI: ElectronAPI = {
   fetchPaper: (id) => ipcRenderer.invoke('arxiv:fetchPaper', id),
   downloadPdf: (id) => ipcRenderer.invoke('arxiv:downloadPdf', id),
   openPath: (path) => ipcRenderer.invoke('shell:openPath', path),
+  revealPath: (path) => ipcRenderer.invoke('shell:revealPath', path),
+  openExternal: (url) => ipcRenderer.invoke('shell:openExternal', url),
 
   createTerminal: (id, options) => ipcRenderer.invoke('terminal:create', id, options),
   writeTerminal: (id, data) => ipcRenderer.invoke('terminal:write', id, data),
@@ -471,7 +526,17 @@ const electronAPI: ElectronAPI = {
       ipcRenderer.removeListener('agent:approval-request', listener)
     }
   },
-  approvalRespond: (id, allow) => ipcRenderer.invoke('agent:approval-respond', id, allow),
+  approvalRespond: (id, allow, remember) =>
+    ipcRenderer.invoke('agent:approval-respond', id, allow, remember === true),
+
+  // 权限与安全（沙箱档位 + 已记住目录 + 审计日志）
+  permissions: {
+    get: () => ipcRenderer.invoke('permissions:get'),
+    set: (patch: Record<string, unknown>) => ipcRenderer.invoke('permissions:set', patch),
+    allowRoot: (dir: string, action: 'read' | 'write') => ipcRenderer.invoke('permissions:allowRoot', dir, action),
+    revokeRoot: (dir: string) => ipcRenderer.invoke('permissions:revokeRoot', dir),
+    audit: () => ipcRenderer.invoke('permissions:audit')
+  },
 
   library: {
     listPapers: () => ipcRenderer.invoke('library:listPapers'),

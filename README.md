@@ -42,20 +42,43 @@
 
 ## 功能特性
 
-以 **DeepAgents (LangChain/LangGraph)** 为核心，配合 Supervisor 编排 + 子 Agent 协作，用自然语言无侵入驱动整条科研工作流。
+以 **DeepAgents (LangChain/LangGraph)** 为核心，采用**单 Agent + 职业角色工具集 + 可选委派子代理**（主 Agent 默认直接持有全部科研工具、自己规划执行；遇到属于某位「同事」职责、可独立完成的整块工作时，可自主把它委派出去），用自然语言无侵入驱动整条科研工作流。
 
 ### Agent 对话与上下文治理
 
-- **Supervisor 编排**：主管 Agent 把文献 / 论文 / 实验 / 组会 / 服务器等任务按需委派给模块子 Agent 协作并汇总作答；支持 Markdown、流式输出、气泡内**执行过程轨迹卡**，会话管理 / 历史（重命名 / 置顶）本地持久化。
-- **可选 Ultra 增强控制器**（Supervisor 之上的增强总开关，默认关闭以控制 token）：自动或手动选择增强策略——普通增强(仅长程规划) / 多专家合议(K 路评审→共识/分歧→反思) / 批判迭代(草稿→批判→修订) / 混合增强(关键判断点合议+整体批判) / 一致性投票(轻量 SC 选最优)；策略带 cost 标签，上下文过长自动降级，选型轨迹可回溯，执行动作全部下沉 Supervisor，分歧点由子 Agent 工具核验。
-- **会话上下文治理**：发送时携带最近对话为滑动窗口，超阈值自动把更早对话压缩为结构化摘要（原文归档可回看）；工具返回与增强子产物不沉淀历史；删除 / 改名等破坏性操作触发会话级**失效提醒**，防止跨轮复述旧对象。
+- **单 Agent + 职业角色工具集**：一个 Agent 直接持有全部科研工具，按任务自行选择调用（工具行按「职业角色」打标签，过程可读）；支持 Markdown、流式输出、气泡内**执行过程轨迹卡**，会话管理 / 历史（重命名 / 置顶）本地持久化。
+- **轻量委派（子代理 = 专业同事）**：每个职业角色同时编译为一个 `isolated` 子代理（独立上下文、只见委派任务、结果以 ToolMessage 回传），主 Agent 通过 deepagents 注入的 `task` 工具**自主决定是否委派**——单次工具调用就能解决的小事自己直接做，需要多步工具接力的整块工作才派出去（对齐 WorkBuddy / Trae 的默认形态）。委派期间渲染层时间线把子代理内部步骤折叠到「委派」节点下（带角色标签），批准卡标注「来自角色：X」；「防嵌套防火墙」限制委派深度为 1（主 Agent 可委派、子代理不得再委派），杜绝递归委派导致拓扑失控。
+- **对话内产物验收**：Agent 回复过程中落盘的文件（PPT / PDF / 配图 / 数据等）会自动从工具返回中识别，在气泡下方以**产物卡**列出（类型图标 + 文件名 + 大小），支持「打开」与「打开所在文件夹」；识别只认磁盘上真实存在且扩展名在白名单内的绝对路径，避免把示例路径误判为产物。
+- **多会话并行（后台任务）**：不同会话可同时生成回复，互不阻塞——A 会话在跑时可切到 B 会话继续提问；侧栏对正在生成的会话显示转圈标记；停止生成按会话生效，只影响目标会话。窗口关闭时中止全部后台任务。
+- **可选 Ultra 增强控制器**（Agent 之上的增强总开关，默认关闭以控制 token）：自动或手动选择增强策略——多专家合议(K 路评审→共识/分歧→反思) / 批判迭代(草稿→批判→修订) / 混合增强(关键判断点合议+整体批判) / 一致性投票(轻量 SC 选最优)；策略带 cost 标签，上下文过长**按真实 token** 自动降级（降级即「本次不增强」，不塞无效提示词），选型轨迹可回溯，执行动作全部下沉 Agent，分歧点由工具核验。
+  > 原「普通增强（plain，仅注入一段长程规划约束）」已按 A/B 实测移除：配对 18 条用例上 0 例修复 / 1 例回归，token +43.4%、工具调用 +85.7%。它能改的不是判断力而是「勤快度」，反而推高撞上「不该调的工具」的概率。**不需要增强时就不介入**，而不是注入一段确定有害的文本。
+- **会话上下文治理（主进程侧）**：滑动窗口、超限时的**分段结构化摘要压缩**、压缩熔断降级、原文归档、失效提醒、压缩后能力声明重建，全部由主进程 `electron/agent/contextManager.ts` 统一完成（渲染层只传「原始历史 + 技能目录」）；阈值以**真实 token** 计量（不再是字符数估算），中文/英文/代码的预算口径一致；工具返回与增强子产物不沉淀历史；删除 / 改名等破坏性操作触发会话级**失效提醒**，防止跨轮复述旧对象。
+- **工具纪律与交付门禁**：`subagentResult.ts` 的三条交付门禁（多步任务不得只做第一步 / 更新已有对象 ≠ 新建 / 结构化数据必须用结构化工具）来自基线实测的高频失败模式，`capabilityDomains.ts` 按能力域给出使用纪律。
+  > **一条有实测支撑的经验**：写「禁止 X」会稳定生效，写「允许 X」会被忽略 —— 过度收紧会把**必需**的工具调用一起压掉。因此禁令要把作用域写窄（「**检索学术论文时**别用 web_search 顶替 paper_search」），而「什么时候该用某个工具」要写进**工具自身的描述**（模型选工具时读的是它），不能只写进 systemPrompt 规则。数据见 `test/eval/README.md` 的配对分析②③。
 - **永久身份常量**：在「设置 → 身份与默认值」维护科研身份 / 交互语言 / 写作语言等几乎不变的 identity，作为极小 system 段每轮恒定注入、保存即生效；默认不注入任何内容，自动学习永不写入该层。
-- **长期记忆档案**：全局记忆默认不注入，仅当任务相关时由 Supervisor 调用 `load_memory` 按需读取（「设置 → 长期记忆」维护）。
+- **交流语言一致性（每轮前置注入）**：身份常量只作用于会话开头的 systemPrompt，对多轮工具循环的**中间轮次**约束力不足——实测表现为「最终回答是中文，但工具调用之间的过程叙述整段英文」（"Let me check..." / "Now I'll..."）。因此「交流语言」由 `electron/agent/languageMiddleware.ts` 作为中间件在**每次模型调用时**读取最新设置并前置注入 systemMessage 顶部：覆盖正文、计划说明、进度更新与错误解释，禁止中英混杂旁白（专有名词 / 代码 / 论文标题保留原文）；改设置免重启即生效。
+  > 另一实测漏点是**「英文材料 → 英文总结」**：任务上下文全是英文论文/代码时，模型会把最终总结也滑回英文。指令对此显式点名——即使材料是英文，总结正文仍必须用中文书写，仅引用原文术语/标题/代码时保留英文（单测锁定该条款存在，防回退）。
+- **长期记忆档案**：全局记忆默认不注入，仅当任务相关时由 Agent 调用 `load_memory` 按需读取（「设置 → 长期记忆」维护）。
 - **语音输入**：对话输入框支持语音转文本——本地 **SenseVoice**（sherpa-onnx，Electron 主进程离线识别，可下载模型）或浏览器 **Web Speech** 引擎，在「设置 → 语音与资源」切换。
+
+### 权限与安全（沙箱档位 × 三态批准）
+
+Agent 拥有真实磁盘读写，因此权限模型决定「它能不问自取地动哪里」。改动前是「一刀切」——写入一律弹批准卡；科研用户一天写二十个文件要点二十次，结果是**批准疲劳**（无脑点是），安全性反而下降。现在改为**策略矩阵 + 三态批准**：
+
+- **沙箱档位**（「设置 → 权限与安全」）：只读档（禁止一切写盘）/ **工作区可写（默认）** / 全权档（控制平面除外）；决策顺序即优先级，见 `electron/agent/permissions.ts`。
+- **空间内免批准**：科研空间是用户自己的资料库，在里面产出笔记 / 图表 / PPT / 编译产物默认**不打扰**（可开关「空间内也要确认」）。
+- **「允许并记住此目录」**：批准卡从「拒绝 / 允许一次」升级为三态。点记住即把这一次放行升级为**这一类的允许**，后续同类动作不再弹卡；已记住的目录在设置页可随时撤销。
+- **路径口径统一**：判定、空间根、允许列表三处都用**磁盘实体路径**（`realpath`）。macOS 上 `/var → /private/var` 是软链，口径不一致会造成「记住了却照样弹卡」与「空间内被误判成空间外」，软链也会成为绕过前缀匹配的口子。
+- **业务卡的档位感知**：文献入库 / PPT 生成 / LaTeX 编译这类「业务副作用卡」曾绕过沙箱档位无条件弹卡，导致设了全权档仍被反复打断（档位形同虚设）。现统一走 `requireBusinessApproval`：**全权档下非破坏性动作自动放行**（审计照记，与人工允许可区分），**删除类操作任何档位都弹卡**（误删没有后悔药，风险不对称）；判定只看批准卡 `summary` 前缀（删除 / 移除 / 清空），避免 detail 里的解释性文字（如「不会删除你的源文件」）被误判成破坏动作。见 `electron/agent/approval.ts`。
+- **审计日志**：每次文件读写的判定与用户裁决都落盘（工具 / 路径 / 决定 / 时间），设置页可回看。**这是把「每次都问」换成「问一次」的前提**——放行必须可追溯，否则等于交进黑箱。
+- **控制平面永远硬拒绝**：`~/.mimir`、应用配置目录（settings / 能力域与技能定义、运行时凭据）不参与任何允许列表，**全权档也不放行、也不弹卡**（不给出「用户误点同意」的机会）。理由见 `electron/agent/controlPlane.ts`：那是 Agent 给自己加工具的提权入口。
+- **渲染层不等于可信**：上述矩阵只约束 Agent 的写盘路径；渲染层另有 `fs:readFile` / `fs:writeFile` 通道，**曾被无校验地透传给 `fs`** —— 任何被注入的渲染内容都能借它读走整块磁盘，与 Agent 侧形成两条口径不一的旁路。现改为**白名单/边界收口**：读只放行「用户在原生文件对话框里显式选择过」的文件，写只放行科研空间根目录内（见 `electron/ipc/index.ts` 的 `assertRendererFilePath`）。**判断放在主进程**，渲染层的判断只是 UX，不作为信任依据。
+- **外链协议白名单**：`shell.openExternal` 会把 URL 原样交给操作系统，`file:` / 自定义 scheme 都可能产生系统侧副作用；链接可能来自模型返回的 Markdown（不可信输入）。窗口层的 `setWindowOpenHandler` 与 IPC 层的 `shell:openExternal` **共用同一份白名单**（仅 http(s)，见 `electron/safeUrl.ts`），杜绝两处口径漂移。
+- **子代理工具上防**：委派链路的防火墙按层级判定——主 Agent（depth 0）可持 `task` 作为委派入口，子代理（depth ≥ 1）禁止，否则会形成「主 → 子 → 孙…」的递归委派。该约束**在能力域编译成子代理时逐域施加**（`buildDomainSubagents`），而非只覆盖主 Agent 工具集（见 `electron/agent/delegationFirewall.ts`）。
 
 ### 技能分层路由（Skill Router）
 
-技能以元数据注册（L3 目录 / tags / 适用边界 / 反例 / 成本 / 会话次数），每轮 Meta-Cognition 意图识别 → 规则粗召回 →(可配) LLM 精排 → 只把 **top-K 候选**注给 Supervisor，替换原先的全量技能目录注入；手动 `/技能` 直通绕过；自定义技能缺字段自动推导、缺关键字段拒绝注册；开关在「设置 → 技能路由」。
+技能以元数据注册（L3 目录 / tags / 适用边界 / 反例 / 成本 / 会话次数），每轮 Meta-Cognition 意图识别 → 规则粗召回 →(可配) **向量精排**（embedding 相似度，复用当前对话模型的接口与 Key，模型名在「设置 → 技能路由」配置）→ 只把 **top-K 候选**注入给 Agent，替换原先的全量技能目录注入；手动 `/技能` 直通绕过；自定义技能缺字段自动推导、缺关键字段拒绝注册。相比原先的 LLM 精排，把每轮 2 次 LLM 调用降到 1 次；网关无 embeddings 接口时自动回退规则排序，不影响正常对话。
 
 ### 科研空间
 
@@ -76,17 +99,8 @@
 | **服务器 `servers`** | SSH 远程连接，nvidia-smi 实时 GPU / 显存监控，内置远程终端 |
 | **记录 `ledger`** | 成长记录时间线（里程碑 / 论文 / 实验等），本地持久化、可删除 |
 | **会议截稿 `venues`** | ccfddl 会议截稿目录（本地缓存优先、启动自动抓取 + 6h 定时 / 手动刷新，离线可用），领域 / CCF 等级 / 时间窗过滤、倒计时高亮、关注星标；内置 CCF-A 期刊目录 |
-| **插件 `plugins`** | 统一管理技能 / 子代理 / 插件 / Hooks（增删改查 + 启停开关，本地持久化） |
-| **设置 `settings`** | 模型（LLM 管理 · 图像生成端点 · `/v1/models` 自动发现）/ 外观 / Agent（技能路由 · 身份与默认值 · 长期记忆 · Harness 选择）/ 科研空间 / 语音与资源 / 关于 |
-
-### Agent Harness 层
-
-Agent 执行层抽象为统一的 `HarnessAdapter` 接口，上层业务面向接口编程而非具体实现，默认使用 `Mimir` harness（现有 DeepAgents / LangChain 实现）：
-
-- **Harness 注册表**：`electron/agent/harnessRegistry.ts` 统一注册与切换，`isAvailable()` 判定运行环境，不可用时给出明确提示。
-- **已注册 harness**：`Mimir`（可用）、`Codex` / `Claude Code` / `Pi`（stub 占位，`isAvailable()` 返回 `false`，UI 中灰色标注「即将支持」）。
-- **设置页切换**：「设置 → Agent → Harness」可选择当前 harness，切换不影响已有模型配置。
-- **新增 adapter**：在 `electron/agent/harnesses/` 实现接口并在注册表登记即可。
+| **插件 `plugins`** | 统一管理指令 / 技能 / 能力域 / 插件 / Hooks（增删改查 + 启停开关，本地持久化） |
+| **设置 `settings`** | 模型（LLM 管理 · 图像生成端点 · `/v1/models` 自动发现）/ 外观 / Agent（技能路由 · 身份与默认值 · 长期记忆）/ **权限与安全** / 科研空间 / 语音与资源 / 关于 |
 
 ### 模型自动发现
 
@@ -98,26 +112,21 @@ Agent 执行层抽象为统一的 `HarnessAdapter` 接口，上层业务面向�
 - **错误处理**：覆盖无效 URL、网络不可达、401/403、端点不支持、超时、格式异常等情况。
 - **多选批量添加**：发现结果可勾选多个模型（支持全选）一次性写入；按 `baseUrl + modelId` 自动跳过已存在项；批量添加不做逐条连通测试（发现成功即证明端点与 Key 可达）。
 
-### 本地桥接与插件（Phase 1）
+### 本地只读协作桥接
 
-为 Codex / Claude Code / Pi 等外部 harness 提供调用 Mimir 科研能力的本地通道：
+`electron/plugins/bridge.ts` 在 Electron 主进程中起一个 HTTP 服务，**只绑定 `127.0.0.1`**，把端口与确认令牌写入 `~/.mimir/bridge.json`，供本机其它进程查询 Mimir 的科研数据。
 
-```
-外部 Harness → 原生 extension / skill / MCP → Mimir 插件 → HTTP(127.0.0.1) → Mimir Bridge → 领域服务
-```
-
-- **`electron/plugins/bridge.ts`**：本地 HTTP 桥接，仅绑定 `127.0.0.1`，随机端口写入 `~/.mimir/bridge.json`；读操作默认允许，写操作需 `X-Mimir-Confirm` 头。
-- **`electron/plugins/mcpServer.ts`**：基于 stdio 的 MCP server（JSON-RPC 2.0），实现 `tools/list` / `tools/call`，暴露文献库 / 图表 / 组会 / 截稿等只读工具。
-- **`electron/plugins/codex-extension.ts`** / **`claude-code-skill.ts`**：各 harness 插件入口骨架；`pluginRegistry.test.ts` 校验三方工具定义一致。
+- **只暴露只读查询**：早期面向外部 agent 宿主插件的写入路由**已全部下线**——多宿主（harness）集成本身已取消；确认令牌只能证明调用方读过 `~/.mimir/bridge.json`（同机任意进程都能读），无法构成远程鉴权，因此把危险面整体移除，而不是去加固一个挡不住的令牌。
 - **IPC**：`bridge:start` / `bridge:stop` / `bridge:status`。
 
-> Phase 1 仅含只读能力。写入确认卡片 UI、完整能力暴露（服务器执行 / 论文编辑）与权限策略待后续实现。
+> 写入能力（库导入 / 组会生成 / 服务器执行 / 论文编辑）不在桥接层提供；所有写盘与副作用统一走对话内的批准卡。
 
-### 插件模块（技能 / 子代理 / 插件 / Hooks）
+### 插件模块（指令 / 技能 / 能力域 / 插件 / Hooks）
 
-- **技能**：内置 `research-*` 只读；**自定义技能**支持弹窗导入（手动表单或粘贴 JSON）与删除，导入即落盘生效；增删后重进「对话」自动刷新斜杠菜单。
-- **子代理**：Supervisor 可委派子代理的管理界面——内置 5 个科研 worker（文献 / 论文 / 实验 / 组会 / 服务器）只读展示、可「克隆」改造；支持 **AI 生成**（一句话描述职责草拟 name / 说明 / systemPrompt / 工具白名单）；自定义子代理可增删改查 + 启停，从**内置工具白名单**勾选工具并自写 systemPrompt；保存 / 切换启停自动「重载 Agent」（重建 Supervisor）免重启；副作用仍走批准卡。
-- **插件 / Hooks**：注册与管理界面（启用开关 / 描述 / 配置）。
+- **指令 / 技能**：内置只读；**自定义指令与技能**支持弹窗导入（手动表单或粘贴 JSON）与删除，导入即落盘生效；增删后重进「对话」自动刷新斜杠菜单。
+- **能力域（= 职业角色）**：Agent 可委派的**专业同事**管理界面——内置 5 个角色（研究员 / 写作编辑 / 实验管理员 / 汇报助理 / 运维工程师）只读展示、可「克隆」改造；支持 **AI 生成**（一句话描述职责草拟 name / 说明 / 纪律 / 工具白名单）；自定义能力域可增删改查 + 启停，从**内置工具白名单**勾选工具并自写使用纪律；保存 / 切换启停自动「重载 Agent」（按最新能力域配置重新初始化）免重启；副作用仍走批准卡。
+  > 角色按**职责结果**划分，而不是按工具种类划分 —— 一个角色 = 一类要对结果负责的工作（如「研究员」对「问题搞清楚了没有」负责，「实验管理员」对「数据管住了没有」负责）。因此归档类工具（`paper_fetch` / `set_paper`）归实验管理员而非检索性质的「研究员」；跨职责的任务由主 Agent 自己拆分（先调研、再归档）。每个角色的提示词是一份岗位说明书：身份 / 精通什么 / 工作准则 / **不做什么** / 交付格式。
+- **插件 / Hooks**：注册与管理界面（启用开关 / 描述 / 配置）；运行时消费尚未接入，当前作为能力清单管理。
 
 ---
 
@@ -135,10 +144,10 @@ Agent 执行层抽象为统一的 `HarnessAdapter` 接口，上层业务面向�
 | LaTeX | latexmk / Tectonic |
 | 远程终端 | @xterm/xterm + node-pty |
 | 语音 | sherpa-onnx (SenseVoice) / Web Speech |
-| 数据存储 | 双层 JSON Store（全局设置 + 科研空间）+ arXiv API |
-| 测试 | Vitest（契约 / 网关探测 / 无头冒烟）+ Node/Bun 模块自检 |
-| Agent Harness | 统一 `HarnessAdapter` 抽象（Mimir / Codex / Claude Code / Pi） |
-| 外部集成 | 本地 HTTP Bridge + MCP Server（stdio） |
+| 数据存储 | 双层 JSON Store（全局设置 + 科研空间） |
+| 文献检索 | OpenAlex（主源）+ Semantic Scholar（标题精确匹配，辅助）+ arXiv API（新鲜预印本补充 / 最新提交排序） |
+| 测试 | Vitest（契约 / 网关探测 / 无头冒烟 / 上下文治理）+ 科研 Agent 评测集（`test/eval`）+ Node 模块自检 |
+| 本地协作 | 只读 HTTP Bridge（仅绑定 `127.0.0.1`，写路由已下线） |
 
 ---
 
@@ -162,8 +171,12 @@ pnpm test
 
 # 6. 各模块自检（离线）
 pnpm test:model-discovery   # /v1/models URL 归一化与响应解析
-pnpm test:harness           # Harness 注册表与切换
-pnpm test:plugins           # 三方插件工具定义一致性
+
+# 7. 科研 Agent 评测集（默认 mock 执行器；接真实网关见 test/eval/README.md）
+pnpm test:eval              # 评测指标与任务集的一致性单测
+pnpm eval -- --label baseline   # 跑一轮评测并落盘报告（mock 执行器）
+pnpm eval:real              # 真实网关评测 / A/B 入口（需 MIMIR_GW_URL/KEY/MODEL，缺凭据则跳过）
+pnpm eval:compare <A.json> <B.json>   # A/B 对比两份报告
 ```
 
 > 打包平台：`pnpm build:mac` / `pnpm build:win` / `pnpm build:linux`（分别产出 dmg/zip、nsis/portable、AppImage/deb）。
@@ -172,6 +185,59 @@ pnpm test:plugins           # 三方插件工具定义一致性
 
 - **Node.js ≥ 22**
 - 编译论文可选用本机 `latexmk`，或在「设置 → 语音与资源」下载内置 **Tectonic** 单文件引擎（推荐，跨平台，免安装）
+
+### 构建注意：依赖处理是「分类策略」，不是全外置也不是全内联
+
+`electron.vite.config.ts` 里 main/preload 的依赖处理踩过**两个方向相反的坑**，改之前请读完本节。
+
+#### 坑 1：数据型依赖必须外置（否则构建就失败）
+
+- **现象**：`pnpm build` 在渲染 chunk 阶段失败 ——
+  `[vite:esbuild-transpile] Transform failed ... index.js:367298:2: ERROR: Unterminated string literal`，
+  出错位置附近能看到 `// -- CommonJS Shims --`。
+- **机制**：`electron/agent/tokenizer.ts` 引入的 `gpt-tokenizer` 词表是两张共约 30 万行的**字符串数组**
+  （BPE 词表，元素本身就是 `"\timport"`、`" corrupt"` 这类「源码片段」）。只要它们被打进 chunk，
+  electron-vite 的 `vite:esm-shim` 插件（`"type": "module"` 下为 main/preload 注入 CJS 互操作 shim）
+  就会用**不识别字符串边界**的正则 `ESMStaticImportRe` 去找插入点，命中词表里的伪
+  `import … from " "` 序列，把 shim 插进字符串字面量中间 —— 产出的 chunk 本身就不是合法 JS。
+- **结论**：**任何"数据文件里含源码片段字符串"的依赖都必须外置**（当前是 `gpt-tokenizer`）。
+  只把某一个包加进 external 不算修好，换一个同类依赖会再犯。
+
+#### 坑 2：LangChain 生态**不能**外置（否则能构建、但启动即崩）
+
+- **现象**：构建全过，`pnpm dev` 时主进程崩：
+  `SyntaxError: Cannot use import statement outside a module`，栈顶指向
+  `@langchain/langgraph-sdk/dist/node_modules/.pnpm/p-retry@7.1.1/node_modules/p-retry/index.js`。
+- **机制**：`@langchain/langgraph-sdk@1.10.2` 的发布产物里带着一棵**被剥掉 package.json 的
+  pnpm 嵌套 node_modules**（该目录只有 `index.js`(ESM) 与 `index.cjs`，没有 package.json）。
+  Electron 33 内置 **Node 20** 不做语法嗅探，只能把 `index.js` 当 CJS 解析 → 直接语法错误。
+- **结论**：`langchain` / `langsmith` / `deepagents` / `@langchain/*` 必须**打进 bundle**，
+  由 Rollup 解析并内联，运行时就不再去读那棵坏树。
+
+> ⚠️ **不要用系统 node 的 `import()` 测试代替"能否在 Electron 里启动"的验证**：
+> 在 Node 22 下 `import('deepagents')` 是**通过**的（Node 22 会按语法嗅探 ESM），
+> 而同样的代码在 Electron 33 的 Node 20 里会崩。唯一可信的验证是 `pnpm dev` 能起。
+
+#### 坑 3：zod 必须跟着一起内联（否则运行时缺符号）
+
+LangChain 生态内部用的是 **zod 4**（`zod/v4/core` 的 `$ZodNever` / `toJSONSchema` 等内部符号），
+而本项目顶层 zod 是 **3.25.x**（声明 `^3.23.8`，只提供 v3 API + v4 子路径）。若 zod 外置，
+被 bundle 的 LangChain 代码会在运行时去顶层 zod 解析 `zod/v4/core`，版本对不上就会以
+「does not provide an export named …」在启动时崩溃。内联后每个导入方各取自己依赖的版本。
+
+#### 收敛后的外置面（`BUNDLE_INSTEAD_OF_EXTERNAL` 的反面）
+
+```
+electron · node 内建 · gpt-tokenizer/encoding/* · js-yaml · node-pty
+```
+
+其余全部内联（main bundle ≈ 1500 模块 / 4.3 MB）。改 `package.json` / 配置时注意：
+
+1. **要外置的依赖必须留在 `dependencies`** —— `externalizeDepsPlugin` 只把 `dependencies` 列为
+   外置候选，放进 devDependencies 会被当源码打进 bundle；
+2. **原生 / 二进制依赖要加进 `electron-builder.yml` 的 `asarUnpack`**（当前：`node-pty` / `sherpa-onnx` / `ffmpeg-static`）；
+3. **改完依赖相关配置必须跑到"能启动"**：`pnpm build` 通过**不等于**能跑。用 `pnpm dev` 确认主进程
+   打印出 `[agent] 主 Agent 工具注册（N 个 + task 委派）` 与 `[agent] 委派子代理（M 个）` —— 那才说明 bundle 真的被 Electron 加载了。
 
 ---
 
@@ -191,13 +257,13 @@ pnpm test:plugins           # 三方插件工具定义一致性
 
 | 工具 | 说明 |
 |---|---|
-| `arxiv_search` | 搜索 arXiv 学术论文 |
-| `arxiv_fetch_paper` | 按 id 读取单篇论文完整元数据（不写入文献库） |
+| `paper_search` | 检索学术论文：默认源 OpenAlex（覆盖 arXiv 预印本与期刊正式版）并自动补充 arXiv 最新预印本；`sortBy=submittedDate` 时才走 arXiv 原生接口 |
+| `arxiv_fetch_paper` | 按 arXiv id 读取单篇论文完整元数据（走 OpenAlex / Semantic Scholar，不写入文献库） |
 | `library_search` | 检索文献库内已收藏论文（标题 / 摘要 / 标签 / 笔记关键词，只读片段） |
 | `wiki_search` | 检索当前科研空间的 Wiki 笔记（只读片段） |
-| `web_search` | 搜索网页获取最新信息 |
+| `web_search` | 搜索网页获取最新信息（只读）。用户说「在网上找 / 要链接」时用它——即便话题是学术主题 |
 | `wiki_note` | 创建 / 追加 Wiki 研究笔记 |
-| `paper_fetch` | 获取 arXiv 论文并自动保存到文献库（关联项目） |
+| `paper_fetch` | 按 arXiv id 或 DOI 获取论文并自动保存到文献库（走统一检索访问层，不受 arXiv 限流影响） |
 | `set_paper` | 更新文献库论文的标签、笔记、AI 相关性评分 |
 | `venue_search` | 查询 CCF 会议截稿与倒计时（本地缓存，离线可用） |
 | `experiment` | 操作实验模块：list / create / update / delete（副作用先确认） |
@@ -228,8 +294,9 @@ pnpm test:gateway    # 只跑网关相关（离线判定逻辑 + live 矩阵）
 |---|---|
 | `test/contract` | **工具名契约**——自定义工具不得与 deepagents 内置名（`ls`/`read_file`/`write_file`/`edit_file`/`delete`/`glob`/`grep`/`execute`）及中间件保留名（`task`/`write_todos`/`load_memory`）冲突。撞名会在构建 agent 时抛 `MiddlewareError`，本测试在 CI 阶段即拦截 |
 | `test/gateway` | **网关能力探测**——用注入的 fetch 桩离线验证三通道（`json_schema` / `json_object` / `function_calling`）判定逻辑正确性 |
-| `test/smoke` | **无头冒烟**——用生产同款装配构建 Supervisor（拦截中间件/撞名类错误）；文件后端 + 批准卡全链路（获批落盘 / 拒绝不落盘 / 空间内外读差异 / 超时按拒绝） |
-| `test/unit` | 批准卡握手机制（回填 / 超时 / 并发 / 无发送器保守放行） |
+| `test/smoke` | **无头冒烟**——用生产同款装配构建单 Agent 图（拦截中间件/撞名类错误）；文件后端 + 批准卡全链路（获批落盘 / 拒绝不落盘 / 空间内外读差异 / 超时按拒绝） |
+| `test/unit` | 批准卡握手机制（回填 / 超时 / 并发 / 无发送器保守放行）与**档位感知放行**（全权档放行 / 删除除外）、控制平面写保护、上下文治理（窗口/压缩/熔断）、产物识别、评测指标、**文献检索访问层**（多源合并去重 / 缓存 / 失败信息）、**交流语言注入**（热生效 / 前置 / 不污染入参） |
+| `test/eval` | **科研 Agent 评测集**——任务集 + 指标 + A/B 对比（详见 `test/eval/README.md`） |
 
 ### 网关能力探测（Gateway Probe）
 
@@ -245,6 +312,8 @@ const { method } = pickStructuredOutputMethod(caps)  // 传给 withStructuredOut
 ```
 
 优先级：`functionCalling` > `jsonMode` > `jsonSchema`（`json_schema` 即便可用也排最后，因在兼容网关上最脆弱）。
+
+**⚠️ 思考模式（thinking）必须避开 `tool_choice`**：DeepSeek 思考模式（`thinking:{type:'enabled'}`）**明确拒绝 `tool_choice`**（不论 `auto` / `required` / 具名函数），一律返回 `400 Thinking mode does not support this tool_choice`；而 LangChain 的 `withStructuredOutput(schema, { method: 'functionCalling' })` 恰恰会注入 `tool_choice`（强制调用该 schema 函数）。因此**思考开启时改走 `jsonMode`**（只发 `response_format: {type:'json_object'}`，不发 `tool_choice`）。统一由 `pickStructuredMethod(reasoningOn)` 选路（思考开 → `jsonMode`，思考关 → `functionCalling`），所有结构化调用点（技能路由 / Ultra 合议 / 能力域生成）都走它，不要硬编码 `method: 'functionCalling'`。
 
 ### Live 测试（打真实网关）
 
@@ -282,6 +351,7 @@ MIMIR_GW_URL=... MIMIR_GW_KEY=... MIMIR_GW_MODEL=... \
 ├── electron/                      # Electron 主进程
 │   ├── main.ts                    # 进程入口（mimir-pdf / mimir-tex / mimir-img 本地协议注册）
 │   ├── preload.ts                 # 预加载脚本（IPC 桥接）
+│   ├── safeUrl.ts                 # 外链协议白名单（仅 http(s)；窗口层与 IPC 层共用）
 │   ├── latex.ts                   # LaTeX 编译引擎（latexmk / Tectonic）与编译日志解析
 │   ├── latex/runtime.ts           # Tectonic 探测与官方 release 下载安装（内置引擎）
 │   ├── ipc/                       # IPC 处理器
@@ -293,29 +363,36 @@ MIMIR_GW_URL=... MIMIR_GW_KEY=... MIMIR_GW_MODEL=... \
 │   ├── servers/                   # 服务器（SSH / nvidia-smi / 终端）
 │   ├── speech/                    # 语音识别（SenseVoice / sherpa-onnx）
 │   ├── modelDiscovery.ts          # /v1/models 自动发现（URL 归一化 + 宽松解析）
-│   ├── agent/                     # DeepAgents 集成
-│   │   ├── agentService.ts        # Agent 服务
-│   │   ├── harness.ts             # HarnessAdapter 统一接口
-│   │   ├── harnessRegistry.ts     # Harness 注册表与激活切换
-│   │   ├── harnesses/             # 各 harness adapter（mimir / codex / claudeCode / pi）
-│   │   ├── subagentRegistry.ts    # 内置子代理注册（重建 Supervisor）
+│   ├── agent/                     # DeepAgents 集成（单 Agent + 能力域）
+│   │   ├── agentService.ts        # Agent 服务（单 Agent 装配 / 技能路由 / 主流程）
+│   │   ├── ultra.ts               # Ultra 增强控制器（生产与评测共用同一份实现）
+│   │   ├── agentText.ts           # 文本小工具（摘要截断 / 错误压缩）
+│   │   ├── capabilityDomains.ts   # 能力域目录（工具分组 + 使用纪律 + 子代理定义）
+│   │   ├── contextManager.ts      # 会话上下文治理（token 计量 / 分段摘要 / 熔断 / 归档）
+│   │   ├── controlPlane.ts        # 控制平面写保护（防 Agent 自我提权）
+│   │   ├── delegationFirewall.ts  # 限制委派嵌套深度（主 Agent 可委派、子代理不可再委派）
+│   │   ├── subagentResult.ts      # 工具结果消费纪律 + 执行纪律
+│   │   ├── artifactExtract.ts     # 工具返回中的落盘产物识别
+│   │   ├── embeddingRerank.ts     # 技能候选 embedding 精排
 │   │   ├── skillRouter.ts         # 技能分层路由
-│   │   ├── approval.ts            # 副作用批准卡
+│   │   ├── tokenizer.ts           # 真实 token 计数
+│   │   ├── approval.ts            # 副作用批准卡（Fail-Closed + 档位感知）
+│   │   ├── languageMiddleware.ts  # 交流语言每轮前置注入（改设置免重启）
+│   │   ├── paperSearch.ts         # 文献检索统一访问层（OpenAlex/S2/arXiv）
 │   │   ├── fsBackend.ts           # 真实磁盘文件后端（写/改/删前过批准卡）
 │   │   ├── gatewayProbe.ts        # 网关结构化输出能力探测
 │   │   ├── trace.ts               # Agent 轨迹日志
+│   │   ├── subagentRegistry.ts    # 兼容转发层（deprecated → capabilityDomains）
+│   │   ├── skills/                # 技能注册表
 │   │   └── tools/                 # Agent 工具
-│   └── plugins/                   # 外部 harness 集成（Phase 1）
-│       ├── bridge.ts              # 本地 HTTP 桥接（仅 127.0.0.1 + 确认头）
-│       ├── bridgeClient.ts        # 插件共用 HTTP 客户端
-│       ├── mcpServer.ts           # stdio MCP server（tools/list · tools/call）
-│       ├── codex-extension.ts     # Codex 插件入口
-│       └── claude-code-skill.ts   # Claude Code 插件入口
+│   └── plugins/                   # 本机只读协作
+│       └── bridge.ts              # 本地 HTTP 桥接（仅 127.0.0.1，只读）
 ├── test/                          # 测试（vitest，无需 Electron 运行时）
 │   ├── contract/                  # 工具名契约（防与内置撞名）
 │   ├── gateway/                   # 网关能力探测（离线判定 + live 矩阵）
 │   ├── smoke/                     # 无头冒烟（构建图 / 批准卡全链路 / live agent）
-│   ├── unit/                      # 单元测试（批准卡握手）
+│   ├── unit/                      # 单元测试（批准卡握手 / 上下文治理 / 产物识别）
+│   ├── eval/                      # 科研 Agent 评测集（任务集 / 指标 / A-B 对比）
 │   └── stubs/                     # electron / electron-store / store 测试桩
 ├── src/
 │   ├── renderer/                  # 渲染进程（React 应用）

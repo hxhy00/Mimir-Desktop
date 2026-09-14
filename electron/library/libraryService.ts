@@ -88,9 +88,17 @@ export async function searchArxiv(
   if (!Number.isSafeInteger(maxResults) || maxResults < 1 || maxResults > ARXIV_SEARCH_MAX_RESULTS) {
     throw new Error(`maxResults must be an integer between 1 and ${ARXIV_SEARCH_MAX_RESULTS}`)
   }
-  return fetchArxivSearch(q, maxResults, AbortSignal.timeout(ARXIV_FETCH_TIMEOUT_MS), {
-    sortBySubmittedDate: sortBy === 'submittedDate',
-  })
+  // 「按最新提交」只有 arXiv 支持（OpenAlex 无该排序），保持原路径；
+  // 默认相关度检索走统一访问层：OpenAlex 主源 + arXiv 补充，免 3 秒/次的排队体感。
+  if (sortBy === 'submittedDate') {
+    return fetchArxivSearch(q, maxResults, AbortSignal.timeout(ARXIV_FETCH_TIMEOUT_MS), {
+      sortBySubmittedDate: true,
+    })
+  }
+  const { searchPapers } = await import('../agent/paperSearch')
+  return searchPapers(q, maxResults, (queryText, n) =>
+    fetchArxivSearch(queryText, n, AbortSignal.timeout(ARXIV_FETCH_TIMEOUT_MS)),
+  )
 }
 
 /** 导入一篇论文（幂等 upsert：重新导入刷新元数据但保留笔记/标签/项目/评分） */
@@ -110,6 +118,7 @@ export async function importPaper(entry: ArxivEntry, projectId?: string): Promis
     authors: [...entry.authors],
     summary: entry.summary,
     url: entry.url === '' ? `https://arxiv.org/abs/${arxivId}` : entry.url,
+    ...(entry.source !== undefined ? { source: entry.source } : existing?.source !== undefined ? { source: existing.source } : {}),
     notes: existing?.notes ?? '',
     tags: [...(existing?.tags ?? [])],
     projectIds: [...new Set([
@@ -182,12 +191,15 @@ export async function updatePaper(request: {
   return next
 }
 
-/** 下载一篇论文的 arXiv PDF 到空间 papers 目录并更新记录 */
+/** 下载一篇论文的 PDF 到空间 papers 目录并更新记录（仅 arXiv id 可下载；DOI 条目请先在网页端获取） */
 export async function fetchPaperPdf(arxivId: string): Promise<PaperRecord> {
   const epoch = currentSpaceEpoch()
   const table = papersTable()
   const existing = table[arxivId]
   if (existing === undefined) throw new Error(`paper-not-found: ${arxivId}`)
+  if (arxivId.startsWith('doi:') || /^10\./.test(arxivId)) {
+    throw new Error('该论文不是 arXiv 预印本，暂不支持直接下载 PDF。')
+  }
   const bytes = await fetchArxivPdf(arxivId, AbortSignal.timeout(ARXIV_PDF_FETCH_TIMEOUT_MS))
   // 下载期间用户可能切换了科研空间：写盘与写回前校验，避免把旧空间数据写进新空间
   assertSpaceUnchanged(epoch)

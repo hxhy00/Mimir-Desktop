@@ -3,6 +3,7 @@ import { Button } from '@/components/ui/button'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Square, Plus, Mic, MicOff, Bot, ArrowUp, X, Paperclip, Loader2, Command } from 'lucide-react'
 import { cn } from '@/lib/utils'
+import { isImeComposing, isSubmitEnter } from '@/lib/keyboard'
 import { filterSlashEntries, SLASH_ENTRIES } from '@/lib/slash'
 import type { SlashEntry } from '@/lib/slash/types'
 import {
@@ -523,6 +524,9 @@ export function ChatInput({ onSend, onModelChange, onStop, entries, disabled, is
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
+      // 输入法组合中（中文/日文等）的回车属于「确认候选词」，不能当成发送。
+      // 斜杠菜单的 ↑↓/Enter 补全同理 —— 打 `/su` 时按回车选字不该补全技能。
+      if (isImeComposing(e)) return
       const menu = slash
       if (menu !== null && menu.items.length > 0) {
         if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
@@ -543,7 +547,7 @@ export function ChatInput({ onSend, onModelChange, onStop, entries, disabled, is
           return
         }
       }
-      if (e.key === 'Enter' && !e.shiftKey) {
+      if (isSubmitEnter(e)) {
         e.preventDefault()
         handleSubmit()
         return
@@ -806,7 +810,7 @@ export function ChatInput({ onSend, onModelChange, onStop, entries, disabled, is
         <p className="mt-1.5 text-center text-[10px] text-muted-foreground/60">
           {ultraEnabled
             ? `Ultra 增强已开启 · 策略：${ultraStrategyLabel ?? '自动选择'} · Mimir 可能出错，请核查重要信息`
-            : 'Supervisor 编排 · Mimir 可能出错，请核查重要信息'}
+            : 'Agent 编排 · Mimir 可能出错，请核查重要信息'}
         </p>
       </form>
 

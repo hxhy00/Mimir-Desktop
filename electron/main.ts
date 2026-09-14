@@ -3,13 +3,16 @@ import { join, dirname } from 'path'
 import { fileURLToPath, pathToFileURL } from 'url'
 import { is } from '@electron-toolkit/utils'
 import { setupIpcHandlers } from './ipc'
-import { agentService } from './agent/agentService'
+import { agentService, stopAllAgentTasks } from './agent/agentService'
 import { isLatexPdfAllowed } from './latex'
 import { existsSync } from 'fs'
 import { paperPdfFileName } from './library/arxiv'
 import { figureFilePath } from './figures/figuresService'
 import { loadStore, getStoreValue, spaceRoot } from './library/store'
 import { startVenueDeadlineLoop } from './venues/venuesService'
+import { setTokenCounter } from './agent/contextManager'
+import { countTokensCached } from './agent/tokenizer'
+import { isSafeExternalUrl } from './safeUrl'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 
@@ -46,8 +49,11 @@ async function initAgentFromSettings(): Promise<void> {
     try {
       await agentService.initialize({
         apiKey: selected.apiKey as string,
-        model: (selected.modelId as string) || 'deepseek-chat',
-        baseUrl: selected.baseUrl as string | undefined
+        // 兜底模型名与 ipc/index.ts 保持一致：`deepseek-chat` 已退役。
+        model: (selected.modelId as string) || 'deepseek-flash',
+        baseUrl: selected.baseUrl as string | undefined,
+        // 模型设置里的「支持推理」显式开关；未设置时由 autoReasoningFor(baseUrl) 兜底。
+        reasoning: selected.supportsReasoning as boolean | undefined
       })
       console.log('Agent 已从保存的设置初始化')
     } catch (error) {
@@ -79,6 +85,8 @@ function createWindow(): void {
   windowRef.current = mainWindow
 
   mainWindow.on('closed', () => {
+    // 窗口销毁后其 IPC 目标已失效：中止该窗口名下所有会话的后台任务，避免残留任务空转写事件
+    stopAllAgentTasks()
     if (windowRef.current === mainWindow) windowRef.current = null
     mainWindow = null
   })
@@ -88,7 +96,14 @@ function createWindow(): void {
   })
 
   mainWindow.webContents.setWindowOpenHandler((details) => {
-    shell.openExternal(details.url)
+    // 只放行 http(s)：`shell.openExternal` 会把任意 scheme 交给操作系统处理，
+    // `file:` / 自定义 scheme 都可能在系统侧产生副作用。链接可能来自模型返回的
+    // Markdown（渲染层渲染），因此必须与 `shell:openExternal` IPC 用同一套白名单。
+    if (isSafeExternalUrl(details.url)) {
+      void shell.openExternal(details.url)
+    } else {
+      console.warn('[window] 拒绝打开非 http(s) 链接：', details.url)
+    }
     return { action: 'deny' }
   })
 
@@ -165,6 +180,12 @@ app.whenReady().then(async () => {
   // 装载全局 store（首次会迁移旧版 userData/store.json → ~/.mimir/），
   // 并完成默认科研空间注册 / 恢复上次激活的空间
   loadStore()
+
+  // 上下文治理的 token 计数接缝：把真实 tokenizer 注入 contextManager（见 agent/contextManager.ts）。
+  // 在进程启动时一次性注入，而不是在 Agent 初始化时——因为治理在「Agent 未初始化」时也可能被调用，
+  // 且 token 口径属于进程级约定，不该随模型配置反复切换（countTokens 自身按模型名选词表）。
+  // 用带 LRU 的版本：历史文本每轮都会被重复计数，缓存能省下热路径上的 BPE 开销。
+  setTokenCounter(countTokensCached)
 
   // 会议截稿：首刷延迟 2s，之后每 6h 自动刷新
   startVenueDeadlineLoop()

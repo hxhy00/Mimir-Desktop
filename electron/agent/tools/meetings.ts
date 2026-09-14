@@ -6,7 +6,7 @@
 import { tool } from 'langchain/tools'
 import { z } from 'zod'
 import { generateMeetingDeck, listMeetingDecks } from '../../meetings/service'
-import { requireUserApproval } from '../approval'
+import { requireBusinessApproval } from '../approval'
 
 export const meetingDeckTool = tool(
   async ({ action, title, presenter, date, projectId, paperIds, experimentIds, enhance, aiImages }) => {
@@ -24,7 +24,7 @@ export const meetingDeckTool = tool(
       if (action === 'generate') {
         if (!title || title.trim() === '') return '生成失败：title（汇报主题）不能为空。'
         // 副作用确认：真实生成 .pptx（可长耗时）需用户放行
-        const allowed = await requireUserApproval({
+        const allowed = await requireBusinessApproval({
           tool: 'meeting_deck',
           summary: `生成组会演示文稿「${title.trim()}」`,
           detail: `汇报人：${presenter ?? '未填'}；日期：${date ?? '今天'}；论文 ${(paperIds ?? []).length} 篇、实验 ${(experimentIds ?? []).length} 条；${enhance !== false ? '启用 AI 要点提炼（无模型自动降级）' : '关闭 AI 要点'}${aiImages === true ? '；启用 AI 配图' : ''}。生成可能耗时数十秒到数分钟。`,

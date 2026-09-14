@@ -6,7 +6,7 @@ import { BrainCircuit, Save, Check } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
 /** 长期记忆档案（Mimir Agent 治理 Phase 3）：全局存储于 settings.memoryProfile，
- *  默认不注入每轮 prompt，仅当任务相关时由 Supervisor 通过 load_memory 按需读取。 */
+ *  默认不注入每轮 prompt，仅当任务相关时由 Agent 通过 load_memory 工具按需读取。 */
 interface MemoryProfile {
   researchFocus: string
   constraints: string
@@ -88,7 +88,7 @@ export function SettingsMemoryCard() {
       </div>
       <p className="text-[11px] text-muted-foreground">
         记录你的长期研究方向与偏好。档案<b className="text-foreground/80">默认不注入每一轮对话</b>；
-        仅当任务与这些内容相关时，Supervisor 才会通过 <code className="rounded bg-muted px-1 font-mono text-[10px]">load_memory</code>{' '}
+        仅当任务与这些内容相关时，Agent 才会通过 <code className="rounded bg-muted px-1 font-mono text-[10px]">load_memory</code>{' '}
         按需读取。内容仅存本机，不会从对话自动写入。
       </p>
 

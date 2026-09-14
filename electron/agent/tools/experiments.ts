@@ -6,7 +6,7 @@
 import { tool } from 'langchain/tools'
 import { z } from 'zod'
 import { getStoreValue, setStoreValue, currentSpaceEpoch, assertSpaceUnchanged } from '../../library/store'
-import { requireUserApproval } from '../approval'
+import { requireBusinessApproval } from '../approval'
 
 export type ExperimentStatus = 'running' | 'success' | 'failed'
 
@@ -84,7 +84,7 @@ export const experimentTool = tool(
         }
       })()
       if (confirm !== null) {
-        const allowed = await requireUserApproval({ tool: 'experiment', summary: confirm.summary, detail: confirm.detail })
+        const allowed = await requireBusinessApproval({ tool: 'experiment', summary: confirm.summary, detail: confirm.detail })
         if (!allowed) return '已取消：该实验操作未获得用户确认（或等待超时）。请先向用户说明并再次发起。'
       }
 

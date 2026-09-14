@@ -5,7 +5,7 @@
 import { tool } from 'langchain/tools'
 import { z } from 'zod'
 import { getStoreValue, setStoreValue, currentSpaceEpoch, assertSpaceUnchanged } from '../../library/store'
-import { requireUserApproval } from '../approval'
+import { requireBusinessApproval } from '../approval'
 
 const LEDGER_KEY = 'ledger:entries'
 
@@ -59,7 +59,7 @@ export const ledgerTool = tool(
             ? { summary: `删除成长记录 id=${id ?? ''}`, detail: '删除不可撤销。' }
             : null
       if (confirm !== null) {
-        const allowed = await requireUserApproval({ tool: 'ledger', summary: confirm.summary, detail: confirm.detail })
+        const allowed = await requireBusinessApproval({ tool: 'ledger', summary: confirm.summary, detail: confirm.detail })
         if (!allowed) return '已取消：该记录操作未获得用户确认（或等待超时）。请先向用户说明并再次发起。'
       }
 

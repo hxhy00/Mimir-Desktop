@@ -23,9 +23,15 @@ interface ElectronAPI {
     options?: {
       ultra?: {
         enabled: boolean
-        strategy?: 'auto' | 'plain' | 'multi_expert' | 'critique_reflect' | 'hybrid_mix' | 'self_consistency_vote'
+        strategy?: 'auto' | 'multi_expert' | 'critique_reflect' | 'hybrid_mix' | 'self_consistency_vote'
       }
+      /**
+       * 本会话历史**原文**（仅 user/assistant 纯文本）。滑动窗口、分段摘要压缩、熔断降级、
+       * 失效对象提醒、压缩后能力声明均由主进程 contextManager 统一处理。
+       */
       history?: { role: 'user' | 'assistant'; content: string }[]
+      /** 当前 slash 目录（技能/指令）触发词与标题，供压缩后重建能力声明。 */
+      skills?: { trigger: string; title: string }[]
       manual?: boolean
     }
   ) => Promise<string>
@@ -34,15 +40,31 @@ interface ElectronAPI {
     summary?: string
     message?: string
   }>
-  stopMessage: () => Promise<boolean>
-  /** 「插件 → 子代理」只读目录：工具白名单 + 内置子代理元数据（展示 / 克隆用）。 */
+  /**
+   * 重置某会话的上下文治理状态（清失效提醒与压缩熔断计数；`/clear` 时调用）。
+   * @param includeArchive 连归档原文一并清除（删除会话时传 true）。
+   */
+  resetConversationContext: (conversationId: string, includeArchive?: boolean) => Promise<boolean>
+  /** 停止生成；传入会话 id 则只停该会话（多会话并行时避免误停其它会话）。 */
+  stopMessage: (conversationId?: string) => Promise<boolean>
+  /** 当前在跑的会话任务 id 列表（侧栏「后台任务」态）。 */
+  getRunningTasks: () => Promise<string[]>
+  /** 「插件 → 能力域」只读目录：工具白名单 + 内置能力域元数据（展示 / 克隆用）。 */
   getSubagentCatalog: () => Promise<{
     tools: { id: string; label: string; description: string }[]
-    builtin: { id: string; label: string; description: string; systemPrompt: string; toolIds: string[] }[]
+    builtin: {
+      id: string
+      label: string
+      /** 职业岗位名（委派身份），如「研究员」「运维工程师」。 */
+      role: string
+      description: string
+      systemPrompt: string
+      toolIds: string[]
+    }[]
   }>
-  /** 按最新子代理注册重新初始化 Agent（增删改查后免重启生效）。 */
+  /** 按最新能力域配置重新初始化 Agent（增删改查后免重启生效）。 */
   reloadAgent: () => Promise<{ ok: boolean; message: string }>
-  /** 一句话职责描述 → AI 生成自定义子代理草稿（name/说明/提示词/工具白名单）。 */
+  /** 一句话职责描述 → AI 生成自定义能力域草稿（name/说明/提示词/工具白名单）。 */
   generateSubagent: (
     prompt: string,
     takenNames: string[]
@@ -95,6 +117,10 @@ interface ElectronAPI {
   fetchPaper: (id: string) => Promise<unknown>
   downloadPdf: (id: string) => Promise<unknown>
   openPath: (path: string) => Promise<void>
+  /** 在系统文件管理器中定位到该文件（对话内产物「打开所在文件夹」）。 */
+  revealPath: (path: string) => Promise<void>
+  /** 用系统浏览器打开 http(s) 外链（执行过程里的来源链接）。其它协议一律拒绝。 */
+  openExternal: (url: string) => Promise<boolean>
   createTerminal: (
     id: string,
     options?: { cols?: number; rows?: number; ssh?: { host: string; port: number; user: string; keyPath?: string } }
@@ -112,9 +138,41 @@ interface ElectronAPI {
     gpus: { name: string; utilizationPct: number; memoryUsedMb: number; memoryTotalMb: number }[]
   }>
 
-  // Agent 副作用确认
+  // Agent 副作用确认（三态：拒绝 / 允许一次 / 允许并记住）
   onApprovalRequest: (callback: (request: { id: string; tool: string; summary: string; detail?: string; source?: { origin: 'main' | 'subagent'; subagentId?: string; subagentLabel?: string } }) => void) => () => void
-  approvalRespond: (id: string, allow: boolean) => Promise<boolean>
+  /** `remember=true` 表示「允许并记住」：主进程会把这一次放行升级为这一类允许（如记住该目录）。 */
+  approvalRespond: (id: string, allow: boolean, remember?: boolean) => Promise<boolean>
+
+  // 权限与安全（沙箱档位 + 已记住目录 + 审计日志）
+  permissions: {
+    get: () => Promise<{
+      policy: {
+        sandbox: 'read-only' | 'workspace-write' | 'danger-full-access'
+        askInsideSpace: boolean
+        allowedWriteRoots: string[]
+        allowedReadRoots: string[]
+      }
+      audit: {
+        at: string
+        action: 'read' | 'write'
+        target: string
+        decision: 'allow' | 'deny' | 'ask'
+        resolved?: 'allow' | 'deny' | 'remember'
+      }[]
+      spaceRoot: string
+      home: string
+    }>
+    set: (patch: Record<string, unknown>) => Promise<unknown>
+    allowRoot: (dir: string, action: 'read' | 'write') => Promise<{ ok: boolean; message: string }>
+    revokeRoot: (dir: string) => Promise<{ ok: boolean; message: string }>
+    audit: () => Promise<{
+      at: string
+      action: 'read' | 'write'
+      target: string
+      decision: 'allow' | 'deny' | 'ask'
+      resolved?: 'allow' | 'deny' | 'remember'
+    }[]>
+  }
   library: {
     listPapers: () => Promise<{ ok: boolean; papers?: unknown[]; message?: string }>
     searchArxiv: (query: string, maxResults?: number, sortBy?: 'relevance' | 'submittedDate') => Promise<{ ok: boolean; entries?: unknown[]; message?: string }>

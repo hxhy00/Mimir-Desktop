@@ -11,6 +11,9 @@ export default defineConfig({
   test: {
     environment: 'node',
     include: ['test/**/*.test.ts'],
+    // 每个用例后清空内存 store / 解绑批准通道：切断「全权档等策略泄漏到后续文件」
+    // 导致的「单文件跑绿、全量跑红」（见 test/setup/resetState.ts 的说明）。
+    setupFiles: ['test/setup/resetState.ts'],
     // 网关矩阵 / 冒烟测试要打真实网络，给足超时
     testTimeout: 60_000,
     hookTimeout: 30_000,

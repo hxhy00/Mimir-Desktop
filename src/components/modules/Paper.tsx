@@ -47,6 +47,7 @@ import {
   LayoutTemplate
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
+import { isSubmitEnter } from '@/lib/keyboard'
 
 /** store 中「最近项目」列表的键。 */
 const RECENT_KEY = 'paper.recentProjects'
@@ -996,7 +997,7 @@ export function Paper({ rightSidebarCollapsed, onToggleRightSidebar, sidebarColl
               value={projectName}
               onChange={(e) => setProjectName(e.target.value.replace(INVALID_NAME_CHARS, '_'))}
               onKeyDown={(e) => {
-                if (e.key === 'Enter') void confirmCreateProject()
+                if (isSubmitEnter(e)) void confirmCreateProject()
               }}
               placeholder="my-paper"
             />
@@ -1034,7 +1035,7 @@ export function Paper({ rightSidebarCollapsed, onToggleRightSidebar, sidebarColl
               value={fileName}
               onChange={(e) => setFileName(e.target.value)}
               onKeyDown={(e) => {
-                if (e.key === 'Enter') void confirmCreateFile()
+                if (isSubmitEnter(e)) void confirmCreateFile()
               }}
               placeholder="chapters/intro.tex"
             />

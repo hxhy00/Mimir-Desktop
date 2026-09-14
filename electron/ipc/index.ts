@@ -2,11 +2,13 @@ import { BrowserWindow, ipcMain, dialog, shell } from 'electron'
 import { readFile, writeFile, readdir } from 'fs/promises'
 import { readFileSync } from 'fs'
 import { app } from 'electron'
-import { join, basename, extname, dirname, relative } from 'path'
+import { join, basename, extname, dirname, relative, resolve } from 'path'
 import { existsSync, mkdirSync } from 'fs'
 import { agentService } from '../agent/agentService'
+import { isSafeExternalUrl } from '../safeUrl'
 import { startBridge, stopBridge, isBridgeRunning, getBridgePort, getConfirmToken } from '../plugins/bridge'
 import { setApprovalSender, settleApproval } from '../agent/approval'
+import { permissionsService } from '../agent/permissionService'
 import { probeServer, type ProbeConfig } from '../servers/probe'
 import { compileLatex, registerLatexPdfDir } from '../latex'
 import {
@@ -116,6 +118,59 @@ const ARXIV_PDF_DOWNLOAD_TIMEOUT_MS = 60_000
 /** Agent 过程事件信封前缀（与渲染层 ChatView 保持一致），经文本 chunk 通道随流发送。 */
 const AGENT_EVENT_PREFIX = '\u0002MIMIR_AGENT_EVENT\u0002'
 
+/**
+ * 用户在原生文件对话框里**显式选中**过的文件（绝对路径）。
+ *
+ * `fs:readFile` 是渲染层唯一能读任意文本的通道（附件解析用）。若无边界，任何被注入的
+ * 渲染内容都能借它读走整块磁盘 —— 与 Agent 侧 fsBackend 的权限矩阵形成两条口径不一的
+ * 旁路。这里改为**白名单**：只有用户自己在对话框里点过的文件才可读。
+ *
+ * 用 `Set` 而非持久化：选择是本次会话的行为，关窗即失效，避免长期漂开放大攻击面。
+ */
+const pickedFiles = new Set<string>()
+
+/**
+ * 校验渲染层文件通道的目标路径（`fs:readFile` / `fs:readImageDataUrl` / `fs:writeFile`）。
+ *
+ * - 读：放行「用户经原生对话框显式选择过」的文件（见 {@link pickedFiles}），
+ *   或**用户已保存进设置的工作台背景图**（跨重启仍然有效，否则重启后背景图读取会被误拒）；
+ * - 写：仅放行科研空间根目录内（渲染层的 `fs:writeFile` 当前无调用方，
+ *   保留通道但把边界收到与 Agent 侧一致）。
+ *
+ * @throws 越界时抛错（IPC invoke 会把错误回传渲染层，调用方已在 try/catch 内）。
+ */
+function assertRendererFilePath(input: unknown, mode: 'read' | 'write' = 'read'): string {
+  if (typeof input !== 'string' || input.trim() === '') throw new Error('无效路径')
+  const target = resolve(input)
+  if (mode === 'read') {
+    if (pickedFiles.has(target) || target === resolveWallpaperPath()) return target
+    throw new Error('已拒绝：仅允许读取你在文件对话框中主动选择的文件。')
+  }
+  const root = resolve(spaceRoot())
+  if (target !== root && !target.startsWith(root.endsWith('/') ? root : `${root}/`)) {
+    throw new Error('已拒绝：写入目标必须位于当前科研空间内。')
+  }
+  return target
+}
+
+/**
+ * 用户已保存的工作台背景图路径（settings.wallpaper.path），无则返回空串。
+ *
+ * 背景图在「设置」里选择后落盘，**下次启动**仍要从磁盘读回；此时用户当次会话并未经过
+ * 文件对话框，单纯的内存白名单会把它误拒。因此把「用户已显式保存的这张图」视为授权路径。
+ */
+function resolveWallpaperPath(): string {
+  try {
+    const settings = getStoreValue<Record<string, unknown>>('settings')
+    const wp = settings?.wallpaper
+    if (wp === null || typeof wp !== 'object') return ''
+    const p = (wp as { path?: unknown }).path
+    return typeof p === 'string' && p !== '' ? resolve(p) : ''
+  } catch {
+    return ''
+  }
+}
+
 export function setupIpcHandlers(winRef: { current: BrowserWindow | null }): void {
   loadStore()
 
@@ -131,10 +186,20 @@ export function setupIpcHandlers(winRef: { current: BrowserWindow | null }): voi
   setApprovalSender((request) => {
     winSend('agent:approval-request', request)
   })
-  ipcMain.handle('agent:approval-respond', (_event, id: string, allow: boolean) => {
-    settleApproval(id, allow === true)
+  ipcMain.handle('agent:approval-respond', (_event, id: string, allow: boolean, remember?: boolean) => {
+    // 三态：拒绝 / 允许一次 / 允许并记住（remember 由调用方落成策略，如「记住该目录」）。
+    settleApproval(id, allow === true, remember === true)
     return true
   })
+
+  // ── 权限策略（沙箱档位 + 已记住目录）────────────────────────────
+  ipcMain.handle('permissions:get', () => permissionsService.get())
+  ipcMain.handle('permissions:set', (_event, patch: unknown) => permissionsService.set(patch))
+  ipcMain.handle('permissions:allowRoot', (_event, dir: string, action: 'read' | 'write') =>
+    permissionsService.allowRoot(dir, action === 'read' ? 'read' : 'write')
+  )
+  ipcMain.handle('permissions:revokeRoot', (_event, dir: string) => permissionsService.revokeRoot(dir))
+  ipcMain.handle('permissions:audit', () => permissionsService.readAudit())
 
   // App info
   ipcMain.handle('app:getVersion', () => {
@@ -226,8 +291,13 @@ export function setupIpcHandlers(winRef: { current: BrowserWindow | null }): voi
       try {
         await agentService.initialize({
           apiKey: selected.apiKey as string,
-          model: (selected.modelId as string) || 'deepseek-chat',
-          baseUrl: selected.baseUrl as string | undefined
+          // 兜底模型名用官方现行名：`deepseek-chat` 已退役，传入会被官方端点判为
+          // invalid_request_error（实测："supported API model names are deepseek-flash,
+          // deepseek-v4-pro"）。
+          model: (selected.modelId as string) || 'deepseek-flash',
+          baseUrl: selected.baseUrl as string | undefined,
+          // 思考模式：优先用模型设置里的显式开关；未设置时由 autoReasoningFor(baseUrl) 兜底。
+          reasoning: selected.supportsReasoning as boolean | undefined
         })
       } catch (error) {
         console.error('Agent 初始化失败:', error)
@@ -279,7 +349,12 @@ export function setupIpcHandlers(winRef: { current: BrowserWindow | null }): voi
   // Dialog
   ipcMain.handle('dialog:open', async (_event, options) => {
     const win = winRef.current
-    return win === null ? dialog.showOpenDialog(options) : dialog.showOpenDialog(win, options)
+    const result = win === null ? await dialog.showOpenDialog(options) : await dialog.showOpenDialog(win, options)
+    // 记住用户显式选择的文件：它们是 `fs:readFile` 白名单的唯一来源（见 assertRendererFilePath）。
+    if (!result.canceled) {
+      for (const p of result.filePaths) pickedFiles.add(resolve(p))
+    }
+    return result
   })
 
   ipcMain.handle('dialog:save', async (_event, options) => {
@@ -289,18 +364,43 @@ export function setupIpcHandlers(winRef: { current: BrowserWindow | null }): voi
 
   // Shell
   ipcMain.handle('shell:openPath', async (_event, path: string) => {
+    if (typeof path !== 'string' || path === '') return '无效路径'
     return shell.openPath(path)
+  })
+
+  /**
+   * 用系统浏览器打开外链（执行过程里的来源链接：arXiv / 论文页 / 网页）。
+   *
+   * ⚠️ **只放行 http(s)**：`shell.openExternal` 会把任意 scheme 交给操作系统处理，
+   * 而 `file:` / 自定义 scheme / `javascript:` 都可能在系统侧产生副作用。
+   * 链接内容来自工具返回（模型可影响），因此必须在这里做白名单，而不是只在渲染层判。
+   */
+  ipcMain.handle('shell:openExternal', async (_event, url: string) => {
+    // 白名单与窗口层 setWindowOpenHandler 共用同一实现（electron/main.ts），避免两处口径漂移。
+    if (!isSafeExternalUrl(url)) {
+      console.warn('[shell] 拒绝打开非 http(s) 链接：', url)
+      return false
+    }
+    await shell.openExternal(new URL(url).toString())
+    return true
+  })
+
+  // 在系统文件管理器中定位到文件（对话内产物「打开所在文件夹」）
+  ipcMain.handle('shell:revealPath', async (_event, path: string) => {
+    if (typeof path !== 'string' || path === '' || !existsSync(path)) return
+    shell.showItemInFolder(path)
   })
 
   // File system
   ipcMain.handle('fs:readFile', async (_event, path: string) => {
-    return readFile(path, 'utf-8')
+    return readFile(assertRendererFilePath(path), 'utf-8')
   })
 
   ipcMain.handle('fs:writeFile', async (_event, path: string, content: string) => {
-    const dir = join(path, '..')
+    const target = assertRendererFilePath(path)
+    const dir = dirname(target)
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
-    return writeFile(path, content, 'utf-8')
+    return writeFile(target, content, 'utf-8')
   })
 
   // 背景图等本地图片 → dataURL（渲染进程可直接作为 <img>/背景引用）
@@ -316,10 +416,13 @@ export function setupIpcHandlers(winRef: { current: BrowserWindow | null }): voi
   }
   ipcMain.handle('fs:readImageDataUrl', async (_event, filePath: string) => {
     try {
-      const ext = extname(filePath).replace(/^\./, '').toLowerCase()
+      // 与 fs:readFile 同一边界：只允许用户经原生对话框主动选中的图片。
+      // 此前仅按扩展名放行，任意路径的图片都能被读出 dataURL —— 同一类旁路（见 assertRendererFilePath）。
+      const target = assertRendererFilePath(filePath)
+      const ext = extname(target).replace(/^\./, '').toLowerCase()
       const mime = IMAGE_MIME_BY_EXT[ext]
       if (!mime) return { ok: false, message: '仅支持图片文件（png/jpg/webp/gif/bmp/svg/avif）' }
-      const data = readFileSync(filePath)
+      const data = readFileSync(target)
       return { ok: true, dataUrl: `data:${mime};base64,${data.toString('base64')}` }
     } catch (error) {
       return { ok: false, message: error instanceof Error ? error.message : '读取图片失败' }
@@ -506,12 +609,17 @@ export function setupIpcHandlers(winRef: { current: BrowserWindow | null }): voi
   })
 
   // Agent
-  ipcMain.handle('agent:stop', () => {
-    agentService.stopStreaming()
+  ipcMain.handle('agent:stop', (_event, conversationId?: string) => {
+    // 指定会话则只停该会话；缺省停全部（兼容旧调用）
+    agentService.stopStreaming(typeof conversationId === 'string' ? conversationId : undefined)
     return true
   })
 
-  // 会话历史摘要压缩（治理 Phase 1：渲染层发送前对超出滑动窗口的旧轮做结构化摘要）
+  // 当前在跑的会话任务列表（渲染层侧栏「后台任务」态；多会话并行的可见性来源）
+  ipcMain.handle('agent:runningTasks', () => agentService.runningConversationIds())
+
+  // 会话历史摘要压缩：上下文治理已下沉主进程（见 agent/contextManager.ts），治理路径内部
+  // 直接调用 agentService.compressHistory；此通道保留为独立能力（如未来的手动压缩入口）。
   ipcMain.handle(
     'agent:compress',
     async (_event, history: { role: 'user' | 'assistant'; content: string }[]) => {
@@ -530,6 +638,15 @@ export function setupIpcHandlers(winRef: { current: BrowserWindow | null }): voi
     }
   )
 
+  // 重置某会话的上下文治理状态（清失效提醒与压缩熔断计数）；
+  // includeArchive=true 时连归档原文一并清除（删除会话时用）。
+  ipcMain.handle('agent:resetContext', (_event, conversationId: string, includeArchive?: boolean) => {
+    if (typeof conversationId === 'string' && conversationId !== '') {
+      agentService.resetConversationContext(conversationId, includeArchive === true)
+    }
+    return true
+  })
+
   ipcMain.handle(
     'agent:sendMessage',
     async (
@@ -537,8 +654,11 @@ export function setupIpcHandlers(winRef: { current: BrowserWindow | null }): voi
       message: string,
       conversationId: string,
       options?: {
-        ultra?: { enabled: boolean; strategy?: 'auto' | 'plain' | 'multi_expert' | 'critique_reflect' | 'hybrid_mix' | 'self_consistency_vote' }
+        ultra?: { enabled: boolean; strategy?: 'auto' | 'multi_expert' | 'critique_reflect' | 'hybrid_mix' | 'self_consistency_vote' }
+        /** 本会话历史**原文**；治理（窗口/压缩/熔断/失效提醒）由主进程完成。 */
         history?: { role: 'user' | 'assistant'; content: string }[]
+        /** 渲染层 slash 目录（技能/指令）触发词与标题，供压缩后重建能力声明。 */
+        skills?: { trigger: string; title: string }[]
         manual?: boolean
       }
     ) => {

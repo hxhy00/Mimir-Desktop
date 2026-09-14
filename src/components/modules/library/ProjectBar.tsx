@@ -3,6 +3,7 @@ import { FolderPlus, Folder, Pencil, Trash2, Check, X, FolderOpen } from 'lucide
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { cn } from '@/lib/utils'
+import { isSubmitEnter } from '@/lib/keyboard'
 import type { ProjectRecord } from './types'
 
 interface ProjectBarProps {
@@ -83,7 +84,7 @@ export function ProjectBar({
                 value={renameTitle}
                 onChange={(e) => setRenameTitle(e.target.value)}
                 onKeyDown={(e) => {
-                  if (e.key === 'Enter') submitRename()
+                  if (isSubmitEnter(e)) submitRename()
                   if (e.key === 'Escape') setRenamingId(null)
                 }}
                 className="h-6 w-28 text-[11px] px-1.5"
@@ -140,7 +141,7 @@ export function ProjectBar({
             value={newTitle}
             onChange={(e) => setNewTitle(e.target.value)}
             onKeyDown={(e) => {
-              if (e.key === 'Enter') submitCreate()
+              if (isSubmitEnter(e)) submitCreate()
               if (e.key === 'Escape') setCreating(false)
             }}
             placeholder="项目名称"

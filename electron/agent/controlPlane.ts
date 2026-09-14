@@ -4,7 +4,7 @@
  * 问题：Agent 拥有真实磁盘读写（`MimirFsBackend` → `FilesystemBackend(virtualMode:false)`）。
  * 若不加约束，它可以改写宿主的**配置与能力定义**，实现「自我提权」：
  *   - 改 `settings`（模型/网关/批准相关配置）→ 绕过后续策略；
- *   - 改 `plugins:subagents`（子代理定义、工具白名单）→ 给自己新增工具；
+ *   - 改 `plugins:subagents`（能力域定义、工具白名单）→ 给自己新增工具；
  *   - 改技能目录 / 记忆档案 → 篡改自身行为指令。
  * 这类写入必须被**硬拒绝**（不是弹卡让用户选——用户无法审查隐藏的提权后果），
  * 且与用户从 UI 主动修改设置是两条路径：UI 走 IPC，不经此守卫。
@@ -52,7 +52,7 @@ export function isControlPlanePath(target: string): boolean {
 /** 控制平面提示文案（写入被拒时回给 Agent，说明原因与正确路径）。 */
 export function controlPlaneRejectMessage(target: string): string {
   return (
-    `已拒绝：${target} 属于 Mimir 的配置/能力控制平面（settings、子代理与技能定义、运行时凭据），` +
+    `已拒绝：${target} 属于 Mimir 的配置/能力控制平面（settings、能力域与技能定义、运行时凭据），` +
     '应用层不允许 Agent 直接改写——这属于自我提权，会绕过用户审查。' +
     '如需修改，请告知用户在「设置 / 插件」界面中操作。'
   )

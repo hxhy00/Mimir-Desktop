@@ -17,7 +17,7 @@ import {
   type FigureRecord,
 } from '../../figures/figuresService'
 import { getStoreValue } from '../../library/store'
-import { requireUserApproval } from '../approval'
+import { requireBusinessApproval } from '../approval'
 
 const PROJECTS_KEY = 'library:projects'
 
@@ -66,7 +66,7 @@ export const figureTool = tool(
               ? { summary: `删除图片 ${fileName ?? ''}`, detail: '删除不可撤销；若论文 .tex 仍引用它会编译报缺图。' }
               : null
       if (confirm !== null) {
-        const allowed = await requireUserApproval({ tool: 'figure', summary: confirm.summary, detail: confirm.detail })
+        const allowed = await requireBusinessApproval({ tool: 'figure', summary: confirm.summary, detail: confirm.detail })
         if (!allowed) return '已取消：该图表操作未获得用户确认（或等待超时）。请先向用户说明并再次发起。'
       }
 

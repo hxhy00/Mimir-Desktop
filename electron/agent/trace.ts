@@ -7,7 +7,7 @@
  * 本模块实现一个 LangChain BaseCallbackHandler，挂在 ChatOpenAI 构造时的 callbacks 上：
  * LangChain v1 的 BaseChatModel 在运行时会用 `CallbackManager.configure(config.callbacks,
  * this.callbacks, …)` 把「构造时传入的 callbacks」作为回退，因此 deepagents 内部无论
- * supervisor / 子代理 / 各增强子图共用该 model 实例的多少次调用，都会触发这里的事件——
+ * Agent 主循环 / 各增强子图共用该 model 实例的多少次调用，都会触发这里的事件——
  * 一个 handler 即可看到整张执行图，无需在库内部逐点埋桩。
  *
  * 级别（settings.agentTraceLevel，缺省 'compact'）：
@@ -198,7 +198,7 @@ export class AgentTraceHandler extends BaseCallbackHandler {
     this.out({ type: 'llm✗', runId, parentRunId, msg: clip(err.message, 240) })
   }
 
-  /** 工具开始：与 withToolTrace 互补，能捕获 deepagents 内部（含 supervisor 直属）每次工具。 */
+  /** 工具开始：与 withToolTrace 互补，能捕获 deepagents 内部（含 Agent 主循环直接发起）的每次工具。 */
   async handleToolStart(
     tool: { name?: string } | undefined,
     input: string,

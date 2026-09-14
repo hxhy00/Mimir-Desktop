@@ -69,7 +69,7 @@ export const librarySearchTool = tool(
 
       if (scored.length === 0) {
         return (
-          '文献库中没有与关键词匹配的论文。提示：可改用 arxiv_search 搜索外部 arXiv、web_search 搜网页，' +
+          '文献库中没有与关键词匹配的论文。提示：可改用 paper_search 搜索外部学术文献、web_search 搜网页，' +
           '找到后用 paper_fetch 保存进文献库再检索。'
         )
       }
@@ -103,7 +103,7 @@ export const librarySearchTool = tool(
     name: 'library_search',
     description:
       '只读检索当前科研空间「文献库」中已收藏的论文（标题/作者/摘要/标签/阅读笔记做关键词匹配），返回 top-K 命中与片段。' +
-      '当你需要基于用户已收藏论文作答、回顾笔记、或确认某篇论文是否已在库中时使用。外部论文请用 arxiv_search，入库用 paper_fetch。',
+      '当你需要基于用户已收藏论文作答、回顾笔记、或确认某篇论文是否已在库中时使用。外部论文请用 paper_search，入库用 paper_fetch。',
     schema: z.object({
       query: z.string().describe('检索关键词，如 "vision transformer 注意力"'),
       projectId: z.string().optional().describe('限定某研究项目 id（只查关联该项目的论文）'),

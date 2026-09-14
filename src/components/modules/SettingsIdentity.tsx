@@ -6,7 +6,7 @@ import { UserRound, Save, Check } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
 /** 永久层「身份与默认值」（Mimir Agent 治理 Phase 4）：存于全局设置 settings.identity。
- *  一旦填写，主进程会在每一轮对话将其作为极小 system 段恒定注入 Supervisor；
+ *  一旦填写，主进程会在每一轮对话将其作为极小 system 段恒定注入 Agent；
  *  默认（未填写身份/写作语言）不注入任何内容。自动学习从不写入永久层。
  *  分界：会随课题/进展变化的内容（研究方向、常用约束）请维护到「长期记忆」档案。 */
 interface IdentityProfile {

@@ -9,6 +9,7 @@ import { describe, expect, it } from 'vitest'
 import {
   probeGatewayCapabilities,
   pickStructuredOutputMethod,
+  pickStructuredMethod,
   formatCapabilityReport,
   type GatewayCapabilities
 } from '../../electron/agent/gatewayProbe'
@@ -129,5 +130,18 @@ describe('网关能力探测：判定逻辑（离线）', () => {
     const caps = await probeGatewayCapabilities({ ...base, fetchImpl: makeFetchStub({}) })
     expect(caps.fingerprint).toBe('https://gw.example.com/v1::test-model')
     expect(caps.probedAt).toBeGreaterThan(0)
+  })
+})
+
+describe('结构化输出通道 × 思考模式（pickStructuredMethod）', () => {
+  it('思考关闭：走 functionCalling（兼容性最好）', () => {
+    expect(pickStructuredMethod(false)).toBe('functionCalling')
+  })
+
+  it('思考开启：绝不用 functionCalling（会注入 tool_choice 被上游 400 拒绝），改走 jsonMode', () => {
+    const method = pickStructuredMethod(true)
+    expect(method).toBe('jsonMode')
+    // 核心不变量：思考模式下不得选择任何会注入 tool_choice 的通道
+    expect(method).not.toBe('functionCalling')
   })
 })
