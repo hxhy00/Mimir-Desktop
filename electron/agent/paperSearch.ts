@@ -13,6 +13,8 @@
  * - **Semantic Scholar Graph API**（辅助匹配）：标题精确匹配（search/match）质量好；
  *   ⚠️ 实测其 search 端点共享 IP 配额常 429，match/by-id 端点较宽松——因此它只做
  *   「已知标题 → 论文」的匹配，不做关键词浏览，且失败静默降级不阻塞；
+ *   💡 配了 `MIMIR_S2_API_KEY` 后走账号配额（官方免费申请）：节流自动放宽到 200ms、
+ *   429 只冷却 5s 而非 30s，本层最脆弱的一环基本消失。不带 key 时行为与旧版一致；
  * - **arXiv API**（新鲜度补充）：OpenAlex/S2 对**刚提交数日内的预印本**收录有延迟，
  *   合并结果时用 arXiv 补最近新论文（走既有 3s 节流队列，只发一次）。
  *
@@ -22,6 +24,7 @@
  * url 指向其落地页。下游 importPaper / set_paper / bibtex 不需要感知来源差异。
  */
 import type { ArxivEntry } from '../library/types'
+import { httpFetch } from '../http'
 
 const FETCH_TIMEOUT_MS = 15_000
 const CACHE_TTL_MS = 15 * 60 * 1000
@@ -59,7 +62,7 @@ function writeCache(key: string, value: ArxivEntry[]): void {
 }
 
 async function getJson(url: string, headers?: Record<string, string>): Promise<unknown> {
-  const response = await fetch(url, {
+  const response = await httpFetch(url, {
     signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
     ...(headers !== undefined ? { headers } : {})
   })
@@ -111,6 +114,9 @@ function toEntryFromOpenAlex(work: OpenAlexWork): ArxivEntry {
     .flatMap((a) => (a.authors ?? []).map((x) => x.display_name ?? ''))
     .filter((n) => n !== '')
   const title = (work.title ?? work.display_name ?? '').replace(/\s+/g, ' ').trim()
+  // OpenAlex 已给出 OA 版本时顺手带回来（免一次 Unpaywall 请求）；注意 pdf_url 常为
+  // null 而只有 landing_page_url（机构库/出版商页），那种情况留给下载时的瀑布链处理。
+  const oaPdf = (work.best_oa_location?.pdf_url ?? '').trim()
   return {
     id: arxivId ?? (work.doi ?? work.id ?? title).replace(/^https?:\/\/doi\.org\//, ''),
     title,
@@ -118,7 +124,8 @@ function toEntryFromOpenAlex(work: OpenAlexWork): ArxivEntry {
     summary: rebuildAbstract(work.abstract_inverted_index),
     published: work.publication_date ?? (work.publication_year !== undefined ? `${work.publication_year}-01-01` : ''),
     url: arxivId !== null ? `https://arxiv.org/abs/${arxivId}` : work.doi ?? work.id ?? '',
-    source: 'openalex'
+    source: 'openalex',
+    ...(oaPdf !== '' && arxivId === null ? { pdfUrl: oaPdf, pdfSource: 'openalex-oa' } : {})
   }
 }
 
@@ -160,7 +167,12 @@ interface S2Paper {
 async function s2Gate(): Promise<boolean> {
   const now = Date.now()
   if (now < s2CoolUntil) return false
-  const wait = s2LastRequestAt + S2_MIN_INTERVAL_MS - now
+  // 配了 API key 就走账号配额（官方 1 req/s 起），共享 IP 的熔断困境不复存在，
+  // 因此不再需要 1.2s 的保守间隔——用 200ms 让有 key 的用户明显更快。
+  const interval = process.env['MIMIR_S2_API_KEY'] !== undefined && process.env['MIMIR_S2_API_KEY'] !== ''
+    ? 200
+    : S2_MIN_INTERVAL_MS
+  const wait = s2LastRequestAt + interval - now
   if (wait > 0) await new Promise((r) => setTimeout(r, wait))
   s2LastRequestAt = Date.now()
   return true
@@ -169,11 +181,17 @@ async function s2Gate(): Promise<boolean> {
 async function s2Fetch(url: string): Promise<S2Paper | null> {
   if (!(await s2Gate())) return null
   try {
-    const data = (await getJson(url)) as S2Paper & { data?: S2Paper[] }
+    const key = process.env['MIMIR_S2_API_KEY']
+    const headers = key !== undefined && key !== '' ? { 'x-api-key': key } : undefined
+    const data = (await getJson(url, headers)) as S2Paper & { data?: S2Paper[] }
     return (data.data?.[0] ?? (data.title !== undefined ? data : null)) ?? null
   } catch (error) {
     const msg = error instanceof Error ? error.message : ''
-    if (msg.includes('429')) s2CoolUntil = Date.now() + S2_COOL_DOWN_MS
+    // 带 key 时 429 通常是瞬时抖动，仍按冷却处理但缩短；无 key 时共享 IP 配额脆弱，冷却更久
+    if (msg.includes('429')) {
+      const hasKey = process.env['MIMIR_S2_API_KEY'] !== undefined && process.env['MIMIR_S2_API_KEY'] !== ''
+      s2CoolUntil = Date.now() + (hasKey ? 5_000 : S2_COOL_DOWN_MS)
+    }
     return null
   }
 }

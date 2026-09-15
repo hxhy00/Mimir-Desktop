@@ -11,6 +11,7 @@
 
 import { app } from 'electron'
 import { join } from 'path'
+import { httpFetch } from '../http'
 import {
   chmod,
   mkdir,
@@ -137,7 +138,7 @@ async function latestTectonicRelease(): Promise<GithubRelease> {
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), 15_000)
   try {
-    const response = await fetch(
+    const response = await httpFetch(
       'https://api.github.com/repos/tectonic-typesetting/tectonic/releases/latest',
       {
         headers: {

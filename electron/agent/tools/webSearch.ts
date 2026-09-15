@@ -1,5 +1,6 @@
 import { tool } from 'langchain/tools'
 import { z } from 'zod'
+import { httpFetch } from '../../http'
 
 /**
  * Web search tool using DuckDuckGo (no API key required)
@@ -9,7 +10,7 @@ export const webSearchTool = tool(
     try {
       const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`
 
-      const response = await fetch(url, {
+      const response = await httpFetch(url, {
         headers: {
           'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
         }

@@ -6,6 +6,7 @@
 import { join } from 'path'
 import { getStoreValue } from '../library/store'
 import { figuresDir, importFigure, type FigureRecord } from './figuresService'
+import { httpFetch } from '../http'
 
 export interface ImageGenConfig {
   readonly baseUrl: string
@@ -55,7 +56,7 @@ export async function generateDeckImage(
   let buffer: Buffer
   try {
     const base = config.baseUrl.replace(/\/+$/, '')
-    const response = await fetch(`${base}/images/generations`, {
+    const response = await httpFetch(`${base}/images/generations`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',

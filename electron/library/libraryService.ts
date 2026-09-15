@@ -7,7 +7,9 @@ import { mkdir, writeFile, readFile, access } from 'fs/promises'
 import { join, dirname } from 'path'
 import { app } from 'electron'
 import { getStoreValue, setStoreValue, spaceRoot, currentSpaceEpoch, assertSpaceUnchanged } from './store'
-import { fetchArxivSearch, fetchArxivPdf, paperPdfFileName } from './arxiv'
+import { fetchArxivSearch, fetchArxivPdf, fetchPdfBytes, paperPdfFileName } from './arxiv'
+import { isDoiId, normalizeDoi, resolveOaPdfLocation } from './oaLocation'
+import { httpFetch } from '../http'
 import { parseBibtex, serializeBibtex, entryFromPaper } from './bibtex'
 import type {
   ArxivEntry,
@@ -119,6 +121,8 @@ export async function importPaper(entry: ArxivEntry, projectId?: string): Promis
     summary: entry.summary,
     url: entry.url === '' ? `https://arxiv.org/abs/${arxivId}` : entry.url,
     ...(entry.source !== undefined ? { source: entry.source } : existing?.source !== undefined ? { source: existing.source } : {}),
+    // OA 直链：新条目带回；旧条目保留原值（避免重新导入时被空值擦掉）
+    ...(entry.pdfUrl !== undefined && entry.pdfUrl !== '' ? { pdfUrl: entry.pdfUrl, ...(entry.pdfSource !== undefined ? { pdfSource: entry.pdfSource } : {}) } : existing?.pdfUrl !== undefined ? { pdfUrl: existing.pdfUrl, ...(existing.pdfSource !== undefined ? { pdfSource: existing.pdfSource } : {}) } : {}),
     notes: existing?.notes ?? '',
     tags: [...(existing?.tags ?? [])],
     projectIds: [...new Set([
@@ -191,16 +195,76 @@ export async function updatePaper(request: {
   return next
 }
 
-/** 下载一篇论文的 PDF 到空间 papers 目录并更新记录（仅 arXiv id 可下载；DOI 条目请先在网页端获取） */
+/**
+ * 解析并下载一篇论文的 PDF 字节（fetchPaperPdf 的取字节阶段）。
+ *
+ * 顺序（命中即停，失败原因累计后如实汇总）：
+ * 1. 条目可解析出 arXiv id → arXiv 通道（export 主站 + 主站回退，内部已处理）；
+ * 2. 否则视为 DOI 条目 → OA 直链（OpenAlex → Unpaywall）→ 通用 https PDF 下载。
+ *
+ * 注意：DOI 条目**不再直接拒绝**——OA 版本存在时就能直接读全文，
+ * 不存在时给出的是「未发现开放获取版本」这一准确结论，而非笼统的「不支持」。
+ */
+async function downloadPaperBytes(
+  paper: PaperRecord,
+): Promise<{ bytes: Uint8Array; source?: string }> {
+  const arxivId = arxivIdOf(paper)
+  const errors: string[] = []
+  const timeout = ARXIV_PDF_FETCH_TIMEOUT_MS
+  if (arxivId !== null) {
+    try {
+      return { bytes: await fetchArxivPdf(arxivId, AbortSignal.timeout(timeout)), source: 'arxiv' }
+    } catch (error) {
+      errors.push(`arXiv: ${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+  const doi = normalizeDoi(paper.arxivId) ?? paper.arxivId
+  const location = await resolveOaPdfLocation(doi, { url: paper.pdfUrl, source: paper.pdfSource })
+  if (location === null) {
+    errors.push('未在 OpenAlex / Unpaywall 找到开放获取（OA）版本')
+    throw new Error(
+      `${errors.join('；')}。该论文可能需要机构订阅访问，可复制链接到浏览器或图书馆代理下载：${paper.url}`,
+    )
+  }
+  try {
+    return { bytes: await fetchPdfBytes(location.url, AbortSignal.timeout(timeout)), source: location.source }
+  } catch (error) {
+    errors.push(`${location.source}: ${error instanceof Error ? error.message : String(error)}`)
+    throw new Error(`${errors.join('；')}。该论文可能需要机构订阅访问，可复制链接到浏览器或图书馆代理下载：${paper.url}`)
+  }
+}
+
+/** 从一条记录里解析可用的 arXiv id：主键是裸 id 时直接可用；DOI 条目则看 URL 与 pdfUrl。 */
+function arxivIdOf(paper: PaperRecord): string | null {
+  const bare = paper.arxivId.trim()
+  if (bare !== '' && !isDoiId(bare)) return bare
+  // DOI 条目：若来源页是 arXiv 落地页（如 10.48550/arXiv.xxxx 或 url 指向 /abs/），仍可走 arXiv 通道
+  const candidates = [paper.url, paper.pdfUrl ?? '', bare]
+  for (const candidate of candidates) {
+    const match = /arxiv\.org\/(?:abs|pdf)\/([\w.\-/]+?)(?:v\d+)?(?:\.pdf)?(?:[?#].*)?$/i.exec(candidate)
+    if (match?.[1] !== undefined && match[1] !== '') return match[1]
+    const doiMatch = /10\.48550\/arxiv\.([\w.\-/]+)/i.exec(candidate)
+    if (doiMatch?.[1] !== undefined && doiMatch[1] !== '') return doiMatch[1]
+  }
+  return null
+}
+
+/**
+ * 下载一篇论文的 PDF 到空间 papers 目录并更新记录。
+ *
+ * 两条通道合一的瀑布：
+ * - **arXiv 条目**（裸 id / 可解析出 arXiv id）→ export.arxiv.org（含主站回退）；
+ * - **非 arXiv 条目**（DOI）→ 解析 OA 直链（OpenAlex → Unpaywall）后下载。
+ *
+ * 失败信息如实列出各源状态，不再一言以蔽之「暂不支持」。
+ */
 export async function fetchPaperPdf(arxivId: string): Promise<PaperRecord> {
   const epoch = currentSpaceEpoch()
   const table = papersTable()
   const existing = table[arxivId]
   if (existing === undefined) throw new Error(`paper-not-found: ${arxivId}`)
-  if (arxivId.startsWith('doi:') || /^10\./.test(arxivId)) {
-    throw new Error('该论文不是 arXiv 预印本，暂不支持直接下载 PDF。')
-  }
-  const bytes = await fetchArxivPdf(arxivId, AbortSignal.timeout(ARXIV_PDF_FETCH_TIMEOUT_MS))
+
+  const { bytes, source } = await downloadPaperBytes(existing)
   // 下载期间用户可能切换了科研空间：写盘与写回前校验，避免把旧空间数据写进新空间
   assertSpaceUnchanged(epoch)
   const dir = papersDir()
@@ -211,7 +275,12 @@ export async function fetchPaperPdf(arxivId: string): Promise<PaperRecord> {
   const currentTable = papersTable()
   const current = currentTable[arxivId]
   if (current === undefined) throw new Error(`paper-not-found: ${arxivId}（科研空间已切换）`)
-  const next: PaperRecord = { ...current, pdfPath: filePath }
+  const next: PaperRecord = {
+    ...current,
+    pdfPath: filePath,
+    // 记录本次实际命中的通道，便于排障「这篇到底从哪下的」
+    ...(source !== undefined ? { pdfSource: source } : {}),
+  }
   currentTable[arxivId] = next
   savePapersTable(currentTable)
   return next
@@ -408,7 +477,7 @@ export async function searchWeb(query: string, maxResults = 10): Promise<WebSear
   const q = query.trim()
   if (q === '') throw new Error('query must be non-empty')
   const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(q)}`
-  const response = await fetch(url, {
+  const response = await httpFetch(url, {
     headers: { 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36' },
     signal: AbortSignal.timeout(ARXIV_FETCH_TIMEOUT_MS),
   })
@@ -469,7 +538,7 @@ export async function listZoteroCollections(): Promise<{ key: string; name: stri
   const client = zoteroClient()
   if (client === null) throw new Error('Zotero 未配置：请在设置中填写 API Key 和 User ID')
   const url = `https://api.zotero.org/users/${client.userId}/collections?limit=100`
-  const response = await fetch(url, {
+  const response = await httpFetch(url, {
     headers: { 'Zotero-API-Key': client.apiKey },
     signal: AbortSignal.timeout(ARXIV_FETCH_TIMEOUT_MS),
   })
@@ -483,7 +552,7 @@ export async function searchZotero(query: string): Promise<{ key: string; title:
   const client = zoteroClient()
   if (client === null) throw new Error('Zotero 未配置：请在设置中填写 API Key 和 User ID')
   const url = `https://api.zotero.org/users/${client.userId}/items?q=${encodeURIComponent(query)}&limit=25&format=json&itemType=-attachment%20-note`
-  const response = await fetch(url, {
+  const response = await httpFetch(url, {
     headers: { 'Zotero-API-Key': client.apiKey },
     signal: AbortSignal.timeout(ARXIV_FETCH_TIMEOUT_MS),
   })
@@ -509,7 +578,7 @@ export async function exportZoteroCollectionToBib(
   if (project === undefined) throw new Error(`project-not-found: ${projectId}`)
 
   const url = `https://api.zotero.org/users/${client.userId}/collections/${collectionKey}/items?format=bibtex&limit=100`
-  const response = await fetch(url, {
+  const response = await httpFetch(url, {
     headers: { 'Zotero-API-Key': client.apiKey },
     signal: AbortSignal.timeout(ARXIV_FETCH_TIMEOUT_MS),
   })

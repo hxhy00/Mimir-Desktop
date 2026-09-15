@@ -12,6 +12,7 @@ import { join, dirname } from 'path'
 import { randomUUID } from 'crypto'
 import { existsSync } from 'fs'
 import { getStoreValue, setStoreValue, spaceRoot } from '../library/store'
+import { httpFetch } from '../http'
 import {
   CCF_A_JOURNALS,
   currentConfOf,
@@ -104,7 +105,7 @@ export async function refreshVenueDeadlines(): Promise<string> {
   const timer = setTimeout(() => controller.abort(), VENUE_FETCH_TIMEOUT_MS)
   let text: string
   try {
-    const response = await fetch(CCFDDL_ALLCONF_URL, { signal: controller.signal })
+    const response = await httpFetch(CCFDDL_ALLCONF_URL, { signal: controller.signal })
     if (!response.ok) throw new Error(`HTTP ${response.status}`)
     text = await response.text()
   } finally {

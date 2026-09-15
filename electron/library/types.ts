@@ -13,6 +13,10 @@ export interface ArxivEntry {
   url: string
   /** 来源标识（统一访问层填充：openalex / semantic-scholar / arxiv），展示与排障用 */
   source?: 'openalex' | 'semantic-scholar' | 'arxiv'
+  /** 开放获取 PDF 直链（统一访问层从 OpenAlex 等投影而来）；缺省表示未发现 OA 版本 */
+  pdfUrl?: string
+  /** pdfUrl 的来源，展示与排障用（如 'openalex-oa'） */
+  pdfSource?: string
 }
 
 /** 一条网页搜索结果 */
@@ -42,6 +46,13 @@ export interface PaperRecord {
   url: string
   /** 来源标识（openalex / semantic-scholar / arxiv），展示与排障用 */
   source?: 'openalex' | 'semantic-scholar' | 'arxiv'
+  /**
+   * 开放获取 PDF 直链（入库时从检索源带回）。arXiv 条目走 arXiv 通道下载，
+   * 该字段主要服务非 arXiv 的期刊/会议论文——没有它就只能去网页端手动找。
+   */
+  pdfUrl?: string
+  /** pdfUrl 的来源（如 'openalex-oa' / 'unpaywall'），用于展示与排障 */
+  pdfSource?: string
   /** 自由格式的工作笔记（阅读笔记以 [YYYY-MM-DD HH:mm] 块追加） */
   notes: string
   /** 组织标签 */

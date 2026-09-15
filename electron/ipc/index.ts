@@ -10,6 +10,7 @@ import { startBridge, stopBridge, isBridgeRunning, getBridgePort, getConfirmToke
 import { setApprovalSender, settleApproval } from '../agent/approval'
 import { permissionsService } from '../agent/permissionService'
 import { probeServer, type ProbeConfig } from '../servers/probe'
+import { httpFetch } from '../http'
 import { compileLatex, registerLatexPdfDir } from '../latex'
 import {
   TECTONIC_RESOURCE_ID,
@@ -34,6 +35,7 @@ import {
   setDefaultWorkspace,
 } from '../library/store'
 import * as library from '../library/libraryService'
+import { fetchArxivPdf, paperPdfFileName } from '../library/arxiv'
 import {
   appendLedger,
   listLedgerEntries,
@@ -112,7 +114,6 @@ function parseArxivXml(xml: string): ArxivPaper[] {
 }
 
 // Maximum PDF download size (64 MB)
-const ARXIV_PDF_MAX_BYTES = 64 * 1024 * 1024
 const ARXIV_PDF_DOWNLOAD_TIMEOUT_MS = 60_000
 
 /** Agent 过程事件信封前缀（与渲染层 ChatView 保持一致），经文本 chunk 通道随流发送。 */
@@ -216,7 +217,7 @@ export function setupIpcHandlers(winRef: { current: BrowserWindow | null }): voi
       const url = `${baseUrl.replace(/\/+$/, '')}/chat/completions`
       const controller = new AbortController()
       const timeout = setTimeout(() => controller.abort(), 15000)
-      const response = await fetch(url, {
+      const response = await httpFetch(url, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -440,7 +441,7 @@ export function setupIpcHandlers(winRef: { current: BrowserWindow | null }): voi
         query
       )}&start=0&max_results=${maxResults}${sortParam}`
 
-      const response = await fetch(url)
+      const response = await httpFetch(url)
       if (!response.ok) {
         return { error: `arXiv API 请求失败: HTTP ${response.status}` }
       }
@@ -457,7 +458,7 @@ export function setupIpcHandlers(winRef: { current: BrowserWindow | null }): voi
       const cleanId = id.trim().replace(/^https?:\/\/arxiv\.org\/abs\//, '')
       if (!cleanId) return { error: '无效的 arXiv id' }
       const url = `https://export.arxiv.org/api/query?id_list=${encodeURIComponent(cleanId)}&max_results=1`
-      const response = await fetch(url)
+      const response = await httpFetch(url)
       if (!response.ok) {
         return { error: `arXiv API 请求失败: HTTP ${response.status}` }
       }
@@ -470,46 +471,19 @@ export function setupIpcHandlers(winRef: { current: BrowserWindow | null }): voi
     }
   })
 
-  // Download a paper PDF to the userData directory
+  // Download a paper PDF to the userData directory（复用 library/arxiv 的下载层：
+  // export 主通道 + UA 标识 + 主站回退，两处行为一致）
   ipcMain.handle('arxiv:downloadPdf', async (_event, id: string) => {
     try {
       const cleanId = id.trim().replace(/^https?:\/\/arxiv\.org\/abs\//, '')
       if (cleanId === '' || !/^[a-zA-Z0-9._/-]+$/.test(cleanId)) {
         return { error: '无效的 arXiv id' }
       }
-      const url = `https://arxiv.org/pdf/${cleanId}`
-      const response = await fetch(url, { signal: AbortSignal.timeout(ARXIV_PDF_DOWNLOAD_TIMEOUT_MS) })
-      if (!response.ok) {
-        return { error: `PDF 下载失败: HTTP ${response.status}` }
-      }
-      const contentLength = Number(response.headers.get('content-length'))
-      if (Number.isFinite(contentLength) && contentLength > ARXIV_PDF_MAX_BYTES) {
-        return { error: `PDF 超过 ${ARXIV_PDF_MAX_BYTES} 字节上限` }
-      }
-      if (response.body === null) return { error: 'arXiv 返回了空的 PDF 内容' }
-      // Stream the body with a size cap
-      const chunks: Buffer[] = []
-      let length = 0
-      const reader = response.body.getReader()
-      while (true) {
-        const { done, value } = await reader.read()
-        if (done) break
-        length += value.length
-        if (length > ARXIV_PDF_MAX_BYTES) {
-          await reader.cancel()
-          return { error: `PDF 超过 ${ARXIV_PDF_MAX_BYTES} 字节上限` }
-        }
-        chunks.push(Buffer.from(value))
-      }
-      const buffer = Buffer.concat(chunks)
-      if (buffer.length < 5 || buffer.subarray(0, 5).toString() !== '%PDF-') {
-        return { error: 'arXiv 返回的不是有效的 PDF 文件' }
-      }
+      const bytes = await fetchArxivPdf(cleanId, AbortSignal.timeout(ARXIV_PDF_DOWNLOAD_TIMEOUT_MS))
       const dir = join(spaceRoot(), 'papers')
       if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
-      const fileName = `${encodeURIComponent(cleanId)}.pdf`
-      const filePath = join(dir, fileName)
-      await writeFile(filePath, buffer)
+      const filePath = join(dir, paperPdfFileName(cleanId))
+      await writeFile(filePath, bytes)
       return { ok: true, path: filePath }
     } catch (error) {
       return { error: error instanceof Error ? error.message : 'PDF 下载失败' }
@@ -536,7 +510,7 @@ export function setupIpcHandlers(winRef: { current: BrowserWindow | null }): voi
         form.append('model', model || 'whisper-1')
         form.append('language', 'zh')
 
-        const response = await fetch(url, {
+        const response = await httpFetch(url, {
           method: 'POST',
           headers: { Authorization: `Bearer ${apiKey}` },
           body: form

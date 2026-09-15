@@ -12,6 +12,8 @@
  *    `models` 字段），让上层调用方式一致。
  */
 
+import { httpFetch } from './http'
+
 /** 规范化后返回的单个模型条目。 */
 export interface DiscoveredModel {
   readonly id: string
@@ -110,7 +112,7 @@ export async function listModels(args: { baseUrl: string; apiKey: string; timeou
   const timeoutMs = typeof args.timeoutMs === 'number' ? args.timeoutMs : 15_000
   const timer = setTimeout(() => controller.abort(), timeoutMs)
   try {
-    const response = await fetch(endpoint, {
+    const response = await httpFetch(endpoint, {
       method: 'GET',
       headers: {
         Authorization: `Bearer ${apiKey}`,
