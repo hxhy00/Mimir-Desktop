@@ -7,7 +7,7 @@
     "name": "Mimir",
     "email": "hxhy@users.noreply.github.com"
   },
-  "license": "MIT",
+  "license": "GPL-3.0-only",
   "type": "module",
   "scripts": {
     "dev": "electron-vite dev",

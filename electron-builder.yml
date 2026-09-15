@@ -2,6 +2,9 @@ appId: com.mimir.desktop
 # productName 决定打包产物名（.app / dmg 标题 / Dock 显示名），刻意用简短的「Mimir」；
 # 文档、README、UA 等品牌展示口径仍统一为「Mimir Desktop」。两者不一致是有意的。
 productName: Mimir
+# 产物文件名不带版本号：版本信息由 GitHub Release 的 tag 表达，不在文件名里重复。
+# 注意：win 的 portable 与 nsis 都是 .exe，靠 -setup 后缀区分，防止同一 Release 内重名。
+artifactName: ${productName}-${arch}.${ext}
 directories:
   buildResources: build
   output: dist
@@ -56,6 +59,8 @@ nsis:
   oneClick: false
   allowToChangeInstallationDirectory: true
   deleteAppDataOnUninstall: false
+  # nsis 与 portable 同为 .exe，覆盖默认命名避免与 portable 重名
+  artifactName: ${productName}-${arch}-setup.${ext}
 
 linux:
   category: Development
