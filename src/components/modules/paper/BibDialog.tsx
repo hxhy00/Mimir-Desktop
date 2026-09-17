@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import {
@@ -34,6 +34,22 @@ export function BibDialog({ projectDir, onClose, onChanged }: BibDialogProps) {
   const [error, setError] = useState<string | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
 
+  /**
+   * `entries` 的**最新值镜像**。
+   *
+   * 为什么需要它：所有改动都先落到 `entries` state，而 React 的 state 更新是异步的——
+   * 保存时若直接读 `entries`（或用函数式 setState 之后再读闭包），拿到的是**改之前**
+   * 的旧列表，于是「刚编辑完就点保存」会用旧数据把新编辑覆盖掉。
+   * 这里让**每一次**改动都经过 `commitEntries`（同步写 ref + 写 state），
+   * 保存时读 ref 即拿到当前值。
+   */
+  const entriesRef = useRef<BibEntry[]>(entries)
+  const commitEntries = useCallback((next: BibEntry[]): BibEntry[] => {
+    entriesRef.current = next
+    setEntries(next)
+    return next
+  }, [])
+
   const active = entries.find((e) => e.key === activeKey) ?? null
 
   useEffect(() => {
@@ -45,7 +61,7 @@ export function BibDialog({ projectDir, onClose, onChanged }: BibDialogProps) {
         const res = await api.paper.bibRead(projectDir)
         if (alive) {
           if (res.ok && res.entries) {
-            setEntries(res.entries)
+            commitEntries(res.entries)
             if (res.entries.length > 0) setActiveKey(res.entries[0]!.key)
           } else {
             setError(res.message ?? '读取失败')
@@ -59,14 +75,14 @@ export function BibDialog({ projectDir, onClose, onChanged }: BibDialogProps) {
     return () => {
       alive = false
     }
-  }, [api, projectDir])
+  }, [api, projectDir, commitEntries])
 
   const selectEntry = useCallback((key: string) => {
-    const entry = entries.find((e) => e.key === key)
+    const entry = entriesRef.current.find((e) => e.key === key)
     if (entry === undefined) return
     setActiveKey(key)
     setRows(Object.entries(entry.fields).map(([k, v]) => ({ k, v })))
-  }, [entries])
+  }, [])
 
   useEffect(() => {
     if (active !== null && rows.length === 0) {
@@ -75,45 +91,76 @@ export function BibDialog({ projectDir, onClose, onChanged }: BibDialogProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeKey])
 
-  const applyRowsToActive = useCallback((): void => {
-    if (active === null) return
+  /**
+   * 把编辑区（rows）里的字段合并回当前条目，并**同步返回**合并后的完整列表。
+   *
+   * 返回值是关键：调用方（保存）必须当场拿到结果，否则只能去读还没更新的 state。
+   */
+  const applyRowsToActive = useCallback((): BibEntry[] => {
+    const current = entriesRef.current
+    const activeEntry = activeKey === null ? undefined : current.find((e) => e.key === activeKey)
+    if (activeEntry === undefined) return current
     const fields: Record<string, string> = {}
     for (const row of rows) {
       if (row.k.trim() !== '') fields[row.k.trim()] = row.v
     }
-    setEntries((prev) => prev.map((e) => (e.key === active.key ? { ...e, fields } : e)))
-  }, [active, rows])
+    return commitEntries(current.map((e) => (e.key === activeEntry.key ? { ...e, fields } : e)))
+  }, [activeKey, rows, commitEntries])
+
+  /**
+   * 改当前条目的引用键：必须**同时**更新 `activeKey`。
+   * 否则 `active`（按 activeKey 查找）立刻变成 null —— 编辑面板整块消失，
+   * 这次改名也就随之下一次读取时丢掉。
+   */
+  const renameActiveKey = useCallback(
+    (nextKey: string) => {
+      if (activeKey === null) return
+      commitEntries(entriesRef.current.map((e) => (e.key === activeKey ? { ...e, key: nextKey } : e)))
+      setActiveKey(nextKey)
+    },
+    [activeKey, commitEntries]
+  )
+
+  const changeActiveType = useCallback(
+    (nextType: string) => {
+      if (activeKey === null) return
+      commitEntries(entriesRef.current.map((e) => (e.key === activeKey ? { ...e, type: nextType } : e)))
+    },
+    [activeKey, commitEntries]
+  )
 
   const handleAdd = useCallback(() => {
     applyRowsToActive()
-    const count = entries.filter((e) => e.key.startsWith('new')).length + 1
+    const count = entriesRef.current.filter((e) => e.key.startsWith('new')).length + 1
     const key = `new-key-${count}`
     const entry: BibEntry = { key, type: 'article', fields: {} }
-    setEntries((prev) => [...prev, entry])
+    commitEntries([...entriesRef.current, entry])
     setActiveKey(key)
     setRows([])
-  }, [entries, applyRowsToActive])
+  }, [applyRowsToActive, commitEntries])
 
   const handleRemove = useCallback(
     (key: string) => {
       if (!window.confirm(`删除条目 ${key} 吗？`)) return
-      const next = entries.filter((e) => e.key !== key)
-      setEntries(next)
+      const next = entriesRef.current.filter((e) => e.key !== key)
+      commitEntries(next)
       setActiveKey(next[0]?.key ?? null)
       setRows([])
     },
-    [entries]
+    [commitEntries]
   )
 
   const handleSave = useCallback(async () => {
     if (!api?.paper) return
-    applyRowsToActive()
+    // 先合并编辑区，并**当场拿到**合并后的列表：这就是「保存时读到当前值」的一手来源。
+    // 旧实现在此处读 `entries`（useCallback 闭包里的旧快照），编辑完立刻保存会被旧数据覆盖。
+    const snapshot = applyRowsToActive()
     setSaving(true)
     setError(null)
     setNotice(null)
     const keys = new Set<string>()
     let dup = ''
-    for (const entry of entries) {
+    for (const entry of snapshot) {
       if (keys.has(entry.key)) dup = entry.key
       keys.add(entry.key)
     }
@@ -123,7 +170,7 @@ export function BibDialog({ projectDir, onClose, onChanged }: BibDialogProps) {
       return
     }
     try {
-      const res = await api.paper.bibWrite(projectDir, entries)
+      const res = await api.paper.bibWrite(projectDir, snapshot)
       if (res.ok) {
         setNotice('已保存到 references.bib')
         onChanged()
@@ -133,7 +180,7 @@ export function BibDialog({ projectDir, onClose, onChanged }: BibDialogProps) {
     } finally {
       setSaving(false)
     }
-  }, [api, projectDir, entries, applyRowsToActive, onChanged])
+  }, [api, projectDir, applyRowsToActive, onChanged])
 
   return (
     <Dialog open onOpenChange={(open) => !open && onClose()}>
@@ -186,13 +233,13 @@ export function BibDialog({ projectDir, onClose, onChanged }: BibDialogProps) {
                 <div className="grid grid-cols-[1fr_120px] gap-1.5">
                   <Input
                     value={active.key}
-                    onChange={(e) => setEntries((prev) => prev.map((item) => (item.key === active.key ? { ...item, key: e.target.value } : item)))}
+                    onChange={(e) => renameActiveKey(e.target.value)}
                     className="h-7 font-mono text-[11px]"
                     placeholder="引用键"
                   />
                   <Input
                     value={active.type}
-                    onChange={(e) => setEntries((prev) => prev.map((item) => (item.key === active.key ? { ...item, type: e.target.value } : item)))}
+                    onChange={(e) => changeActiveType(e.target.value)}
                     className="h-7 font-mono text-[11px]"
                     placeholder="类型（article…）"
                   />

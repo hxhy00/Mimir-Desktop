@@ -11,6 +11,7 @@ import {
   cancelRun,
   createRun,
   fromLegacyTrace,
+  isRunActive,
   summarizeRun,
   visibleSteps,
   type LegacyTraceNode,
@@ -219,6 +220,53 @@ describe('applyRunEvent：思考与整轮状态', () => {
     expect(cancelled.status).toBe('canceled')
     expect(cancelled.steps[0].status).toBe('canceled')
     expect(cancelled.steps[1].status).toBe('done')
+  })
+})
+
+/**
+ * 「回复完了还一直显示思考中」的直接回归。
+ *
+ * 事故链路：时间线原先用 `run.status === 'running' || isStreaming === true` 判定运行态，
+ * 而 isStreaming 是**会话级**标记（streamingConvIds），它的清理由 handleSend 的 finally
+ * 负责 —— 那个 finally 曾带纪元守卫，被新流顶掉的旧回复永远不关灯 → 这个 true 一直传进来，
+ * 把**已经 done 的 run** 硬撑成运行中，界面永久显示「正在思考…」且输入区永久禁用。
+ *
+ * 因此这里锁定：**run.status 是权威终态，外部标记不得把它复活**。
+ */
+describe('isRunActive：run.status 为权威，会话级残留标记不得复活终态', () => {
+  /** 跑到整轮 done 的一条最小 run。 */
+  function doneRun() {
+    const next = counter()
+    let run = createRun()
+    run = applyRunEvent(run, { taskId: 'main', title: 'Mimir', status: 'running', kind: 'task' }, next)
+    return applyRunEvent(run, { taskId: 'main', title: 'Mimir', status: 'done', kind: 'task' }, next)
+  }
+
+  it('run 尚在跑时视为活跃（含 isStreaming 缺省）', () => {
+    expect(isRunActive(createRun())).toBe(true)
+    expect(isRunActive(createRun(), true)).toBe(true)
+  })
+
+  it('run 已 done 时一律不活跃 —— 哪怕 isStreaming 残留为 true（本次事故根因）', () => {
+    const run = doneRun()
+    expect(run.status).toBe('done')
+    // 关键断言：残留的会话级标记**不得**让它重新显示「执行中 / 正在思考…」
+    expect(isRunActive(run, true)).toBe(false)
+    expect(isRunActive(run, false)).toBe(false)
+  })
+
+  it('run 为 error / canceled 时同样不活跃（终态一律不复活）', () => {
+    const next = counter()
+    const errored = applyRunEvent(createRun(), { taskId: 'main', title: 'Mimir', status: 'error', kind: 'task' }, next)
+    expect(isRunActive(errored, true)).toBe(false)
+    expect(isRunActive(cancelRun(createRun()), true)).toBe(false)
+  })
+
+  it('已 done 的 run 其活动行文案不再报「正在思考…」的语义（收据耗时为实测量）', () => {
+    const run = doneRun()
+    // 活动行只用于 running 时渲染；这里顺带锁住收据不再按「当前时间 - 开始时间」虚增耗时
+    const receipt = summarizeRun(run, Date.now() + 60_000)
+    expect(receipt.durationMs).toBe(0)
   })
 })
 

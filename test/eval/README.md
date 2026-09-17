@@ -126,7 +126,12 @@ mock 的行为是**根据 `EvalCase.expected` 反推的理想化响应**（只�
 
 适配器实现在 **`realRunner.ts`**，装配范式照抄 `test/smoke/liveAgent.test.ts`：
 **不依赖 `agentService`、不依赖 electron 的 `app.getPath`**，自己 `new ChatOpenAI` +
-`createDeepAgent` + `MimirFsBackend` 组装一个真实的单 Agent 实例。
+`createDeepAgent` + `MimirFsBackend` 组装一个真实的主 Agent 实例，并注册
+`buildDomainSubagents(domains)` 能力域子代理——**与生产 `agentService` 装配对齐**
+（主 Agent 直调全量工具，同时可通过 `task` 委派给域子代理）。若不注册子代理，
+deepagents 会注入只含默认 `general-purpose` 的 `task` 工具，模型一旦委派
+（如 `cross-01` 委派给 `literature`）会直接抛
+`invoked agent of type ... only allowed types are general-purpose` 导致整条运行失败。
 
 ### 跑起来
 
@@ -247,7 +252,8 @@ MIMIR_GW_URL=... MIMIR_GW_KEY=... MIMIR_GW_MODEL=... \
 | `other`（负例） | 2 | `neg-01` 解释 Transformer（**不该调用工具**） |
 
 工具 id 全部取自 `electron/agent/capabilityDomains.ts` 的 `WORKER_TOOL_CATALOG`（16 个），
-并由单测 `evalHarness.test.ts` 强制校验一致性（**架构已改为单 Agent + 全量工具，「子代理 / 委派」概念已废弃，用例中不存在 `task` 委派工具**）。
+并由单测 `evalHarness.test.ts` 强制校验一致性（主 Agent 直调全量工具；`task` 委派工具
+也可用，委派给域子代理时其内部工具调用同样计入 trace，见 `realRunner.ts` 装配说明）。
 `file-02` / `file-03` 额外引用内置文件工具 `read_file` / `write_file`，走 `BUILTIN_FS_TOOL_IDS` 白名单（见上文「判定规则」）。
 
 ### 用例字段

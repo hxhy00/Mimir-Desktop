@@ -11,6 +11,7 @@ import { fetchArxivSearch, fetchArxivPdf, fetchPdfBytes, paperPdfFileName } from
 import { isDoiId, normalizeDoi, resolveOaPdfLocation } from './oaLocation'
 import { httpFetch } from '../http'
 import { parseBibtex, serializeBibtex, entryFromPaper } from './bibtex'
+import { parseDuckDuckGoResults } from './webSearchParse'
 import type {
   ArxivEntry,
   ArxivSubscriptionRecord,
@@ -97,6 +98,8 @@ export async function searchArxiv(
       sortBySubmittedDate: true,
     })
   }
+  // arXiv 补充与 paper_search 共享统一访问层内的新鲜度门槛（见 paperSearch.shouldSupplementArxiv）：
+  // 只有 OpenAlex 结果显示主题近期活跃时才发 arXiv 请求，省掉 3s 节流排队与 429 暴露面。
   const { searchPapers } = await import('../agent/paperSearch')
   return searchPapers(q, maxResults, (queryText, n) =>
     fetchArxivSearch(queryText, n, AbortSignal.timeout(ARXIV_FETCH_TIMEOUT_MS)),
@@ -372,7 +375,11 @@ export async function importPapersToBib(
   } catch {
     // 文件不存在 → 从空开始
   }
-  const parsed = parseBibtex(existingText)
+  const { entries: parsed, rawByKey, errors } = parseBibtex(existingText)
+  if (errors.length > 0) {
+    throw new Error(`现有 references.bib 解析失败，已中止写入以保护原文件：${errors[0]}`)
+  }
+  const originalByKey = new Map(parsed.map((e) => [e.key, e]))
   const present = new Set(parsed.map((e) => e.key))
   const added: string[] = []
   const skipped: string[] = []
@@ -383,7 +390,7 @@ export async function importPapersToBib(
     added.push(incoming.key)
   }
   if (added.length > 0) {
-    await writeFile(bibPath, serializeBibtex(parsed), 'utf-8')
+    await writeFile(bibPath, serializeBibtex(parsed, rawByKey, originalByKey), 'utf-8')
   }
   return { added, skipped, bibPath }
 }
@@ -486,25 +493,6 @@ export async function searchWeb(query: string, maxResults = 10): Promise<WebSear
   return parseDuckDuckGoResults(html, maxResults)
 }
 
-function parseDuckDuckGoResults(html: string, maxResults: number): WebSearchEntry[] {
-  const results: WebSearchEntry[] = []
-  const resultRegex = /<div class="result[^"]*">([\s\S]*?)<\/div>\s*<\/div>\s*<\/div>/g
-  let match: RegExpExecArray | null
-  while ((match = resultRegex.exec(html)) !== null && results.length < maxResults) {
-    const block = match[1]
-    const titleMatch = block.match(/<a[^>]*class="result__a"[^>]*>([\s\S]*?)<\/a>/)
-    const urlMatch = block.match(/href="([^"]*)"/)
-    const snippetMatch = block.match(/class="result__snippet"[^>]*>([\s\S]*?)<\/a>/)
-    if (titleMatch && urlMatch) {
-      const title = titleMatch[1].replace(/<[^>]+>/g, '').trim()
-      const url = urlMatch[1]
-      const content = snippetMatch ? snippetMatch[1].replace(/<[^>]+>/g, '').trim() : ''
-      results.push({ title, url, content, engine: 'duckduckgo', category: 'general', publishedDate: '' })
-    }
-  }
-  return results
-}
-
 // ─── Zotero 集成 ───────────────────────────────────────────────────
 
 interface ZoteroConfig {
@@ -584,7 +572,11 @@ export async function exportZoteroCollectionToBib(
   })
   if (!response.ok) throw new Error(`Zotero API failed: HTTP ${response.status}`)
   const bibtex = await response.text()
-  const entries = parseBibtex(bibtex)
+  const zoteroParsed = parseBibtex(bibtex)
+  if (zoteroParsed.errors.length > 0) {
+    throw new Error(`Zotero 返回的 BibTeX 解析失败：${zoteroParsed.errors[0]}`)
+  }
+  const entries = zoteroParsed.entries
 
   const dir = project.paperDir
     ? project.paperDir
@@ -598,7 +590,11 @@ export async function exportZoteroCollectionToBib(
   } catch {
     // 文件不存在 → 从空开始
   }
-  const parsed = parseBibtex(existingText)
+  const { entries: parsed, rawByKey, errors } = parseBibtex(existingText)
+  if (errors.length > 0) {
+    throw new Error(`现有 references.bib 解析失败，已中止写入以保护原文件：${errors[0]}`)
+  }
+  const originalByKey = new Map(parsed.map((e) => [e.key, e]))
   const present = new Set(parsed.map((e) => e.key))
   const added: string[] = []
   const skipped: string[] = []
@@ -609,7 +605,7 @@ export async function exportZoteroCollectionToBib(
     added.push(incoming.key)
   }
   if (added.length > 0) {
-    await writeFile(bibPath, serializeBibtex(parsed), 'utf-8')
+    await writeFile(bibPath, serializeBibtex(parsed, rawByKey, originalByKey), 'utf-8')
   }
   return { added, skipped, bibPath }
 }

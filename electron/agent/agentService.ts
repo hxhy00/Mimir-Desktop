@@ -21,7 +21,13 @@ import {
 } from './capabilityDomains'
 import { MimirFsBackend } from './fsBackend'
 import { createLanguageMiddleware } from './languageMiddleware'
-import { createAgentTraceHandler, type AgentTraceLevel } from './trace'
+import {
+  initializeOtelFromCurrentConfig,
+  withAgentTurnContext,
+  startAgentTurnSpan,
+  endAgentTurnSpan,
+  failAgentTurnSpan
+} from './otelTrace'
 import { withApprovalSource, type ApprovalSource } from './approval'
 import { assertNoDelegationTools, guardSubagentTools } from './delegationFirewall'
 import {
@@ -40,6 +46,8 @@ import {
 import { UltraController, type UltraStrategyPick } from './ultra'
 import { pickStructuredMethod } from './gatewayProbe'
 import { humanizeAgentError, truncateSummary } from './agentText'
+import type { AgentStreamEventDraft } from './streamProtocol'
+import { agentLog } from '../logger'
 
 // Ultra 增强层的公开面从 ultra.ts 转出（实现已迁至该模块，见其文件头说明），
 // 保持既有引用点（IPC / 测试 / 未来入口）无需改动。
@@ -126,6 +134,17 @@ export interface AgentWorkerEvent {
  * 这里只维护一份轻量目录，让模型在自然语言请求命中时也知道按对应框架走。
  * 触发词/说明需与 src/lib/slash/registry.ts 保持一致。
  */
+/**
+ * 正文增量的攒批参数（发送侧）。
+ *
+ * 逐 token 外发会退化为每 token 一次 `webContents.send`，在渲染进程主线程繁忙时于 IPC
+ * 投递层被静默丢弃（实测主进程 242 发 / preload 仅 10 收）。攒批把外发次数压到每轮 ~10 次量级。
+ * - 时间阈值取 50ms：约 20fps，肉眼仍为「逐字」观感，同时远低于丢包发生的高频区间。
+ * - 字符阈值取 200：长文本时不等满时间片即冲，避免大段延迟。
+ */
+const TEXT_FLUSH_MS = 50
+const TEXT_FLUSH_CHARS = 200
+
 const SLASH_CATALOG_TEXT = `## 技能与指令
 
 Mimir 提供一组科研「技能」与「指令」，用户在输入框以 / 前缀调用（例：/research-lit-review 多智能体可靠性）。当消息以已知的 / 触发词开头时，完整执行说明会随该消息附带，你必须严格按其中的步骤、门禁与硬规则执行。这些触发词也可以自然语言的方式被提出——此时同样按对应技能的框架推进：
@@ -278,6 +297,41 @@ export interface StepFileAction {
 }
 
 /**
+ * 从 Agent 最终状态里取最后一条 AI 消息的纯文本（对账用第二来源）。
+ *
+ * 为什么需要它：`run.messages` 的流式累计是「主进程自己算的」，它只能证明链路一致，
+ * 无法证明「模型本该说更多」。`run.output` 是 Agent 的最终状态，独立于流，可用来判定
+ * 「流被截断」还是「模型只说这么多」。content 兼容 string / 分块数组两种形态。
+ */
+async function extractFinalAiText(
+  output: Promise<{ messages?: Array<{ content?: unknown }> }> | undefined
+): Promise<string> {
+  if (output === undefined) return ''
+  try {
+    const state = await output
+    const msgs = state?.messages
+    if (!Array.isArray(msgs) || msgs.length === 0) return ''
+    const last = msgs[msgs.length - 1]
+    const content = last?.content
+    if (typeof content === 'string') return content
+    if (Array.isArray(content)) {
+      return content
+        .map((part) => {
+          if (typeof part === 'string') return part
+          if (typeof part === 'object' && part !== null && typeof (part as { text?: unknown }).text === 'string') {
+            return (part as { text: string }).text
+          }
+          return ''
+        })
+        .join('')
+    }
+    return ''
+  } catch {
+    return ''
+  }
+}
+
+/**
  * 从工具入参派生「文件动作」信息。
  *
  * 只做**结构性提取**（读 `file_path` / `path` 与内容字段），不做任何文案推断 ——
@@ -380,6 +434,26 @@ interface ToolCallStream {
   output?: unknown
   /** 调用状态 —— 注意 SDK 给的是 **Promise**（未 await 前是 pending），不是字符串。 */
   status?: unknown
+}
+
+/**
+ * `agent.streamEvents(..., { version: 'v3' })` 的返回面（弱化 deepagents 强泛型差异）。
+ *
+ * 抽成具名类型是为了让 `collectToolEvents` / `collectSubagentEvents` 两个采集方法
+ * 能独立声明入参——它们与 `messages` 并发迭代同一份 `run`，互不阻塞。
+ */
+interface StreamRun {
+  messages: AsyncIterable<{ text: AsyncIterable<string>; reasoning?: AsyncIterable<string> }>
+  /** 结构化工具调用流，覆盖全部工具（含 deepagents 内置文件工具）。 */
+  toolCalls?: AsyncIterable<ToolCallStream>
+  /** 委派子代理流：仅当主 Agent 调用 `task` 时才会产生元素。 */
+  subagents?: AsyncIterable<{
+    name?: string
+    toolCalls?: AsyncIterable<ToolCallStream>
+    messages?: AsyncIterable<{ text: AsyncIterable<string>; reasoning?: AsyncIterable<string> }>
+  }>
+  /** Agent 最终状态（promise-like）：含完整 messages 数组，用于流式累计之外的对账。 */
+  output?: Promise<{ messages?: Array<{ content?: unknown }> }>
 }
 
 /** AgentService 实际用到的 Agent 调用面（弱化 deepagents 的强泛型差异）。 */
@@ -500,26 +574,11 @@ export class AgentService {
   async initialize(config: AgentConfig): Promise<void> {
     this.config = config
 
-    // 模型层全链路 trace（settings.agentTraceLevel: off/compact/full，缺省 compact）：
-    // handler 挂到 ChatOpenAI 构造 callbacks，LangChain 会把它作为每次模型运行的默认回调，
-    // 从而覆盖 Agent 主循环 / 各增强子图 / 压缩等全部模型调用，无需在库内埋桩。
-    let traceLevel: AgentTraceLevel = 'compact'
-    try {
-      const envRaw = process.env.MIMIR_AGENT_TRACE
-      if (envRaw === 'off' || envRaw === 'compact' || envRaw === 'full') {
-        traceLevel = envRaw
-      } else {
-        const settings = (getStoreValue<Record<string, unknown>>('settings') ?? {}) as Record<string, unknown>
-        const raw = settings.agentTraceLevel
-        if (raw === 'off' || raw === 'compact' || raw === 'full') traceLevel = raw
-      }
-    } catch {
-      // 读取失败保持缺省 compact
-    }
-    const traceHandler = createAgentTraceHandler(traceLevel)
-    if (traceHandler !== null) {
-      console.log(`[agent] 模型层 trace 已开启（level=${traceLevel}，JSONL 落盘 ~/.mimir/logs/agent-trace-*.jsonl；设置 settings.agentTraceLevel=off 可关闭）`)
-    }
+    // 模型层全链路可观测性（OpenTelemetry，见 otelTrace.ts）：
+    // 插桩挂在 LangChain 的 CallbackManager 上（manuallyInstrument），覆盖 Agent 主循环 /
+    // 各增强子图 / 历史压缩 / 技能路由等**全部**模型与工具调用，无需在库内埋桩。
+    // 未配置 OTLP 端点时完全不初始化 SDK：零开销、零网络请求。
+    await initializeOtelFromCurrentConfig()
 
     // 思考模式：仅对确认支持的上游开启（详见 AgentConfig.reasoning 注释）。
     const reasoningOn = config.reasoning ?? autoReasoningFor(config.baseUrl)
@@ -534,7 +593,6 @@ export class AgentService {
         apiKey: config.apiKey,
         model: config.model,
         temperature,
-        ...(traceHandler !== null ? { callbacks: [traceHandler] } : {}),
         ...(config.baseUrl ? { configuration: { baseURL: config.baseUrl } } : {}),
         ...(reasoningOn
           ? { modelKwargs: { thinking: { type: 'enabled' }, reasoning_effort: 'high' } }
@@ -686,9 +744,13 @@ export class AgentService {
   }
 
   /**
-   * Stream a message to the agent, calling onChunk for each chunk.
+   * Stream a message to the agent, calling onEvent for each structured event.
+   *
+   * 只发**结构化事件**（见 `streamProtocol.ts`），不再产出「前缀信封字符串」：
+   * 正文增量 / 过程事件 / 流结束 / 出错统一走一条事件通道，由调用方（IPC 层）编排 seq。
    * 可通过 {@link stopStreaming} 中止：abort 后返回已收到的部分内容。
-   * @param onWorkerEvent 工具/阶段执行过程事件（渲染层事件树用）
+   *
+   * @param onEvent 结构化事件外发器（正文增量 / 过程事件 / 结束 / 出错）
    * @param options.ultra 开启「Ultra 增强控制器」（可选的增强层）：enabled 总开关，strategy 为
    *   增强策略（'auto' 由 Ultra 自动选，或 plain / multi_expert / critique_reflect / hybrid_mix /
    *   self_consistency_vote）。
@@ -700,12 +762,11 @@ export class AgentService {
   async streamMessage(
     message: string,
     conversationId: string,
-    onChunk: (chunk: string) => void,
-    onWorkerEvent?: (event: AgentWorkerEvent) => void,
+    onEvent: (event: AgentStreamEventDraft) => void,
     options?: {
       ultra?: { enabled: boolean; strategy?: UltraStrategyPick }
       history?: HistoryMsg[]
-      /** 渲染层 slash 目录（技能/指令）的触发词与标题。 */
+      /** 渲染层 slash 目录（技能/指令）的触发词与标题，供压缩后重建能力声明。 */
       skills?: SkillRef[]
       /** 手动 /trigger 直通：跳过技能路由（用户显式触发，正文已注入）。 */
       manual?: boolean
@@ -717,9 +778,314 @@ export class AgentService {
     }
     // 工具事件归属：整条执行链在「本会话」的 AsyncLocalStorage 上下文里运行，
     // 链内所有工具调用（含并发）据此路由到本会话的外发器，不会被其它并行会话覆盖。
-    return this.toolEventConv.run(conversationId, () =>
-      this.runConversation(agent, message, conversationId, onChunk, onWorkerEvent, options)
+    //
+    // 可观测性：在会话上下文外层再包一层 OTel 根 span（`agent.turn`），本轮所有
+    // 模型/工具 span 都会挂到它下面，在 Langfuse 里呈现为「一轮对话一棵树」。
+    // 未启用 OTel 时 `turn` 为 null，两个包装函数都直接透传 —— 零开销。
+    const turn = startAgentTurnSpan(message, conversationId, {
+      'agent.model': this.config?.model ?? '',
+      'agent.manual': options?.manual === true,
+      'agent.ultra': options?.ultra?.enabled === true
+    })
+    return withAgentTurnContext(turn, () =>
+      this.toolEventConv
+        .run(conversationId, () => this.runConversation(agent, message, conversationId, onEvent, options))
+        .then((content) => {
+          endAgentTurnSpan(turn, content)
+          return content
+        })
+        .catch((error: unknown) => {
+          failAgentTurnSpan(turn, error)
+          throw error
+        })
     )
+  }
+
+  /**
+   * 采集**委派子代理事件**。
+   *
+   * deepagents 的 `task` 工具被调用时会 fork 一个独立上下文的子代理，其内部工具
+   * **不会**出现在主 `run.toolCalls` 里，必须订阅 `run.subagents` 才能看到。
+   * 归因规则：子代理名即能力域 id，用它反查展示标签，事件带 `origin='subagent'`，
+   * 让渲染层把它折叠到对应委派节点下。
+   */
+  private async collectSubagentEvents(
+    run: StreamRun,
+    signal: AbortSignal,
+    emit: (event: AgentWorkerEvent) => void
+  ): Promise<void> {
+    const subs = run.subagents
+    if (subs === undefined) return
+    for await (const sub of subs) {
+      if (signal.aborted) return
+      const domainId = typeof sub?.name === 'string' ? sub.name : ''
+      const domainLabel = this.toolDomainLabels.get(domainId) ?? domainId
+      // 委派开始：一条 task 节点，渲染层据此折叠后续子代理步骤。
+      emit({
+        taskId: `subagent:${domainId}`,
+        title: domainLabel !== '' ? domainLabel : '子代理',
+        status: 'running',
+        kind: 'task',
+        phase: 'main',
+        step: {
+          callId: `subagent:${domainId}`,
+          name: 'task',
+          ...(domainLabel !== '' ? { label: domainLabel } : {}),
+          stage: 'call',
+          origin: 'subagent',
+          ...(domainId !== '' ? { subagentId: domainId } : {}),
+          ...(domainLabel !== '' ? { subagentLabel: domainLabel } : {})
+        },
+        text: `委派给「${domainLabel}」子代理`
+      })
+      const inner = (async (): Promise<void> => {
+        const innerCalls = sub?.toolCalls
+        if (innerCalls === undefined) return
+        let innerSeq = 0
+        for await (const call of innerCalls) {
+          if (signal.aborted) return
+          innerSeq += 1
+          const name = typeof call?.name === 'string' && call.name !== '' ? call.name : `tool#${innerSeq}`
+          const callId = `${domainId}:${name}#${innerSeq}`
+          const file = fileActionOf(name, call.input)
+          const command = commandActionOf(name, call.input)
+          const stamp = {
+            origin: 'subagent' as const,
+            ...(domainId !== '' ? { subagentId: domainId } : {}),
+            ...(domainLabel !== '' ? { subagentLabel: domainLabel } : {})
+          }
+          emit({
+            taskId: `subagent:${domainId}`,
+            title: domainLabel !== '' ? domainLabel : '子代理',
+            status: 'running',
+            kind: 'tool',
+            phase: 'main',
+            step: {
+              callId,
+              name,
+              ...(domainLabel !== '' ? { label: domainLabel } : {}),
+              ...(file !== undefined ? { file } : {}),
+              ...(command !== undefined ? { command } : {}),
+              stage: 'call',
+              argsSummary: truncateSummary(call.input, 200),
+              ...stamp
+            },
+            text: `调用 ${name}${call.input !== undefined ? `：${truncateSummary(call.input, 120)}` : ''}`
+          })
+          const t0 = Date.now()
+          try {
+            const out = await call.output
+            const artifacts = extractArtifacts(out)
+            if (file !== undefined && (file.action === 'write' || file.action === 'edit')) {
+              const abs = resolve(file.path)
+              if (!artifacts.some((a) => a.path === abs)) {
+                artifacts.unshift({ path: abs, name: basename(abs), ext: extname(abs).toLowerCase() })
+              }
+            }
+            emit({
+              taskId: `subagent:${domainId}`,
+              title: domainLabel !== '' ? domainLabel : '子代理',
+              status: 'done',
+              kind: 'tool',
+              phase: 'main',
+              durationMs: Date.now() - t0,
+              step: {
+                callId,
+                name,
+                ...(domainLabel !== '' ? { label: domainLabel } : {}),
+                ...(file !== undefined ? { file } : {}),
+                ...(command !== undefined ? { command } : {}),
+                stage: 'result',
+                resultSummary: truncateSummary(out, 4000),
+                ...stamp
+              },
+              ...(artifacts.length > 0 ? { artifacts } : {}),
+              text: `${name} 返回：${truncateSummary(out, 4000)}`
+            })
+          } catch (error) {
+            emit({
+              taskId: `subagent:${domainId}`,
+              title: domainLabel !== '' ? domainLabel : '子代理',
+              status: 'error',
+              kind: 'tool',
+              phase: 'main',
+              durationMs: Date.now() - t0,
+              step: {
+                callId,
+                name,
+                ...(domainLabel !== '' ? { label: domainLabel } : {}),
+                ...(file !== undefined ? { file } : {}),
+                stage: 'error',
+                resultSummary: humanizeAgentError(error),
+                ...stamp
+              },
+              text: `${name} 出错：${humanizeAgentError(error)}`
+            })
+          }
+        }
+      })()
+      // 子代理产出文本（可选）：用于把「子代理自己说了什么」也带出来。
+      const innerText = (async (): Promise<void> => {
+        const msgs = sub?.messages
+        if (msgs === undefined) return
+        for await (const m of msgs) {
+          if (signal.aborted) return
+          // 子代理的逐字文本对主回复无贡献（结果由 task 的 ToolMessage 回传），
+          // 这里只把 reasoning 当作过程信息透出，避免与主回复文本混流。
+          const reasoning = m?.reasoning
+          if (reasoning === undefined) continue
+          let buf = ''
+          for await (const piece of reasoning) {
+            if (signal.aborted) return
+            buf += piece
+          }
+          if (buf !== '') {
+            emit({
+              taskId: `subagent:${domainId}`,
+              title: domainLabel !== '' ? domainLabel : '子代理',
+              status: 'running',
+              kind: 'think',
+              phase: 'main',
+              text: buf,
+              step: {
+                callId: `${domainId}:think`,
+                name: 'think',
+                ...(domainLabel !== '' ? { label: domainLabel } : {}),
+                stage: 'call',
+                origin: 'subagent',
+                ...(domainId !== '' ? { subagentId: domainId } : {})
+              }
+            })
+          }
+        }
+      })()
+      try {
+        await Promise.all([inner, innerText])
+      } catch {
+        /* 子代理内部异常不应中断主流；细节已由内层捕获或 task 的 ToolMessage 带回 */
+      }
+      emit({
+        taskId: `subagent:${domainId}`,
+        title: domainLabel !== '' ? domainLabel : '子代理',
+        status: 'done',
+        kind: 'task',
+        phase: 'main',
+        step: {
+          callId: `subagent:${domainId}`,
+          name: 'task',
+          ...(domainLabel !== '' ? { label: domainLabel } : {}),
+          stage: 'result',
+          origin: 'subagent',
+          ...(domainId !== '' ? { subagentId: domainId } : {}),
+          ...(domainLabel !== '' ? { subagentLabel: domainLabel } : {})
+        },
+        text: `「${domainLabel}」子代理已完成`
+      })
+    }
+  }
+  /**
+   * 采集主 Agent 的**工具调用事件**（结构化，覆盖全部工具）。
+   *
+   * 用 SDK 的 `run.toolCalls` 而不是逐工具包装：它是唯一覆盖**全部**工具的出口，
+   * 包括 deepagents 内置文件工具（write_file/edit_file/read_file/ls/glob/grep/delete
+   * —— 它们过去完全不在轨迹里），而且直接给名字/入参/出参，无需任何文案嗅探。
+   * 与正文流（`run.messages`）可并发迭代，因此与主循环并行跑。
+   */
+  private async collectToolEvents(
+    run: StreamRun,
+    signal: AbortSignal,
+    emit: (event: AgentWorkerEvent) => void
+  ): Promise<void> {
+    const calls = run.toolCalls
+    if (calls === undefined) return
+    let seq = 0
+    for await (const call of calls) {
+      if (signal.aborted) return
+      seq += 1
+      const name = typeof call?.name === 'string' && call.name !== '' ? call.name : `tool#${seq}`
+      // 同一次调用的 调用/返回/出错 共享 callId，渲染层据此配成一行（不再猜文案）
+      const callId = `${name}#${seq}`
+      const label = this.toolDomainLabels.get(name)
+      // 文件动作（内置文件工具才有）：让时间线显示「写入 model.py +387」而不是一坨 JSON 入参
+      const file = fileActionOf(name, call.input)
+      // 命令行（execute 才有）：让时间线显示「运行 <命令>」而不是笼统的工具名。
+      const command = commandActionOf(name, call.input)
+      emit({
+        taskId: 'main',
+        title: 'Mimir',
+        status: 'running',
+        kind: 'tool',
+        phase: 'main',
+        step: {
+          callId,
+          name,
+          ...(label !== undefined ? { label } : {}),
+          ...(file !== undefined ? { file } : {}),
+          ...(command !== undefined ? { command } : {}),
+          stage: 'call',
+          argsSummary: truncateSummary(call.input, 200),
+          origin: 'main'
+        },
+        text: `调用 ${name}${call.input !== undefined ? `：${truncateSummary(call.input, 120)}` : ''}`
+      })
+      const t0 = Date.now()
+      try {
+        const out = await call.output
+        // 产物识别双通道：① 结构化——write/edit/delete 的目标路径是一手事实，直接计入；
+        // ② 文本嗅探——模块工具返回自然语言里的路径（extractArtifacts）。二者并集去重。
+        // 此前只有②，且白名单不含 .py，导致「写了 6 个文件、验收卡只显示 2 个」。
+        const artifacts = extractArtifacts(out)
+        if (file !== undefined && (file.action === 'write' || file.action === 'edit')) {
+          const abs = resolve(file.path)
+          if (!artifacts.some((a) => a.path === abs)) {
+            artifacts.unshift({
+              path: abs,
+              name: basename(abs),
+              ext: extname(abs).toLowerCase()
+            })
+          }
+        }
+        emit({
+          taskId: 'main',
+          title: 'Mimir',
+          status: 'done',
+          kind: 'tool',
+          phase: 'main',
+          durationMs: Date.now() - t0,
+          step: {
+            callId,
+            name,
+            ...(label !== undefined ? { label } : {}),
+            ...(file !== undefined ? { file } : {}),
+            ...(command !== undefined ? { command } : {}),
+            stage: 'result',
+            resultSummary: truncateSummary(out, 4000),
+            origin: 'main'
+          },
+          ...(artifacts.length > 0 ? { artifacts } : {}),
+          text: `${name} 返回：${truncateSummary(out, 4000)}`
+        })
+      } catch (error) {
+        emit({
+          taskId: 'main',
+          title: 'Mimir',
+          status: 'error',
+          kind: 'tool',
+          phase: 'main',
+          durationMs: Date.now() - t0,
+          step: {
+            callId,
+            name,
+            ...(label !== undefined ? { label } : {}),
+            ...(file !== undefined ? { file } : {}),
+            stage: 'error',
+            resultSummary: humanizeAgentError(error),
+            origin: 'main'
+          },
+          text: `${name} 出错：${humanizeAgentError(error)}`
+        })
+      }
+    }
   }
 
   /**
@@ -730,8 +1096,7 @@ export class AgentService {
     agent: NonNullable<AgentService['agent']>,
     message: string,
     conversationId: string,
-    onChunk: (chunk: string) => void,
-    onWorkerEvent: ((event: AgentWorkerEvent) => void) | undefined,
+    onEvent: (event: AgentStreamEventDraft) => void,
     options: {
       ultra?: { enabled: boolean; strategy?: UltraStrategyPick }
       history?: HistoryMsg[]
@@ -742,7 +1107,9 @@ export class AgentService {
     const controller = new AbortController()
     /** 本次回复的轨迹外发器；主流程各阶段用它补齐 Agent 自身的节点。 */
     // 所有过程事件都从这里出去 —— 因此 `phase` 在这里统一补全，各 emit 站点无需重复标注。
-    const emit = (event: AgentWorkerEvent): void => onWorkerEvent?.(withPhase(event))
+    // 过程事件与正文增量共用同一个 onEvent 出口（协议统一），不再区分两条回调。
+    const emit = (event: AgentWorkerEvent): void =>
+      onEvent({ type: 'worker', payload: withPhase(event) })
     // 多会话并行：本会话登记自己的任务运行时。若同会话已有任务在跑，先中止旧的，
     // 避免同一会话内两条流交叉；不同会话互不影响。
     this.runningTasks.get(conversationId)?.abort.abort()
@@ -878,6 +1245,12 @@ export class AgentService {
       // 「Agent → 工具」的层级（工具行文本里另带能力域标签），而不是散落的顶层行。
       emit({ taskId: 'main', title: 'Mimir', status: 'running', kind: 'task', phase: 'main' })
 
+      // 三条并行消费协程（正文流之外的旁路）。在 try 外声明，使 catch 收尾时也能统一 await 收敛，
+      // 避免异常/中止路径下它们仍在后续运行并向已关闭的渲染层投递事件。
+      let toolLoop: Promise<void> = Promise.resolve()
+      let subagentLoop: Promise<void> = Promise.resolve()
+      const reasoningLoops: Array<Promise<void>> = []
+
       // 官方推荐：streamEvents(state, { version: 'v3' }) → run.messages 内每条
       // AI 消息的 .text 是逐字 AsyncIterable。deepagents legacy `.stream()` 的
       // chunk 结构与文本抽取不匹配（会“正常结束但零输出”），已弃用。
@@ -894,287 +1267,40 @@ export class AgentService {
             toolCalls?: AsyncIterable<ToolCallStream>
             messages?: AsyncIterable<{ text: AsyncIterable<string>; reasoning?: AsyncIterable<string> }>
           }>
+          /** Agent 最终状态（promise-like）：含完整 messages 数组，是「流式累计」之外的第二个事实来源，用于对账。 */
+          output?: Promise<{ messages?: Array<{ content?: unknown }> }>
         }>)(
           { messages: inputMessages },
           { version: 'v3' },
         )
 
-        // ── 子代理（委派）事件采集 ───────────────────────────────────────────
-        // deepagents 的 `task` 工具被调用时会 fork 一个独立上下文的子代理。它的内部工具
-        // **不会**出现在主 `run.toolCalls` 里（那是主 Agent 自己的流），必须订阅
-        // `run.subagents` 才能看到「子代理正在做什么」。
-        // 归因规则：子代理名即能力域 id（见 buildDomainSubagents），用它反查展示标签，
-        // 事件带 origin='subagent'，让渲染层把它折叠到对应委派节点下。
-        const subagentLoop = (async (): Promise<void> => {
-          const subs = run.subagents
-          if (subs === undefined) return
-          for await (const sub of subs) {
-            if (controller.signal.aborted) return
-            const domainId = typeof sub?.name === 'string' ? sub.name : ''
-            const domainLabel = this.toolDomainLabels.get(domainId) ?? domainId
-            // 委派开始：一条 task 节点，渲染层据此折叠后续子代理步骤。
-            emit({
-              taskId: `subagent:${domainId}`,
-              title: domainLabel !== '' ? domainLabel : '子代理',
-              status: 'running',
-              kind: 'task',
-              phase: 'main',
-              step: {
-                callId: `subagent:${domainId}`,
-                name: 'task',
-                ...(domainLabel !== '' ? { label: domainLabel } : {}),
-                stage: 'call',
-                origin: 'subagent',
-                ...(domainId !== '' ? { subagentId: domainId } : {}),
-                ...(domainLabel !== '' ? { subagentLabel: domainLabel } : {})
-              },
-              text: `委派给「${domainLabel}」子代理`
-            })
-            const inner = (async (): Promise<void> => {
-              const innerCalls = sub?.toolCalls
-              if (innerCalls === undefined) return
-              let innerSeq = 0
-              for await (const call of innerCalls) {
-                if (controller.signal.aborted) return
-                innerSeq += 1
-                const name = typeof call?.name === 'string' && call.name !== '' ? call.name : `tool#${innerSeq}`
-                const callId = `${domainId}:${name}#${innerSeq}`
-                const file = fileActionOf(name, call.input)
-                const command = commandActionOf(name, call.input)
-                const stamp = {
-                  origin: 'subagent' as const,
-                  ...(domainId !== '' ? { subagentId: domainId } : {}),
-                  ...(domainLabel !== '' ? { subagentLabel: domainLabel } : {})
-                }
-                emit({
-                  taskId: `subagent:${domainId}`,
-                  title: domainLabel !== '' ? domainLabel : '子代理',
-                  status: 'running',
-                  kind: 'tool',
-                  phase: 'main',
-                  step: {
-                    callId,
-                    name,
-                    ...(domainLabel !== '' ? { label: domainLabel } : {}),
-                    ...(file !== undefined ? { file } : {}),
-                    ...(command !== undefined ? { command } : {}),
-                    stage: 'call',
-                    argsSummary: truncateSummary(call.input, 200),
-                    ...stamp
-                  },
-                  text: `调用 ${name}${call.input !== undefined ? `：${truncateSummary(call.input, 120)}` : ''}`
-                })
-                const t0 = Date.now()
-                try {
-                  const out = await call.output
-                  const artifacts = extractArtifacts(out)
-                  if (file !== undefined && (file.action === 'write' || file.action === 'edit')) {
-                    const abs = resolve(file.path)
-                    if (!artifacts.some((a) => a.path === abs)) {
-                      artifacts.unshift({ path: abs, name: basename(abs), ext: extname(abs).toLowerCase() })
-                    }
-                  }
-                  emit({
-                    taskId: `subagent:${domainId}`,
-                    title: domainLabel !== '' ? domainLabel : '子代理',
-                    status: 'done',
-                    kind: 'tool',
-                    phase: 'main',
-                    durationMs: Date.now() - t0,
-                    step: {
-                      callId,
-                      name,
-                      ...(domainLabel !== '' ? { label: domainLabel } : {}),
-                      ...(file !== undefined ? { file } : {}),
-                      ...(command !== undefined ? { command } : {}),
-                      stage: 'result',
-                      resultSummary: truncateSummary(out, 4000),
-                      ...stamp
-                    },
-                    ...(artifacts.length > 0 ? { artifacts } : {}),
-                    text: `${name} 返回：${truncateSummary(out, 4000)}`
-                  })
-                } catch (error) {
-                  emit({
-                    taskId: `subagent:${domainId}`,
-                    title: domainLabel !== '' ? domainLabel : '子代理',
-                    status: 'error',
-                    kind: 'tool',
-                    phase: 'main',
-                    durationMs: Date.now() - t0,
-                    step: {
-                      callId,
-                      name,
-                      ...(domainLabel !== '' ? { label: domainLabel } : {}),
-                      ...(file !== undefined ? { file } : {}),
-                      stage: 'error',
-                      resultSummary: humanizeAgentError(error),
-                      ...stamp
-                    },
-                    text: `${name} 出错：${humanizeAgentError(error)}`
-                  })
-                }
-              }
-            })()
-            // 子代理产出文本（可选）：用于把「子代理自己说了什么」也带出来。
-            const innerText = (async (): Promise<void> => {
-              const msgs = sub?.messages
-              if (msgs === undefined) return
-              for await (const m of msgs) {
-                if (controller.signal.aborted) return
-                // 子代理的逐字文本对主回复无贡献（结果由 task 的 ToolMessage 回传），
-                // 这里只把 reasoning 当作过程信息透出，避免与主回复文本混流。
-                const reasoning = m?.reasoning
-                if (reasoning === undefined) continue
-                let buf = ''
-                for await (const piece of reasoning) {
-                  if (controller.signal.aborted) return
-                  buf += piece
-                }
-                if (buf !== '') {
-                  emit({
-                    taskId: `subagent:${domainId}`,
-                    title: domainLabel !== '' ? domainLabel : '子代理',
-                    status: 'running',
-                    kind: 'think',
-                    phase: 'main',
-                    text: buf,
-                    step: {
-                      callId: `${domainId}:think`,
-                      name: 'think',
-                      ...(domainLabel !== '' ? { label: domainLabel } : {}),
-                      stage: 'call',
-                      origin: 'subagent',
-                      ...(domainId !== '' ? { subagentId: domainId } : {})
-                    }
-                  })
-                }
-              }
-            })()
-            try {
-              await Promise.all([inner, innerText])
-            } catch {
-              /* 子代理内部异常不应中断主流；细节已由内层捕获或 task 的 ToolMessage 带回 */
-            }
-            emit({
-              taskId: `subagent:${domainId}`,
-              title: domainLabel !== '' ? domainLabel : '子代理',
-              status: 'done',
-              kind: 'task',
-              phase: 'main',
-              step: {
-                callId: `subagent:${domainId}`,
-                name: 'task',
-                ...(domainLabel !== '' ? { label: domainLabel } : {}),
-                stage: 'result',
-                origin: 'subagent',
-                ...(domainId !== '' ? { subagentId: domainId } : {}),
-                ...(domainLabel !== '' ? { subagentLabel: domainLabel } : {})
-              },
-              text: `「${domainLabel}」子代理已完成`
-            })
-          }
-        })()
+        // 委派子代理事件由 collectSubagentEvents 采集（与正文流并行）。
+        subagentLoop = this.collectSubagentEvents(run, controller.signal, emit)
 
-        // ── 工具步骤采集（结构化，覆盖全部工具）──────────────────────────────
-        // 用 SDK 的 `run.toolCalls` 而不是逐工具包装：它是唯一覆盖**全部**工具的出口，
-        // 包括 deepagents 内置文件工具（write_file/edit_file/read_file/ls/glob/grep/delete
-        // —— 它们过去完全不在轨迹里），而且直接给名字/入参/出参，不需要任何文案嗅探。
-        // 两条投影可并发迭代（已实测），因此这里与正文流并行跑。
-        const toolLoop = (async (): Promise<void> => {
-          const calls = run.toolCalls
-          if (calls === undefined) return
-          let seq = 0
-          for await (const call of calls) {
-            if (controller.signal.aborted) return
-            seq += 1
-            const name = typeof call?.name === 'string' && call.name !== '' ? call.name : `tool#${seq}`
-            // 同一次调用的 调用/返回/出错 共享 callId，渲染层据此配成一行（不再猜文案）
-            const callId = `${name}#${seq}`
-            const label = this.toolDomainLabels.get(name)
-            // 文件动作（内置文件工具才有）：让时间线显示「写入 model.py +387」而不是一坨 JSON 入参
-            const file = fileActionOf(name, call.input)
-            // 命令行（execute 才有）：让时间线显示「运行 <命令>」而不是笼统的工具名。
-            const command = commandActionOf(name, call.input)
-            emit({
-              taskId: 'main',
-              title: 'Mimir',
-              status: 'running',
-              kind: 'tool',
-              phase: 'main',
-              step: {
-                callId,
-                name,
-                ...(label !== undefined ? { label } : {}),
-                ...(file !== undefined ? { file } : {}),
-                ...(command !== undefined ? { command } : {}),
-                stage: 'call',
-                argsSummary: truncateSummary(call.input, 200),
-                origin: 'main'
-              },
-              text: `调用 ${name}${call.input !== undefined ? `：${truncateSummary(call.input, 120)}` : ''}`
-            })
-            const t0 = Date.now()
-            try {
-              const out = await call.output
-              // 产物识别双通道：① 结构化——write/edit/delete 的目标路径是一手事实，直接计入；
-              // ② 文本嗅探——模块工具返回自然语言里的路径（extractArtifacts）。二者并集去重。
-              // 此前只有②，且白名单不含 .py，导致「写了 6 个文件、验收卡只显示 2 个」。
-              const artifacts = extractArtifacts(out)
-              if (file !== undefined && (file.action === 'write' || file.action === 'edit')) {
-                const abs = resolve(file.path)
-                if (!artifacts.some((a) => a.path === abs)) {
-                  artifacts.unshift({
-                    path: abs,
-                    name: basename(abs),
-                    ext: extname(abs).toLowerCase()
-                  })
-                }
-              }
-              emit({
-                taskId: 'main',
-                title: 'Mimir',
-                status: 'done',
-                kind: 'tool',
-                phase: 'main',
-                durationMs: Date.now() - t0,
-                step: {
-                  callId,
-                  name,
-                  ...(label !== undefined ? { label } : {}),
-                  ...(file !== undefined ? { file } : {}),
-                  ...(command !== undefined ? { command } : {}),
-                  stage: 'result',
-                  resultSummary: truncateSummary(out, 4000),
-                  origin: 'main'
-                },
-                ...(artifacts.length > 0 ? { artifacts } : {}),
-                text: `${name} 返回：${truncateSummary(out, 4000)}`
-              })
-            } catch (error) {
-              emit({
-                taskId: 'main',
-                title: 'Mimir',
-                status: 'error',
-                kind: 'tool',
-                phase: 'main',
-                durationMs: Date.now() - t0,
-                step: {
-                  callId,
-                  name,
-                  ...(label !== undefined ? { label } : {}),
-                  ...(file !== undefined ? { file } : {}),
-                  stage: 'error',
-                  resultSummary: humanizeAgentError(error),
-                  origin: 'main'
-                },
-                text: `${name} 出错：${humanizeAgentError(error)}`
-              })
-            }
-          }
-        })()
+        // ── 正文流消费 ───────────────────────────────────────────────────────
+        // msgSeq/msgChars 仅用于观测（见下方 stream.msg / stream.reconcile 日志）。
+        let msgSeq = 0
+
+        // ── 正文增量攒批外发 ─────────────────────────────────────────────────
+        // 逐 token 调用 onEvent 会退化成「每 token 一次 webContents.send」，在渲染进程主线程
+        // 繁忙时于 IPC 投递层静默丢包（实测 242 发 / 10 收）。这里在**发送侧**把 token 攒成批：
+        // 达到 TEXT_FLUSH_CHARS 或距上次外发超过 TEXT_FLUSH_MS 即合并成一帧下发。
+        // 协议无需变更——`text-delta.delta` 本就是「增量字符串」，一批也是增量，接收端累加语义不变。
+        let textBuf = ''
+        let lastTextFlush = 0
+        /** 冲掉缓冲：非空才外发，避免产生空增量事件。 */
+        const flushText = (): void => {
+          if (textBuf === '') return
+          onEvent({ type: 'text-delta', delta: textBuf })
+          textBuf = ''
+        }
+
+        // 工具调用事件由 collectToolEvents 与正文流并行采集（见方法注释）。
+        toolLoop = this.collectToolEvents(run, controller.signal, emit)
 
         for await (const msg of run.messages) {
+          msgSeq += 1
+          let msgChars = 0
           // 思考（reasoning）：是否有内容取决于上游是否开了思考模式（见 AgentConfig.reasoning）。
           // 官方 deepseek-flash 在 thinking=enabled 下 `reasoning_content` 逐字流会被
           // deepagents 投影为 msg.reasoning（已实测 ~500 字符）；第三方代理不透传该参数时
@@ -1182,37 +1308,103 @@ export class AgentService {
           // 按 ~200ms 合并成批再外发：逐 token 发会让渲染层再次被事件洪流压住
           // （正是「批准卡迟迟不弹」的成因）。
           const reasoning = msg.reasoning
+          // 关键：`msg.reasoning` 与 `msg.text` 共享同一个 ReplayBuffer（见 @langchain/core
+          // language_models/stream：ChatModelStream 的 text/reasoning 都是同一 _buffer 的投影）。
+          // ReasoningContentStream 在**没有 reasoning 内容**时不会提前结束，必须等到底层
+          // `message-finish` 才 return——若在此处同步 await 它，会把整个流的时长阻塞在
+          // 正文迭代之前，导致 msg.text 的 content-block-delta 全部积压、最后一次性吐出
+          // （表现为首字延迟=整段回答时长、打字机失效）。
+          // 因此 reasoning 必须与 text **并发消费**，各自在自己的时间线推进。
           if (reasoning !== undefined) {
-            let thinkBuf = ''
-            let lastFlush = 0
+            const thinkBufState = { buf: '', lastFlush: 0 }
             const flushThink = (): void => {
-              if (thinkBuf === '') return
-              emit({ taskId: 'main', title: 'Mimir', status: 'running', kind: 'think-token', phase: 'main', text: thinkBuf })
-              thinkBuf = ''
+              if (thinkBufState.buf === '') return
+              emit({
+                taskId: 'main',
+                title: 'Mimir',
+                status: 'running',
+                kind: 'think-token',
+                phase: 'main',
+                text: thinkBufState.buf
+              })
+              thinkBufState.buf = ''
             }
-            for await (const piece of reasoning) {
-              if (controller.signal.aborted) break
-              thinkBuf += piece
-              const now = Date.now()
-              if (now - lastFlush >= 200) {
+            // 与正文流并行推进，不阻塞 text 消费；收尾时统一 await 收敛（见下方 Promise.all）。
+            reasoningLoops.push(
+              (async (): Promise<void> => {
+                for await (const piece of reasoning) {
+                  if (controller.signal.aborted) break
+                  thinkBufState.buf += piece
+                  const now = Date.now()
+                  if (now - thinkBufState.lastFlush >= 200) {
+                    flushThink()
+                    thinkBufState.lastFlush = now
+                  }
+                }
                 flushThink()
-                lastFlush = now
-              }
-            }
-            flushThink()
+              })()
+            )
           }
           for await (const token of msg.text) {
             if (controller.signal.aborted) break
             fullContent += token
-            onChunk(token)
+            msgChars += 1
+            // 只发增量：接收端自行累加。结束事件只带 finalLength，不重复传全文
+            // （旧设计用「结束信封带全量 content」对账，制造了主进程/渲染层两份 fullContent）。
+            //
+            // 按 ~50ms / 200 字符合并成批再外发（与上方 reasoning 同款思路）。
+            // 逐 token 直发会造成每轮 200+ 次 webContents.send 的高频外发洪流，渲染进程主线程
+            // 繁忙时这些消息会在 IPC **投递层被静默丢弃**（实测主进程发 242 个事件、preload
+            // 仅收到 10 个），表现为「回复说一半就断了」且接收端看不到任何跳号/陈旧日志——
+            // 因为丢失的事件根本没进入 JS 回调。攒批把外发次数压到每轮 ~10 次量级，从源头消除丢包。
+            textBuf += token
+            const now = Date.now()
+            if (textBuf.length >= TEXT_FLUSH_CHARS || now - lastTextFlush >= TEXT_FLUSH_MS) {
+              flushText()
+              lastTextFlush = now
+            }
           }
+          // 本条消息文本流收尾：强制冲掉缓冲，保证不丢尾部（否则末段不足阈值会滞留到下一条消息）。
+          flushText()
+          // stream.msg：逐条 AI 消息的产出量。多条 = 工具调用后的续写轮次。
+          agentLog.info(`stream.msg conv=${conversationId} seq=${msgSeq} chars=${msgChars}`)
           if (controller.signal.aborted) break
         }
+        // 正文流结束（模型停止生成）：立即发「结束事件」。此刻全文已 emit 完毕，而工具收尾/
+        // 子代理可能还要跑很久 —— 渲染层据此马上定稿正文并关灯，不必等整轮 invoke 返回。
+        //
+        // 收尾前强制冲缓冲：这是**最后一个**出口（含 abort 提前 break 的路径），
+        // 保证 end 之前正文全部送达，避免「最后不足一级阈值的尾巴」被滞留。
+        flushText()
+        // stream.end.emit：模型逐字流已收尾（这是全文长度的一手来源）。
+        // 若此处长度已小于预期，问题在**模型/网关**，与 IPC 和渲染层无关。
+        agentLog.info(`stream.end.emit conv=${conversationId} chars=${fullContent.length}`)
+        onEvent({ type: 'end', finalLength: fullContent.length })
         // 等工具流收尾：模型可能已停止生成，但最后一次工具调用仍在返回。
         // 子代理流同样要收尾——`task` 的返回依赖子代理跑完，委派节点的 done 事件不能漏发。
-        await Promise.all([toolLoop, subagentLoop])
+        await Promise.all([toolLoop, subagentLoop, ...reasoningLoops])
+        // ── 双来源对账（观测）─────────────────────────────────────────────────
+        // stream.msg 只能证明「流里收到多少」；run.output 是 Agent 的最终状态，是独立第二来源。
+        // 若 output 末条 AI 文本显著长于 fullContent，则问题在**流消费**（提前结束 / 漏轮次）；
+        // 若两者一致，则模型/网关本身只产出了这么多，与 IPC 和渲染层无关。
+        {
+          const finalAiText = await extractFinalAiText(run.output)
+          const finalLen = finalAiText.length
+          const gap = finalLen - fullContent.length
+          agentLog.info(
+            `stream.reconcile conv=${conversationId} streamChars=${fullContent.length} outputChars=${finalLen} gap=${gap}`
+          )
+          if (gap > 0) {
+            agentLog.warn(
+              `stream.reconcile.mismatch conv=${conversationId} 流式少 ${gap} 字符（流被提前截断，根因在流消费而非 IPC/渲染层）`
+            )
+          }
+        }
         emit({ taskId: 'main', title: 'Mimir', status: 'done' })
       } catch (streamError) {
+        // 异常路径同样收敛并发循环：reasoningLoops 会随 controller.abort 退出，但必须等它们
+        // 真正结束，避免其在函数返回后仍向已关闭的 renderer 发事件（toolLoop/subagentLoop 同）。
+        await Promise.allSettled([toolLoop, subagentLoop, ...reasoningLoops])
         if (controller.signal.aborted) {
           console.log('[agent] v3 流被用户中止')
           emit({ taskId: 'main', title: 'Mimir', status: 'error', text: '已被用户中止。' })

@@ -1,6 +1,7 @@
 import { tool } from 'langchain/tools'
 import { z } from 'zod'
 import { httpFetch } from '../../http'
+import { parseDuckDuckGoResults } from '../../library/webSearchParse'
 
 /**
  * Web search tool using DuckDuckGo (no API key required)
@@ -17,18 +18,20 @@ export const webSearchTool = tool(
       })
       const html = await response.text()
 
-      // Parse search results
       const results = parseDuckDuckGoResults(html, maxResults)
 
       if (results.length === 0) {
-        return '未找到相关搜索结果。'
+        // 空结果有两种可能：确实没搜到，或 DDG 页面结构变了导致选择器失效。
+        // 不能笼统回「未找到」——那会让"解析已损坏"伪装成"没有结果"，模型据此
+        // 得出错误结论。明确提示让模型换用其他途径。
+        return '未从 DuckDuckGo 取到任何结果。可能确实没有匹配内容，也可能是搜索源当前不可用（网络受限或页面结构变化），建议换用其他检索方式。'
       }
 
       return results
         .map((result, i) => {
           return `### ${i + 1}. ${result.title}\n` +
             `- 链接: ${result.url}\n` +
-            `- 摘要: ${result.snippet}`
+            `- 摘要: ${result.content}`
         })
         .join('\n\n')
     } catch (error) {
@@ -52,35 +55,3 @@ export const webSearchTool = tool(
     })
   }
 )
-
-interface SearchResult {
-  title: string
-  url: string
-  snippet: string
-}
-
-function parseDuckDuckGoResults(html: string, maxResults: number): SearchResult[] {
-  const results: SearchResult[] = []
-  const resultRegex = /<div class="result[^"]*">([\s\S]*?)<\/div>\s*<\/div>\s*<\/div>/g
-  let match: RegExpExecArray | null
-
-  while ((match = resultRegex.exec(html)) !== null && results.length < maxResults) {
-    const block = match[1]
-
-    const titleMatch = block.match(/<a[^>]*class="result__a"[^>]*>([\s\S]*?)<\/a>/)
-    const urlMatch = block.match(/href="([^"]*)"/)
-    const snippetMatch = block.match(/class="result__snippet"[^>]*>([\s\S]*?)<\/a>/)
-
-    if (titleMatch && urlMatch) {
-      const title = titleMatch[1].replace(/<[^>]+>/g, '').trim()
-      const url = urlMatch[1]
-      const snippet = snippetMatch
-        ? snippetMatch[1].replace(/<[^>]+>/g, '').trim()
-        : ''
-
-      results.push({ title, url, snippet })
-    }
-  }
-
-  return results
-}

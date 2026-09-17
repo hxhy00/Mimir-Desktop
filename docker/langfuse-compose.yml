@@ -1,0 +1,237 @@
+# 本地可观测性后端：Langfuse 自托管（按需启停）
+#
+# 用途：接收 Mimir 上报的 OpenTelemetry 链路，提供 LLM 专用观测界面
+#（完整 prompt 原文、会话串联、token/成本、运行对比、prompt 版本与评测）。
+# 数据全在本机，不出境 —— 这是用户已确认的硬性口径（链路含论文与实验数据）。
+#
+# ─── 为什么是 Langfuse 而不是 Jaeger ─────────────────────────────────────────
+# Jaeger 是「微服务调用链」工具，不懂 LLM：prompt 原文塞在 attribute 里不可读、
+# 没有「会话」概念、不做 token/成本聚合、不支持运行对比与标注。Langfuse 是专为
+# LLM 应用做观测的平台，OpenInference 的语义约定本就是喂给这类平台看的。
+#
+# ─── 启停（按需使用，平时不占资源）──────────────────────────────────────────
+# 启动：  cd docker && docker compose -f langfuse-compose.yml up -d
+# 停止：  cd docker && docker compose -f langfuse-compose.yml down
+# 清空：  cd docker && docker compose -f langfuse-compose.yml down -v   # 连数据卷一起删
+# 查看：  http://localhost:3000
+#
+# 首次启动约 2-3 分钟（ClickHouse 建表 + 迁移），`docker compose logs -f langfuse-web`
+# 出现 "Ready" 即可访问。
+#
+# ─── 资源要求（官方推荐值，别低配）──────────────────────────────────────────
+# CPU ≥ 4 核 / 内存 ≥ 16 GiB / 磁盘 ≥ 100 GiB。
+# 吃内存的主因是 ClickHouse（Langfuse v3+ 用它存链路，为查询性能做了内存换速度）。
+# 下方已给 ClickHouse 加了 MEMORY_LIMIT 环境变量做软限制，但**不要指望能压到很小**。
+#
+# ─── 首次启动后要做的事 ─────────────────────────────────────────────────────
+# 本文件已用 LANGFUSE_INIT_* 自动建好「组织 / 项目 / API Key」，无需去 UI 手动创建。
+# 启动后到 Mimir「设置 → Agent → 可观测性」填：
+#   OTLP 端点   http://localhost:3000/api/public/otel
+#   Public Key  pk-lf-mimir-local
+#   Secret Key  sk-lf-mimir-local
+# 保存后重新初始化 Agent 即开始上报。
+#
+# ─── 端口说明（宿主端口，均只绑 127.0.0.1，不对外）─────────────────────────
+#   3000  Langfuse UI + OTLP/HTTP 入口（Mimir 用这个，路径 /api/public/otel）
+#   9092  MinIO S3（多模态数据用，本方案暂不涉及）
+#   6380  Redis      ← 刻意避开宿主 6379（已被其它项目 eams-redis 占用）
+#   5432  Postgres
+#   8123 / 9000  ClickHouse，3030 worker，9091 MinIO 控制台
+#
+# 注：容器之间互访一律走 compose 内部网络（redis:6379 等），
+# 与这里改的宿主端口无关，改端口不影响 Langfuse 内部通信。
+#
+# ─── 注意 ───────────────────────────────────────────────────────────────────
+# · Langfuse 的 OTLP 端点**仅支持 HTTP，不支持 gRPC**，且端点路径不带 /v1/traces。
+# · 值全部走同目录 .env 文件（见 langfuse.env.example），本文件不写死密钥。
+# · 去掉了官方 compose 的 `restart: always` —— 本方案是「按需启动」，关机不常驻。
+# ─── 项目名 ─────────────────────────────────────────────────────────────────
+# 不写 name 时，Docker 会拿「compose 文件所在目录名」当项目名，于是这里会显示成
+# `docker`（因为文件就在 docker/ 目录下），在 Docker Desktop 里就成了一组叫
+# "docker" 的容器。显式指定后，界面里的分组名即为 langfuse。
+name: langfuse
+
+services:
+  langfuse-worker:
+    image: docker.langfuse.com/langfuse/langfuse-worker:4
+    container_name: mimir-langfuse-worker
+    depends_on: &langfuse-depends-on
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    ports:
+      - '127.0.0.1:3030:3030'
+    environment: &langfuse-worker-env
+      DATABASE_URL: ${DATABASE_URL:-postgresql://postgres:postgres@postgres:5432/postgres}
+      SALT: ${SALT:-mysalt}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:-0000000000000000000000000000000000000000000000000000000000000000}
+      # 关闭匿名遥测：数据不出本机是本方案的硬性口径。
+      TELEMETRY_ENABLED: 'false'
+      CLICKHOUSE_MIGRATION_URL: ${CLICKHOUSE_MIGRATION_URL:-clickhouse://clickhouse:9000}
+      CLICKHOUSE_URL: ${CLICKHOUSE_URL:-http://clickhouse:8123}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-clickhouse}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-clickhouse}
+      CLICKHOUSE_CLUSTER_ENABLED: 'false'
+      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: ${LANGFUSE_S3_EVENT_UPLOAD_BUCKET:-langfuse}
+      LANGFUSE_S3_EVENT_UPLOAD_REGION: ${LANGFUSE_S3_EVENT_UPLOAD_REGION:-auto}
+      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: ${LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID:-minio}
+      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: ${LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY:-miniosecret}
+      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: ${LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT:-http://minio:9000}
+      LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: 'true'
+      LANGFUSE_S3_EVENT_UPLOAD_PREFIX: ${LANGFUSE_S3_EVENT_UPLOAD_PREFIX:-events/}
+      LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: ${LANGFUSE_S3_MEDIA_UPLOAD_BUCKET:-langfuse}
+      LANGFUSE_S3_MEDIA_UPLOAD_REGION: ${LANGFUSE_S3_MEDIA_UPLOAD_REGION:-auto}
+      LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: ${LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID:-minio}
+      LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: ${LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY:-miniosecret}
+      LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: ${LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT:-http://minio:9000}
+      LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: 'true'
+      LANGFUSE_S3_MEDIA_UPLOAD_PREFIX: ${LANGFUSE_S3_MEDIA_UPLOAD_PREFIX:-media/}
+      LANGFUSE_S3_BATCH_EXPORT_ENABLED: 'false'
+      LANGFUSE_S3_BATCH_EXPORT_BUCKET: ${LANGFUSE_S3_BATCH_EXPORT_BUCKET:-langfuse}
+      LANGFUSE_S3_BATCH_EXPORT_PREFIX: ${LANGFUSE_S3_BATCH_EXPORT_PREFIX:-exports/}
+      LANGFUSE_S3_BATCH_EXPORT_REGION: ${LANGFUSE_S3_BATCH_EXPORT_REGION:-auto}
+      LANGFUSE_S3_BATCH_EXPORT_ENDPOINT: ${LANGFUSE_S3_BATCH_EXPORT_ENDPOINT:-http://minio:9000}
+      LANGFUSE_S3_BATCH_EXPORT_EXTERNAL_ENDPOINT: ${LANGFUSE_S3_BATCH_EXPORT_EXTERNAL_ENDPOINT:-http://localhost:9090}
+      LANGFUSE_S3_BATCH_EXPORT_ACCESS_KEY_ID: ${LANGFUSE_S3_BATCH_EXPORT_ACCESS_KEY_ID:-minio}
+      LANGFUSE_S3_BATCH_EXPORT_SECRET_ACCESS_KEY: ${LANGFUSE_S3_BATCH_EXPORT_SECRET_ACCESS_KEY:-miniosecret}
+      LANGFUSE_S3_BATCH_EXPORT_FORCE_PATH_STYLE: 'true'
+      REDIS_HOST: ${REDIS_HOST:-redis}
+      REDIS_PORT: ${REDIS_PORT:-6379}
+      REDIS_AUTH: ${REDIS_AUTH:-myredissecret}
+      REDIS_TLS_ENABLED: 'false'
+      EMAIL_FROM_ADDRESS: ${EMAIL_FROM_ADDRESS:-}
+      SMTP_CONNECTION_URL: ${SMTP_CONNECTION_URL:-}
+
+  langfuse-web:
+    image: docker.langfuse.com/langfuse/langfuse:4
+    container_name: mimir-langfuse-web
+    depends_on: *langfuse-depends-on
+    ports:
+      # 只绑本机：UI 含完整 prompt 原文与论文数据，不应被局域网访问。
+      - '127.0.0.1:3000:3000'
+    environment:
+      <<: *langfuse-worker-env
+      NEXTAUTH_URL: ${NEXTAUTH_URL:-http://localhost:3000}
+      NEXTAUTH_SECRET: ${NEXTAUTH_SECRET:-mysecret}
+      LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: ${LANGFUSE_S3_MEDIA_UPLOAD_EXTERNAL_ENDPOINT:-http://localhost:9090}
+      LANGFUSE_S3_MEDIA_UPLOAD_INTERNAL_ENDPOINT: ${LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT:-http://minio:9000}
+      # ── 自动初始化：免去首次启动后去 UI 手动建组织/项目/API Key ──
+      # 这些 key 与 Mimir 设置页里填的必须一致；改了这里的值就要同步改设置页。
+      LANGFUSE_INIT_ORG_ID: ${LANGFUSE_INIT_ORG_ID:-mimir-local}
+      LANGFUSE_INIT_ORG_NAME: ${LANGFUSE_INIT_ORG_NAME:-Mimir Local}
+      LANGFUSE_INIT_PROJECT_ID: ${LANGFUSE_INIT_PROJECT_ID:-mimir-desktop}
+      LANGFUSE_INIT_PROJECT_NAME: ${LANGFUSE_INIT_PROJECT_NAME:-Mimir Desktop}
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: ${LANGFUSE_INIT_PROJECT_PUBLIC_KEY:-pk-lf-mimir-local}
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: ${LANGFUSE_INIT_PROJECT_SECRET_KEY:-sk-lf-mimir-local}
+      # 本地登录账号（自用，随便起；登录 Langfuse UI 用）
+      LANGFUSE_INIT_USER_EMAIL: ${LANGFUSE_INIT_USER_EMAIL:-mimir@mimir.local}
+      LANGFUSE_INIT_USER_NAME: ${LANGFUSE_INIT_USER_NAME:-mimir}
+      LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_INIT_USER_PASSWORD:-mimir-local-dev}
+
+  clickhouse:
+    image: docker.io/clickhouse/clickhouse-server:25.12
+    container_name: mimir-langfuse-clickhouse
+    user: '101:101'
+    # ClickHouse 是内存大户（官方推荐整机 16 GiB 的主因）。这里给个软上限，
+    # 避免它无节制增长把机器拖死；真调优请改这个值而非硬重启。
+    environment:
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB:-default}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-clickhouse}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-clickhouse}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: '1'
+      # 日志与查询的内存相关软限制（单位字节），按机器实际情况调
+      MALLOC_CONF: 'background_thread:true'
+    ports:
+      - '127.0.0.1:8123:8123'
+      - '127.0.0.1:9000:9000'
+    healthcheck:
+      test: ['CMD', 'wget', '--no-verbose', '--tries=1', '--spider', 'http://localhost:8123/ping']
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    volumes:
+      - langfuse_clickhouse_data:/var/lib/clickhouse
+      - langfuse_clickhouse_logs:/var/log/clickhouse-server
+
+  minio:
+    image: cgr.dev/chainguard/minio
+    container_name: mimir-langfuse-minio
+    entrypoint: sh
+    command: -c 'mkdir -p /data/langfuse && minio server --address ":9000" --console-address ":9001" /data'
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minio}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-miniosecret}
+    ports:
+      - '127.0.0.1:9092:9000'
+      - '127.0.0.1:9091:9001'
+    healthcheck:
+      test: ['CMD', 'mc', 'ready', 'local']
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+    volumes:
+      - langfuse_minio_data:/data
+
+  redis:
+    image: docker.io/redis:7
+    container_name: mimir-langfuse-redis
+    command: >
+      --requirepass ${REDIS_AUTH:-myredissecret}
+      --maxmemory-policy noeviction
+    ports:
+      # 宿主用 6380：6379 已被其它项目的 redis 占用。容器内仍是 6379。
+      - '127.0.0.1:6380:6379'
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 3s
+      timeout: 10s
+      retries: 10
+    volumes:
+      - langfuse_redis_data:/data
+
+  postgres:
+    image: docker.io/postgres:${POSTGRES_VERSION:-17}
+    container_name: mimir-langfuse-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-postgres}
+      TZ: UTC
+      PGTZ: UTC
+    ports:
+      - '127.0.0.1:5432:5432'
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres']
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    volumes:
+      - langfuse_postgres_data:/var/lib/postgresql/data
+
+# 卷名沿用最初由 `docker` 项目创建的 `docker_langfuse_*`（external 引用），
+# 这样改项目名为 langfuse 后数据不丢。若想彻底重来：
+#   docker volume rm docker_langfuse_postgres_data ...（先 down 再删，再跑 up 前
+#   把下面 external 去掉交回 Docker 自动创建为 langfuse_*）。
+volumes:
+  langfuse_postgres_data:
+    external: true
+    name: docker_langfuse_postgres_data
+  langfuse_clickhouse_data:
+    external: true
+    name: docker_langfuse_clickhouse_data
+  langfuse_clickhouse_logs:
+    external: true
+    name: docker_langfuse_clickhouse_logs
+  langfuse_minio_data:
+    external: true
+    name: docker_langfuse_minio_data
+  langfuse_redis_data:
+    external: true
+    name: docker_langfuse_redis_data

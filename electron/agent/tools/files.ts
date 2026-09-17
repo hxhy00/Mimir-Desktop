@@ -16,7 +16,11 @@ import { z } from 'zod'
 import { readdir } from 'fs/promises'
 import { resolve } from 'path'
 import { requireUserApprovalDetailed } from '../approval'
-import { evaluate, recordResolution, rememberRoot } from '../permissionService'
+import { controlPlaneRejectMessage, isControlPlanePath } from '../controlPlane'
+import { canonicalize, evaluate, recordResolution, rememberRoot } from '../permissionService'
+// `~` 展开是 read_dir / server 两个工具共用的语义，收敛在 pathUtils 里，
+// 避免一处修了另一处没修（server 的 keyPath 就曾漏掉，见该模块注释）。
+import { expandHome } from '../pathUtils'
 
 /** read_dir 单次最多回显的条目数（防超大目录刷爆响应）。 */
 const DIR_LIST_CAP = 500
@@ -25,10 +29,22 @@ export const readDirTool = tool(
   async ({ dir }) => {
     try {
       if (typeof dir !== 'string' || dir.trim() === '') return '读取失败：dir 不能为空（需为目录绝对路径）。'
-      const target = resolve(dir.trim())
+      const target = resolve(expandHome(dir.trim()))
       // 读权限统一走权限矩阵（evaluate）：全权档 / 空间内 / 已记住目录 → 免批准；
       // 仅当判定为 ask 才弹卡。此前该工具绕过策略硬弹卡，导致「设了全权档还被反复问」。
-      if (evaluate(target, 'read') === 'ask') {
+      //
+      // ⚠️ 三态必须**全部**处理：此前只判断 `=== 'ask'`，`deny` 会直接穿透到下面的 readdir
+      // ——「策略判定为拒绝」被当成了「放行」，只读工具反而成了绕过权限体系的口子
+      // （控制平面目录因此可被任意列出）。口径与 fsBackend.authorize 保持一致：
+      // 控制平面给具体文案，其余 deny 给通用拒绝文案。
+      const decision = evaluate(target, 'read')
+      if (decision === 'deny') {
+        const canonical = canonicalize(target)
+        return isControlPlanePath(canonical)
+          ? controlPlaneRejectMessage(canonical)
+          : '已拒绝：该目录不在允许范围内，当前权限档位不允许读取。'
+      }
+      if (decision === 'ask') {
         const allowed = await requireUserApprovalDetailed({
           tool: 'read_dir',
           summary: `读取目录 ${target}`,
@@ -70,9 +86,10 @@ export const readDirTool = tool(
     name: 'read_dir',
     description:
       '只读列出本地某个目录下的条目（文件名与类型），在处理用户项目/文件夹前先探清里面有什么。' +
-      '读取科研空间根内的目录免批准；读取空间外任意目录会弹批准卡，卡片通过后返回列表。一次仅列一层。',
+      '读取科研空间根内的目录免批准；读取空间外任意目录会弹批准卡，卡片通过后返回列表。一次仅列一层。' +
+      'dir 支持 ~ 写法（如 ~/.ssh，会自动展开为真实主目录），无需先向用户索要绝对路径。',
     schema: z.object({
-      dir: z.string().describe('要列出的目录绝对路径'),
+      dir: z.string().describe('要列出的目录绝对路径；支持 ~ 或 ~/ 开头（自动展开为主目录）'),
     }),
   },
 )

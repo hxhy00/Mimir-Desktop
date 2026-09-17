@@ -105,7 +105,7 @@ describe('无头冒烟：文件后端 + 批准卡全链路', () => {
     responder.restore()
   })
 
-  it('覆盖已有文件时，批准卡的 detail 会提示「整篇覆盖」并附现有内容开头', async () => {
+  it('覆盖已有文件时，批准卡的 detail 会提示「整篇覆盖」但绝不回显旧内容', async () => {
     const target = join(workDir, 'existing.md')
     writeFileSync(target, '原有内容 ABCDEFG')
     const responder = installAutoResponder(() => true)
@@ -113,7 +113,9 @@ describe('无头冒烟：文件后端 + 批准卡全链路', () => {
     await backend.write(target, '新内容')
 
     expect(responder.seen[0].detail).toContain('整篇覆盖')
-    expect(responder.seen[0].detail).toContain('ABCDEFG')
+    // 安全要求（见 fsBackend.write 注释）：任何内容读取都必须发生在授权通过之后，
+    // 因此批准卡只依据 existsSync 的元数据提示「已存在」，**不得**回显旧内容片段。
+    expect(responder.seen[0].detail).not.toContain('ABCDEFG')
     expect(readFileSync(target, 'utf8')).toBe('新内容')
 
     responder.restore()

@@ -4,8 +4,7 @@ import { AgentTimeline } from './AgentTimeline'
 import { ArtifactCard } from './ArtifactCard'
 import { Bot, User, Copy, Check, RefreshCw } from 'lucide-react'
 import { useState } from 'react'
-import ReactMarkdown from 'react-markdown'
-import remarkGfm from 'remark-gfm'
+import { Streamdown } from 'streamdown'
 
 interface MessageBubbleProps {
   message: Message
@@ -68,7 +67,9 @@ export function MessageBubble({ message, onRetry, pendingApprovalTool }: Message
             isUser ? (
               <div className="whitespace-pre-wrap">{message.content}</div>
             ) : (
-              <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown>
+              <Streamdown isAnimating={message.isStreaming === true}>
+                {message.content}
+              </Streamdown>
             )
           ) : message.isStreaming ? (
             <div className="flex items-center gap-1.5 py-1">

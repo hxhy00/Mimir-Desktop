@@ -19,7 +19,10 @@ export const app = {
     if (name === 'desktop') return join(sandbox, 'Desktop')
     return join(sandbox, name)
   },
-  getVersion: (): string => '0.0.0-test'
+  getVersion: (): string => '0.0.0-test',
+  // electron/logger.ts 初始化时会读这两个：测试环境视作「未打包」→ 日志级别 debug。
+  getName: (): string => 'mimir-test',
+  isPackaged: false
 }
 
 export const net = {

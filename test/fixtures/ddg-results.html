@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<!--
+  DuckDuckGo HTML 版（html.duckduckgo.com/html/）搜索结果页 fixture。
+
+  ⚠️ 未联网验证：本文件为**按真实页面结构手工构造**，非线上抓取。
+  原因：开发环境无法直连 duckduckgo.com（连接超时），无法获取真实返回页。
+
+  结构依据（DDG HTML 版长期稳定的标记）：
+  - 每条结果：<div class="result ...">
+  - 标题链接：<a class="result__a" href="//duckduckgo.com/l/?uddg=...">
+  - 摘要：    <a class="result__snippet" href="...">
+  - 广告位：  <div class="result result--ad">（解析时必须排除）
+
+  待办：在能联网的环境用真实返回页替换本文件并重跑测试，确认选择器仍命中。
+-->
+<html><body>
+<div class="serp__results">
+
+  <!-- 结果 1：带 result__extras 内层 div（旧正则在此处会提前截断） -->
+  <div class="result results_links results_links_deep web-result ">
+    <div class="links_main links_deep result__body">
+      <h2 class="result__title">
+        <a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Farxiv.org%2Fabs%2F1706.03762&amp;rut=abc123">Attention Is All You Need</a>
+      </h2>
+      <a class="result__snippet" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Farxiv.org%2Fabs%2F1706.03762">The dominant sequence transduction models are based on complex recurrent or convolutional neural networks.</a>
+      <div class="result__extras">
+        <div class="result__extras__url">
+          <span class="result__url">arxiv.org</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 结果 2：直链 + 标题内嵌 <b> + 实体 &amp; -->
+  <div class="result results_links results_links_deep web-result ">
+    <div class="links_main links_deep result__body">
+      <h2 class="result__title">
+        <a rel="nofollow" class="result__a" href="https://direct.example.org/beta">Direct <b>HTML</b> Link &amp; Entities</a>
+      </h2>
+      <a class="result__snippet" href="https://direct.example.org/beta">A snippet with <b>markup</b> inside &amp; entities.</a>
+    </div>
+  </div>
+
+  <!-- 结果 3：标题前插入一个非结果链接（旧正则取第一个 href 会取错） -->
+  <div class="result results_links web-result ">
+    <div class="links_main result__body">
+      <a class="result__icon" href="https://icon.example.com/favicon.ico"><img src="x.png" alt=""></a>
+      <h2 class="result__title">
+        <a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fgamma">Gamma Result</a>
+      </h2>
+      <a class="result__snippet" href="https://example.com/gamma">Third result snippet.</a>
+    </div>
+  </div>
+
+  <!-- 广告位：必须被排除 -->
+  <div class="result result--ad result--ad--small">
+    <div class="links_main">
+      <a class="result__a" href="https://ad.example.net/promo">Buy Something Now</a>
+    </div>
+  </div>
+
+  <!-- 无标题链接的空壳块：应被安全跳过 -->
+  <div class="result result--more">
+    <div class="links_main"><a href="https://next.example.com/">Next page</a></div>
+  </div>
+
+</div>
+</body></html>

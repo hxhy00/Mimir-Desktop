@@ -22,7 +22,7 @@ import { Paper } from '@/components/modules/Paper'
 import { Library } from '@/components/modules/library/Library'
 import { Experiments } from '@/components/modules/Experiments'
 import { Figures } from '@/components/modules/Figures'
-import { Meetings } from '@/components/modules/Meetings'
+import { Meetings } from '@/components/modules/meetings/Meetings'
 import { Venues } from '@/components/modules/Venues'
 import { Servers } from '@/components/modules/Servers'
 import { Ledger } from '@/components/modules/Ledger'
@@ -365,8 +365,10 @@ export default function App() {
 
   const renderModule = () => {
     switch (activeModule) {
+      // chat 不在此处渲染：它由下方**常驻层**承载（隐藏而非卸载，见该处注释），
+      // 这样切换模块不会销毁正在生成的对话状态。
       case 'chat':
-        return <ChatView key={activeSpaceId ?? 'no-space'} rightSidebarCollapsed={rightSidebarCollapsed} onToggleRightSidebar={toggleRightSidebar} sidebarCollapsed={sidebarCollapsed} onToggleSidebar={toggleSidebar} />
+        return null
       case 'overview':
         return <Overview onNavigate={handleNavigate} />
       case 'paper':
@@ -397,7 +399,7 @@ export default function App() {
           />
         )
       default:
-        return <ChatView key={activeSpaceId ?? 'no-space'} rightSidebarCollapsed={rightSidebarCollapsed} onToggleRightSidebar={toggleRightSidebar} sidebarCollapsed={sidebarCollapsed} onToggleSidebar={toggleSidebar} />
+        return null
     }
   }
 
@@ -439,6 +441,38 @@ export default function App() {
             renderModule()
           )}
         </div>
+        {/*
+          Chat 常驻层（隐藏而非卸载）。
+          
+          为什么必须常驻：`activeModule` 参与上方 key，切换模块会整棵重挂载 ——
+          ChatView 被卸载后，正在生成的回复会随组件一起消失：新挂载的实例从 store
+          读到的是**上次落盘的快照**（流式内容只在防抖窗口后才落盘），`isStreaming`
+          状态与流事件监听也一并丢失，表现就是「切走再切回，回复被中止/内容残缺」。
+          
+          这里把 Chat 渲染成**始终挂载**的一层，切到别的模块时用 `hidden` 隐藏：
+          DOM 与 React 状态（消息、时间线、streamingConvIds）全部保留，主进程的流
+          事件继续被同一批监听器消费，切回来即可看到完整过程。
+        */}
+
+        {!spaceLoading && (
+          <div
+            className="absolute inset-0"
+            hidden={activeModule !== 'chat'}
+            aria-hidden={activeModule !== 'chat'}
+          >
+            {/*
+              key 只随「空间」变化：空间切换时重挂载以重读新空间的会话数据；
+              切换**模块**不在其中，这正是本次修复要保住的常驻语义。
+            */}
+            <ChatView
+              key={`${activeSpaceId ?? 'no-space'}-${uiSpaceEpoch}`}
+              rightSidebarCollapsed={rightSidebarCollapsed}
+              onToggleRightSidebar={toggleRightSidebar}
+              sidebarCollapsed={sidebarCollapsed}
+              onToggleSidebar={toggleSidebar}
+            />
+          </div>
+        )}
       </main>
 
       {/* 首次启动：选择/创建科研空间（无空间前不可关闭） */}

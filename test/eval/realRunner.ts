@@ -328,11 +328,18 @@ export async function buildRealAgent(
     temperature: 0,
     configuration: { baseURL: cfg.baseUrl }
   })
+  // 与生产装配（agentService.ts）对齐：注册能力域子代理，deepagents 会据此注入
+  // `task` 委派工具并校验 subagent_type。若不传 subagents，deepagents 仍会注入一个
+  // 只含默认 `general-purpose` 的 task 工具——模型一旦选择委派（如跨域用例委派给
+  // `literature`），库会直接抛 "invoked agent of type ... only allowed types are
+  // `general-purpose`" 导致整条运行失败（cross-01 实测踩中此坑）。
+  const { domains } = cap.loadCapabilityDomains()
   const agent = createDeepAgent({
     model,
     systemPrompt: await buildEvalSystemPrompt(),
-    // 单 Agent 持有全部能力域工具（16 个），不存在委派工具。
+    // 主 Agent 持有全部能力域工具（16 个），同时可把整块工作委派给能力域子代理。
     tools: cap.resolveAllWorkerTools() as never,
+    subagents: cap.buildDomainSubagents(domains) as never,
     backend: new fs.MimirFsBackend() as never
   })
 

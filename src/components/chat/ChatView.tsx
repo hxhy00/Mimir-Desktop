@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useCallback, useMemo } from 'react'
+import { useState, useRef, useEffect, useLayoutEffect, useCallback, useMemo } from 'react'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -13,6 +13,7 @@ import {
   type RunEvent
 } from './agentRun'
 import { ChatInput, type Attachment } from './ChatInput'
+import { ConvStreamingRegistry } from './convStreaming'
 import { RightSidebar, RightSidebarExpandButton } from '@/components/layout/RightSidebar'
 import {
   Plus,
@@ -69,8 +70,10 @@ export interface ChatArtifact {
   sizeBytes?: number
 }
 
-/** Agent 过程事件信封前缀（与主进程 ipc/index.ts 保持一致）。 */
-const AGENT_EVENT_PREFIX = '\u0002MIMIR_AGENT_EVENT\u0002'
+/** 流式事件协议（结构化事件 + seq/streamId，与主进程 / preload 共用）。 */
+import type { AgentStreamEvent } from '../../../electron/agent/streamProtocol'
+/** 渲染层日志（经 IPC 送主进程统一落盘，与主进程日志同一时间轴）。 */
+import { streamLog } from '../../lib/logger'
 
 export interface Message {
   id: string
@@ -328,6 +331,16 @@ export function ChatView({ rightSidebarCollapsed, onToggleRightSidebar, sidebarC
   const currentEpoch = useCallback((convId: string): number => epochByConvRef.current.get(convId) ?? 0, [])
   /** 发送锁（按会话）：防止同一会话快速双击并发调用 streamMessage；不同会话互不阻塞。 */
   const sendingRefs = useRef<Set<string>>(new Set())
+  /**
+   * 会话级「正在生成」状态的归属记账（见 `convStreaming.ts` 的模块注释）。
+   *
+   * 为什么不能省：`setConvStreaming(convId, false)` 是无条件关灯，而一条回复的收尾
+   * （finally）可能发生在**下一条回复已经开始之后**（用户停止/重发）。若旧流无条件关灯，
+   * 会把新流的运行态一起关掉；反之若用 `currentEpoch === sendId` 当唯一清理条件，
+   * 旧流被顶掉后就永远没人关灯 → 界面永久「正在思考…」。归属比较是唯一能同时避免
+   * 这两种错的判据，逻辑收敛在 registry 里（纯数据、可单测）。
+   */
+  const streamingRegistry = useRef(new ConvStreamingRegistry())
 
   // ── 斜杠「技能与指令」：内置注册表 + 自定义技能 / 指令 ──
   const [customSkillEntries, setCustomSkillEntries] = useState<readonly SlashEntry[]>([])
@@ -538,6 +551,29 @@ export function ChatView({ rightSidebarCollapsed, onToggleRightSidebar, sidebarC
   }, [])
 
   /**
+   * 本条回复收尾时**按归属**关灯：只有登记的活跃回复仍是自己，才真正清掉运行态。
+   *
+   * 与「无条件关灯」的区别（这就是 bug 的根因）：一条回复的收尾可能晚于下一条
+   * 回复的开场（用户点停止后立刻重发、或快速连发）。此时：
+   *   - 无条件关灯 → 把**新流**的运行态误关（新流看起来已结束，实则还在跑）；
+   *   - 只用 `currentEpoch === sendId` 才关 → 旧流被顶掉后**永远没人关灯**，
+   *     `streamingConvIds` 残留 → 界面永久停在「正在思考…」、输入区永久禁用。
+   * 取「归属比较」这一个条件可以同时避免这两种错：旧的关不掉新的，新的也不会漏关。
+   *
+   * 注意这里**不顺带释放 sendingRefs**：发送锁的释放语义与 UI 运行态不同
+   * （锁只防同一会话并发，见 handleSend），由调用点各自处理。
+   */
+  const releaseConvStreaming = useCallback(
+    (convId: string, sendId: number): void => {
+      // 归属比较（compare-and-clear）：不是当前活跃回复的收尾就保持沉默，
+      // 否则会把已经开场的新流误关。见 convStreaming.ts 的模块注释。
+      if (!streamingRegistry.current.release(convId, sendId)) return
+      setConvStreaming(convId, false)
+    },
+    [setConvStreaming]
+  )
+
+  /**
    * 停止指定会话的生成（缺省为当前活跃会话）：立即本地收尾（UI 即刻可交互），并通知主进程 abort 该会话。
    * 多会话并行下，停止只影响目标会话，其它会话的后台任务继续。
    */
@@ -546,6 +582,9 @@ export function ChatView({ rightSidebarCollapsed, onToggleRightSidebar, sidebarC
       // 纪元 +1：该会话本回复后续所有 chunk / 事件 / 看门狗回调全部失效
       nextEpoch(convId)
       setConvStreaming(convId, false)
+      // 清掉归属登记：旧流之后的 finally 会拿这个旧 sendId 做比较，必须让它认不出「自己」，
+      // 否则用户停止后立刻重发时，旧流的收尾会误关新流的运行态（与本次修复同一类问题）。
+      streamingRegistry.current.forget(convId)
       // 立即释放发送锁：旧流被 abort 后 finally 因纪元不匹配不会重置，这里主动释放避免卡死
       sendingRefs.current.delete(convId)
       void window.electronAPI?.stopMessage?.(convId)
@@ -582,20 +621,69 @@ export function ChatView({ rightSidebarCollapsed, onToggleRightSidebar, sidebarC
     }
   }, [])
 
+  /** 取 Radix ScrollArea 的真实滚动视口（组件重挂载后会换 DOM，故每次现查）。 */
+  const getViewport = useCallback((): HTMLElement | null => {
+    return scrollRef.current?.querySelector('[data-radix-scroll-area-viewport]') ?? null
+  }, [])
+
+  /**
+   * 「用户是否贴着底部」的镜像，由滚动事件实时维护 —— **不在内容变化后再测**。
+   *
+   * 为什么不能用 isNearBottom() 现测：新消息插入后 scrollHeight 已被撑大，
+   * 此时再算 `scrollHeight - scrollTop - clientHeight < 80` 必然得到一个很大的值，
+   * 判定为「用户没在底部」从而放弃跟随。现象就是发完消息停在中间、追不上最新一条。
+   * 结论：贴底状态必须在**上一次渲染**时就记下来。
+   */
+  const stickToBottomRef = useRef(true)
+
   /** 视口是否已贴着底部（用户没往上翻）。 */
   const isNearBottom = useCallback((): boolean => {
-    const viewport = scrollRef.current?.querySelector('[data-radix-scroll-area-viewport]')
-    if (viewport === null || viewport === undefined) return true
+    const viewport = getViewport()
+    if (viewport === null) return true
     return viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight < 80
-  }, [])
+  }, [getViewport])
+
+  // 监听视口滚动：用户主动上滑即解除跟随，滑回底部则恢复跟随。
+  // 视口 DOM 由 Radix ScrollArea 内部渲染，首帧可能还不存在（如 hydration 未完成），
+  // 故用 rAF 重试若干次；否则依赖数组不变会让监听器永远挂不上，表现为「跟随失效」。
+  useEffect(() => {
+    let raf = 0
+    let attempts = 0
+    let viewport: HTMLElement | null = null
+    const onScroll = (): void => {
+      stickToBottomRef.current = isNearBottom()
+    }
+    const attach = (): void => {
+      viewport = getViewport()
+      if (viewport !== null) {
+        viewport.addEventListener('scroll', onScroll, { passive: true })
+        return
+      }
+      if (++attempts < 30) raf = requestAnimationFrame(attach)
+    }
+    attach()
+    return () => {
+      cancelAnimationFrame(raf)
+      viewport?.removeEventListener('scroll', onScroll)
+    }
+  }, [getViewport, isNearBottom])
 
   /**
    * 流式期间自动跟随，但**不抢用户的手**：只有当视口本来就在底部时才跟随滚动。
    * 否则用户往上翻去看前面的内容时，每个 token 都会被强行拽回底部（历史行为）。
+   *
+   * 用 useLayoutEffect：DOM 变更后、浏览器绘制前同步执行，此时 scrollHeight 已是新值，
+   * 避免「先画在旧位置再跳一下」的抖动。
    */
+  useLayoutEffect(() => {
+    if (stickToBottomRef.current) scrollToBottom()
+  }, [displayMessages, scrollToBottom])
+
+  // 切换会话时一律回到底部，并恢复跟随态（否则会停在上一个会话的阅读位置）。
   useEffect(() => {
-    if (isNearBottom()) scrollToBottom()
-  }, [displayMessages, scrollToBottom, isNearBottom])
+    stickToBottomRef.current = true
+    scrollToBottom()
+  }, [activeConvId, scrollToBottom])
 
   const updateMessage = useCallback((convId: string, messageId: string, updater: (m: Message) => Message) => {
     setConversations((prev) =>
@@ -606,6 +694,50 @@ export function ChatView({ rightSidebarCollapsed, onToggleRightSidebar, sidebarC
       )
     )
   }, [])
+
+  /**
+   * 把一条助手回复的运行记录收敛到**终态**（幂等）。
+   *
+   * ── 为什么必须有这一层 ──────────────────────────────────────────────────
+   * `isRunActive()`（见 agentRun.ts）**只认 `run.status`**，而 `run.status` 的权威
+   * 来源只有一个：主进程 `main` 容器事件的 done/error。一旦那两个事件没送到
+   * （流中断、`streamMessage` 只 resolve 不发 end、渲染层自己抛异常…），run 就永远
+   * 停在 'running' —— 界面表现正是「回复完了还一直显示思考中」+ 输入区永久禁用。
+   *
+   * 因此**每个出口**（流内报错 / 异常捕获 / finally）都必须显式写终态，且遵守同一条
+   * 契约（agentRun.ts 顶部的约定）：**终态不可复活** —— 已 done/error/canceled 的 run
+   * 不再被改写，先到的终态即最终结论。这样多个出口各写一次也绝对安全。
+   *
+   * @param note 失败文案：仅在气泡还没有正文时补写（已有内容说明模型已产出，
+   *             不该被错误提示整段盖掉；非空时追加在正文之后，保证失败始终可见）。
+   */
+  const finishRun = useCallback(
+    (
+      convId: string,
+      messageId: string,
+      status: 'done' | 'error' | 'canceled',
+      note?: string
+    ): void => {
+      updateMessage(convId, messageId, (m) => {
+        // 终态不可复活：只有仍处于 running 的 run 才会被收敛。
+        const run =
+          m.run === undefined || m.run.status !== 'running'
+            ? m.run
+            : status === 'canceled'
+              ? cancelRun(m.run)
+              : // 复用主进程「整轮结束」的既有收尾路径：main 容器事件会顺带把仍在运行的
+                // 思考 / 委派行关掉，与成功出口完全一致。该分支不新建步骤，nextId 不会用到。
+                applyRunEvent(m.run, { taskId: 'main', title: 'Mimir', status }, () => 0)
+        let content = m.content
+        if (note !== undefined && note !== '') {
+          content = m.content.trim() === '' ? note : `${m.content}\n\n${note}`
+        }
+        if (run === m.run && content === m.content) return m
+        return { ...m, ...(run !== undefined ? { run } : {}), content }
+      })
+    },
+    [updateMessage]
+  )
 
   const handleSend = useCallback(
     async (content: string, attachments?: Attachment[]) => {
@@ -622,8 +754,10 @@ export function ChatView({ rightSidebarCollapsed, onToggleRightSidebar, sidebarC
 
       // 客户端特殊指令：由 clientAction 标记决定前端行为
       if (slashMatch?.entry.clientAction === 'clear') {
-        // 清空治理状态（失效提醒 + 压缩熔断计数）：归档保留，供用户回看
-        void window.electronAPI?.resetConversationContext?.(convId)
+        // 原地清空当前会话（保留会话 id 与侧栏条目）：必须连归档一起清 ——
+        // 归档的唯一消费方是上下文治理，UI 列表已清空后再留旧归档既无回看入口
+        // （渲染层从未读取 chat:archive:），又会在下一轮被当作历史复活。
+        void window.electronAPI?.resetConversationContext?.(convId, true)
         const fresh = makeWelcomeConversation()
         setConversations((prev) =>
           prev.map((c) =>
@@ -632,7 +766,20 @@ export function ChatView({ rightSidebarCollapsed, onToggleRightSidebar, sidebarC
               : c
           )
         )
+        // 清空后恢复跟随：否则若用户此前上滑过，空白态不会自动回到底部。
+        stickToBottomRef.current = true
         sendingRefs.current.delete(convId)
+        return
+      }
+
+      if (slashMatch?.entry.clientAction === 'reload') {
+        // 重载 = 销毁当前 renderer。在跑的会话不会被自动中止（旧 renderer 的 IPC 监听
+        // 随页面一起消失，任务成了收不到事件的孤儿），因此必须先显式中止本会话，
+        // 并把「重载」这个动作的后果如实落日志（规则：不静默）。
+        streamLog.info(`renderer.reload conv=${convId} source=slash`)
+        sendingRefs.current.delete(convId)
+        void window.electronAPI?.stopMessage?.(convId)
+        window.location.reload()
         return
       }
 
@@ -681,6 +828,9 @@ export function ChatView({ rightSidebarCollapsed, onToggleRightSidebar, sidebarC
 
       // 取本次回复的纪元号（按会话：多会话并行时各会话的纪元互不干扰）
       const sendId = nextEpoch(convId)
+      // 【诊断埋点】确认渲染层是否对同一条用户消息重复进入 handleSend：
+      // 若一次点击出现多个不同 sendId，则后续调用会把前一轮顶掉（epoch 变化 → 前一轮事件被丢）。
+      streamLog.error(`send.enter conv=${convId} sendId=${sendId}`)
 
       // 指令/技能需要参数但用户没给
       if (slashMatch !== null && slashMatch.entry.requiresArg && slashMatch.args === '') {
@@ -740,6 +890,10 @@ export function ChatView({ rightSidebarCollapsed, onToggleRightSidebar, sidebarC
       // 新回复的步骤序号无需手工归零：序号按消息 id 计数（见 nextStepSeq），
       // 新消息自然从 0 起算，且不会影响其它并行会话的计数。
 
+      // 登记「本会话当前活跃回复 = sendId」：这是收尾时判断「该不该由我关灯」的唯一依据
+      // （见 releaseConvStreaming）。必须在 setConvStreaming(true) 之前登记，
+      // 否则极短回复在 finally 里比较时会读不到自己。
+      streamingRegistry.current.begin(convId, sendId)
       setConvStreaming(convId, true)
 
       // 说明：**不做任何超时中止**。此前有一层「滚动看门狗」（连续 120s/360s 无正文或
@@ -757,11 +911,52 @@ export function ChatView({ rightSidebarCollapsed, onToggleRightSidebar, sidebarC
       // 独立通道送来的批准请求会排在队尾，表现就是「界面说要弹批准卡，却等好久好久才弹」。
       const STREAM_FLUSH_MS = 40
       let fullContent = ''
+      /** 渲染层实际收到的正文 chunk 总字符数（与 fullContent 可能因覆盖式定稿而不同）。 */
+      let inChars = 0
+      /**
+       * 本轮**已写入的运行终态**（null = 还没有任何出口写过）。
+       *
+       * 它是「状态机是否收敛」的显式证据：三个出口（流内报错 / 异常捕获 / finally）
+       * 谁先写谁负责，finally 兜底时据此判断是否还需要补写，避免把已有终态改坏。
+       */
+      let terminal: AgentRun['status'] | null = null
       let flushTimer: number | undefined
       const flushContent = (): void => {
         window.clearTimeout(flushTimer)
         flushTimer = undefined
         if (fullContent === '') return
+        // 【临时诊断】记录 flush 后，正文文本所在元素的**可见性细节**。
+        {
+          const w = window as unknown as { __mimirEvt?: Array<Record<string, unknown>>; __mimirT0?: number }
+          if (!w.__mimirT0) w.__mimirT0 = Date.now()
+          if (!w.__mimirEvt) w.__mimirEvt = []
+          const rec: Record<string, unknown> = { t: Date.now() - w.__mimirT0, type: 'flush', len: fullContent.length }
+          w.__mimirEvt.push(rec)
+          const probe = fullContent.slice(-12)
+          requestAnimationFrame(() =>
+            requestAnimationFrame(() => {
+              rec.inInnerText = document.body.innerText.includes(probe)
+              // 遍历所有含该文本的元素，记录其祖先链上是否有 hidden/display:none
+              const all = Array.from(document.querySelectorAll('*'))
+              const hits = all.filter((el) => (el.textContent ?? '').includes(probe))
+              rec.textContentHits = hits.length
+              const leaf = hits[hits.length - 1]
+              if (leaf) {
+                const chain: string[] = []
+                let cur: HTMLElement | null = leaf
+                while (cur && cur !== document.body) {
+                  const cs = getComputedStyle(cur)
+                  const r = cur.getBoundingClientRect()
+                  chain.push(
+                    `${cur.tagName}${cur.className ? '.' + String(cur.className).split(' ')[0] : ''}[disp=${cs.display},vis=${cs.visibility},op=${cs.opacity},w=${Math.round(r.width)},h=${Math.round(r.height)}]`
+                  )
+                  cur = cur.parentElement
+                }
+                rec.chain = chain.slice(0, 8)
+              }
+            })
+          )
+        }
         updateMessage(convId, assistantMessage.id, (m) =>
           m.content === fullContent ? m : { ...m, content: fullContent }
         )
@@ -776,27 +971,80 @@ export function ChatView({ rightSidebarCollapsed, onToggleRightSidebar, sidebarC
           await window.electronAPI.streamMessage(
             fullMessage,
             convId,
-            (chunk: string) => {
-              // 已被停止/已开启新一轮回复：丢弃本回复剩余所有文本/事件 chunk
-              if (currentEpoch(convId) !== sendId) return
-              // Agent 过程事件经同一 chunk 通道送达（前缀信封）：拆包应用到该回复消息的事件树，不进入正文。
-              if (chunk.startsWith(AGENT_EVENT_PREFIX)) {
-                try {
-                  const event = JSON.parse(
-                    chunk.slice(AGENT_EVENT_PREFIX.length)
-                  ) as Parameters<typeof applyTraceEvent>[2]
-                  applyTraceEvent(convId, assistantMessage.id, event)
-                  // 注：破坏性工具完成时的「失效提醒」已在主进程观测并登记（contextManager），
-                  // 渲染层不再重复处理。
-                } catch {
-                  // 忽略无法解析的行程
+            (evt) => {
+              // 已被停止/已开启新一轮回复：丢弃本回复剩余所有事件。
+              // 注：陈旧**流**的过滤已下沉到 preload（按 streamId，见 streamProtocol.ts）；
+              // 这里只处理「本会话被用户停止 / 被顶掉」这一层语义。
+              if (currentEpoch(convId) !== sendId) {
+                // 埋点：丢弃原因（停止 / 被新一轮顶掉）。此前这类静默丢弃不可见，
+                // 排查「内容不全」时无法区分「没收到」与「收到后被丢」。
+                streamLog.debug(`stream.evt.drop conv=${convId} epoch=${sendId} type=${evt.type} seq=${evt.seq}`)
+                return
+              }
+              // ① 过程事件（工具/思考/阶段）：直接喂事件树，不进入正文。
+              if (evt.type === 'worker') {
+                applyTraceEvent(convId, assistantMessage.id, evt.payload as Parameters<typeof applyTraceEvent>[2])
+                return
+              }
+              // ② 出错：写入正文提示（与旧的错误路径行为一致）+ 立即收敛终态。
+              if (evt.type === 'error') {
+                fullContent += evt.message
+                scheduleFlush()
+                // 流内报错 = 本轮已失败：必须当场把 run 写成 error。
+                // 此前这里只写正文不写终态，而 `streamMessage` 出错时常常是 **resolve**
+                // （不是 reject），catch 根本不会走 —— run 就永远停在 running，
+                // 界面永久「正在思考…」、输入区永久禁用。
+                terminal = 'error'
+                finishRun(convId, assistantMessage.id, 'error')
+                return
+              }
+              // ③ 正文流结束：模型已完整生成（主进程在逐字流收尾时发出）。
+              // 只带 finalLength 用于**对账**，不再携带全量全文（消除主进程/渲染层双份状态）。
+              // 此刻工具收尾/子代理可能还要跑很久，故立即定稿并关灯，**不等 invoke 返回**。
+              if (evt.type === 'end') {
+                window.clearTimeout(flushTimer)
+                flushTimer = undefined
+                // 兜底可见性：end 分支此前**一定会打** info 日志却从未出现在 main.log，
+                // 说明渲染层可能压根没走到这里。先用 error 级（不会被级别过滤）留下铁证。
+                streamLog.error(
+                  `stream.end.enter conv=${convId} expect=${evt.finalLength} got=${fullContent.length} recvChars=${inChars}`
+                )
+                // stream.end.in：渲染层实际收到字符数 vs 主进程声明长度。
+                // 二者不一致说明中途丢包（preload 的 seq 跳号日志会指出丢在第几号）。
+                if (evt.finalLength !== fullContent.length) {
+                  streamLog.warn(
+                    `stream.end.mismatch conv=${convId} expect=${evt.finalLength} got=${fullContent.length} recvChars=${inChars}`
+                  )
+                } else {
+                  streamLog.info(`stream.end.in conv=${convId} chars=${fullContent.length} stream=${evt.streamId}`)
+                }
+                flushContent()
+                // 提前把本条消息标记为非流式（时间线停止转圈）；invoke 的 finally 再执行一遍也无害。
+                updateMessage(convId, assistantMessage.id, (m) => ({ ...m, isStreaming: false }))
+                // 正文流结束 = 本轮定稿：同步写 done 终态（与「立即关灯」同一个事实）。
+                // 收尾事件若缺失，run 也不会停在 running。终态幂等：已 error 则保留 error。
+                if (terminal === null) terminal = 'done'
+                finishRun(convId, assistantMessage.id, 'done')
+                releaseConvStreaming(convId, sendId)
+                if (currentEpoch(convId) === sendId) {
+                  sendingRefs.current.delete(convId)
                 }
                 return
               }
-              fullContent += chunk
+              // ④ 正文增量：累加后合并刷新。
+              fullContent += evt.delta
+              // stream.chunk.in：逐增量落盘（量级为 token 级，debug 级避免生产噪音）。
+              inChars += evt.delta.length
+              // 【临时诊断】记录 delta 到达时刻，供 E2E 取证渐进渲染时序。
+              {
+                const w = window as unknown as { __mimirEvt?: Array<{ t: number; type: string; len: number }> }
+                if (!w.__mimirEvt) w.__mimirEvt = []
+                if (!w.__mimirT0) (w as unknown as { __mimirT0?: number }).__mimirT0 = Date.now()
+                w.__mimirEvt.push({ t: Date.now() - ((w as unknown as { __mimirT0: number }).__mimirT0), type: 'text-delta', len: evt.delta.length })
+              }
               // 正文开始流出 = 本轮「思考结束」的一手信号：把运行中的思考步骤收尾，
               // 否则最后一段思考会永远转圈（applyRunEvent 只在 tool/阶段事件时关闭 think 行，
-              // 而最终回复前往往没有新工具调用）。纯文本 chunk 无 kind、不碰 run，需显式派发。
+              // 而最终回复前往往没有新工具调用）。纯文本事件无 kind、不碰 run，需显式派发。
               applyTraceEvent(convId, assistantMessage.id, {
                 taskId: 'content-start',
                 title: 'Mimir',
@@ -805,7 +1053,6 @@ export function ChatView({ rightSidebarCollapsed, onToggleRightSidebar, sidebarC
               // 正文渲染改为合并刷新（见上方注释），不再每 token 触发一次全量状态更新
               scheduleFlush()
             },
-            undefined,
             {
               // Ultra 增强控制器（可选增强层）：enabled 总开关 + 增强策略（auto 由 Ultra 自动选）
               ultra: ultraEnabled ? { enabled: true, strategy: ultraStrategy } : undefined,
@@ -833,6 +1080,9 @@ export function ChatView({ rightSidebarCollapsed, onToggleRightSidebar, sidebarC
               content:
                 '请先在「设置」中配置模型和 API Key，或在 Electron 环境中运行以获得完整功能。'
             }))
+            // 没有可用模型 = 本轮没能开始：写 error 终态，否则时间线一直转圈。
+            terminal = 'error'
+            finishRun(convId, assistantMessage.id, 'error')
             return
           }
 
@@ -867,22 +1117,47 @@ export function ChatView({ rightSidebarCollapsed, onToggleRightSidebar, sidebarC
           const reply =
             data.choices?.[0]?.message?.content || '模型未返回有效内容，请检查 API 配置。'
           updateMessage(convId, assistantMessage.id, (m) => ({ ...m, content: reply }))
+          terminal = 'done'
+          finishRun(convId, assistantMessage.id, 'done')
         }
       } catch (error) {
-        updateMessage(convId, assistantMessage.id, (m) => ({
-          ...m,
-          content: `错误: ${error instanceof Error ? error.message : '未知错误'}`
-        }))
+        // 失败必须显式可见：把异常写进气泡（正文已有内容时追加，不覆盖已产出的回答）。
+        terminal = 'error'
+        finishRun(
+          convId,
+          assistantMessage.id,
+          'error',
+          `错误: ${error instanceof Error ? error.message : '未知错误'}`
+        )
       } finally {
+        // 兜底证据：finally 必然执行，记录渲染层最终累计长度（与主进程 chars 对照）。
+        streamLog.error(`stream.finally conv=${convId} fullContentChars=${fullContent.length} recvChars=${inChars}`)
         // 刷尾：把节流窗口内最后一段正文落定，再标记流式结束（否则末尾几十 ms 会被丢掉）
         flushContent()
         // 本条消息已定稿，回收它的步骤序号（否则 nextStepSeq 会随会话增长长期留存）。
         nextStepSeq.current.delete(assistantMessage.id)
         // 标记本条助手消息流式结束（无论纪元是否已过期都需执行，确保单条消息状态正确）
         updateMessage(convId, assistantMessage.id, (m) => ({ ...m, isStreaming: false }))
-        // 仅当本流仍是该会话当前纪元时才重置流状态——若用户已停止并发起新流，不得覆盖新流的状态
+        // 兜底收敛：**无论上面走了哪条路径**（end / 流内报错 / 抛异常 / 浏览器降级 /
+        // 被用户停止），run.status 都必须离开 'running' —— isRunActive 只认它，停在
+        // running 就等于界面永久「正在思考…」+ 输入区永久禁用。
+        // finishRun 幂等且「终态不可复活」，故这里无条件调用也不会改坏已有终态
+        // （被停止时 handleStop 已写入 canceled，这里自然是空操作）。
+        finishRun(
+          convId,
+          assistantMessage.id,
+          terminal ?? (fullContent.trim() === '' ? 'error' : 'done'),
+          terminal === null && fullContent.trim() === ''
+            ? '错误：本轮回复没有正常结束（既没收到模型输出，也没有报错）。请重试。'
+            : undefined
+        )
+        // 会话级运行态收尾：**必须无条件走这里**（按归属比较，见 releaseConvStreaming）。
+        // 此前用 `currentEpoch(convId) === sendId` 当唯一条件，导致被新流顶掉的旧回复
+        // 永远不关灯 → 界面永久「正在思考…」、输入区永久禁用。
+        releaseConvStreaming(convId, sendId)
+        // 发送锁的释放语义与 UI 运行态不同：只在本流仍是该会话当前纪元时才释放，
+        // 避免旧流的 finally 把新流刚拿到的锁删掉（那会让同一会话又能并发发第二条）。
         if (currentEpoch(convId) === sendId) {
-          setConvStreaming(convId, false)
           sendingRefs.current.delete(convId)
         }
       }
@@ -890,13 +1165,14 @@ export function ChatView({ rightSidebarCollapsed, onToggleRightSidebar, sidebarC
     [
       activeConvId,
       updateMessage,
+      finishRun,
       slashEntries,
       applyTraceEvent,
       ultraEnabled,
       ultraStrategy,
       nextEpoch,
       currentEpoch,
-      setConvStreaming
+      releaseConvStreaming
     ]
   )
 

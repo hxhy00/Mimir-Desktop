@@ -227,9 +227,11 @@ function readReminders(conversationId: string): string[] {
 
 /**
  * 重置某会话的治理状态（用户执行 `/clear` 时调用）：
- * 清空失效提醒与压缩熔断计数。归档保留（属于用户可回看的记录）。
+ * 清空失效提醒与压缩熔断计数。
  *
- * store 没有「删除键」的公开 API，这里写入空值（空数组 / 0）等价于重置。
+ * 注：`/clear` 会连归档一并清除（走 {@link purgeConversation}）。渲染层从未提供
+ * 归档的回看入口，而 UI 消息列表清空后若留着旧归档，等于把「已清掉的历史」继续
+ * 存在 store 里 —— 既无意义也占空间，还容易在上下文重建时被误读回来。
  */
 export function resetConversation(conversationId: string): void {
   try {

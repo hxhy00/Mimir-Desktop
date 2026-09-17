@@ -13,7 +13,9 @@
  * 后者依赖「下一条用例会替上一条善后」的隐式约定，新增文件一漏就复发。
  */
 import { afterEach } from 'vitest'
-import { __resetStore } from '../stubs/store'
+// 必须**经 vitest alias 相同的路径**导入 stub，否则会拿到另一个模块实例，
+// 清空的是「空壳」而真正的 store 仍留有上个用例的数据（跨用例污染）。
+import { __resetStore } from '../../electron/library/store'
 import { resetApprovalSender } from '../../electron/agent/approval'
 
 afterEach(() => {

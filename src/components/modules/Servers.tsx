@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -78,6 +78,40 @@ const EMPTY_FORM: ServerForm = {
   notes: ''
 }
 
+/** 密钥路径长度上限：防止超长输入把 ssh 命令行撑爆（也挡住手工改配置塞进来的异常值）。 */
+const KEY_PATH_MAX_LENGTH = 1024
+/**
+ * 密钥路径白名单：家目录相对（`~/…`）、绝对 / 相对路径、字母数字与常见路径符号。
+ * 不含空白，也不含任何 shell / ssh 元字符。
+ */
+const KEY_PATH_PATTERN = /^[A-Za-z0-9._~@/+-]+$/
+
+/**
+ * SSH 私钥路径校验：合法返回 `null`，不合法返回给用户看的错误文案。
+ *
+ * ── 为什么必须校验 ──────────────────────────────────────────────────────
+ * keyPath 会作为 `-i <路径>` 参数进入**真实的 ssh 命令行**（见 electron/servers/probe.ts：
+ * `sshArgs.push('-i', keyPath)`，渲染层 Terminal 同理）。那里用的是 execFile 的**参数数组**
+ * （不经 shell，所以 `;` `|` `&` 之类不构成 shell 注入），但 **ssh 选项注入** 依然成立：
+ *   - 以 `-` 开头的值会被 ssh 当成**新选项**解析（例如 `-oProxyCommand=…` 可以让 ssh
+ *     连去别的地方、甚至拉起任意命令）。一个「填路径」的输入框就此变成「改一条 ssh 命令」；
+ *   - 含空白的值会被拆成多个参数，同样改变命令结构。
+ * 因此在**源头**（表单保存 / 探测前 / 终端连接前）用白名单拒绝，
+ * 并且必须**显式报错**，不能静默丢掉——否则用户只会看到「连不上」却找不到原因。
+ *
+ * 传参方式本身已经是安全的：始终以 `-i` + 独立参数传递（ssh 真实语法），
+ * 绝不把用户可控字符串拼进一条命令行文本。
+ */
+function validateKeyPath(raw: string): string | null {
+  const value = raw.trim()
+  // 留空合法：表示使用默认密钥 / ssh-agent。
+  if (value === '') return null
+  if (value.length > KEY_PATH_MAX_LENGTH) return `长度超过上限（${String(KEY_PATH_MAX_LENGTH)} 个字符）`
+  if (value.startsWith('-')) return '不能以 "-" 开头（会被 ssh 当成选项解析）'
+  if (!KEY_PATH_PATTERN.test(value)) return '不能包含空白或 ; | & $ ` \' " \\ 等特殊字符'
+  return null
+}
+
 export function Servers() {
   const [servers, setServers] = useState<GpuServer[]>([])
   const [dialogOpen, setDialogOpen] = useState(false)
@@ -89,38 +123,31 @@ export function Servers() {
   const [showPassword, setShowPassword] = useState(false)
   const [testing, setTesting] = useState(false)
   const [testResult, setTestResult] = useState<{ ok: boolean; message: string } | null>(null)
+  /**
+   * 最近一次探测的失败原因（按服务器 id）。
+   * `status` 是运行时字段不落盘，探测失败的原因同样只活在内存里；
+   * 展开区用它把「为什么离线/为什么没 GPU」讲清楚，而不是让用户只看到一个点。
+   */
+  const [probeMsg, setProbeMsg] = useState<Record<string, string | null>>({})
 
-  // Load servers from store
-  useEffect(() => {
-    const loadServers = async () => {
-      try {
-        if (window.electronAPI?.getStoreValue) {
-          const data = await window.electronAPI.getStoreValue<GpuServer[]>('servers:list')
-          if (data) setServers(data)
-        } else {
-          const cached = localStorage.getItem('mimir-servers')
-          if (cached) setServers(JSON.parse(cached))
-        }
-      } catch {
-        // ignore
-      }
-    }
-    loadServers()
-  }, [])
-
-  // Persist servers
-  const persistServers = useCallback(async (next: GpuServer[]) => {
-    setServers(next)
+  // Load servers（经 service 读，不再直接读裸 store key）
+  const reload = useCallback(async () => {
     try {
-      if (window.electronAPI?.setStoreValue) {
-        await window.electronAPI.setStoreValue('servers:list', next)
+      if (window.electronAPI?.listServers) {
+        const data = await window.electronAPI.listServers()
+        if (data) setServers(data as unknown as GpuServer[])
       } else {
-        localStorage.setItem('mimir-servers', JSON.stringify(next))
+        const cached = localStorage.getItem('mimir-servers')
+        if (cached) setServers(JSON.parse(cached))
       }
     } catch {
       // ignore
     }
   }, [])
+
+  useEffect(() => {
+    void reload()
+  }, [reload])
 
   const openAddDialog = useCallback(() => {
     setEditingId(null)
@@ -148,53 +175,63 @@ export function Servers() {
     setDialogOpen(true)
   }, [])
 
-  const handleSave = useCallback(() => {
-    if (!form.name || !form.host) return
-
-    if (editingId) {
-      const updatedServer: GpuServer = {
-        ...servers.find((s) => s.id === editingId)!,
-        name: form.name,
-        host: form.host,
-        port: form.port,
-        user: form.user,
-        password: form.password || undefined,
-        keyPath: form.keyPath || undefined,
-        gpuCount: form.gpuCount,
-        gpuModel: form.gpuModel || '未知',
-        notes: form.notes
-      }
-      const updated = servers.map((s) => (s.id === editingId ? updatedServer : s))
-      setServers(updated)
-      persistServers(updated)
-    } else {
-      const newServer: GpuServer = {
-        id: `srv-${Date.now()}`,
-        name: form.name,
-        host: form.host,
-        port: form.port,
-        user: form.user,
-        password: form.password || undefined,
-        keyPath: form.keyPath || undefined,
-        gpuCount: form.gpuCount,
-        gpuModel: form.gpuModel || '未知',
-        status: 'offline',
-        gpus: [],
-        notes: form.notes
-      }
-      const updated = [...servers, newServer]
-      setServers(updated)
-      persistServers(updated)
+  const handleSave = useCallback(async (overrides?: Partial<ServerForm>) => {
+    const values = { ...form, ...overrides }
+    if (!values.name || !values.host) return
+    // 密钥路径不合法则**拒绝保存**：存进去只会得到一条连不上、且带注入风险的记录。
+    // 报错走对话框里的检测结果区（setTestResult），保存失败因此是可见的。
+    const keyPathError = validateKeyPath(values.keyPath)
+    if (keyPathError !== null) {
+      setTestResult({ ok: false, message: `SSH 密钥路径不合法：${keyPathError}` })
+      return
     }
+
+    // 只把「连接配置」交给 service；status/gpus/lastChecked 是运行时状态，不落盘。
+    const draft = {
+      name: values.name,
+      host: values.host,
+      port: values.port,
+      user: values.user,
+      password: values.password,
+      keyPath: values.keyPath,
+      gpuCount: values.gpuCount,
+      gpuModel: values.gpuModel || '未知',
+      notes: values.notes
+    }
+
+    try {
+      if (window.electronAPI?.createServer) {
+        // 经主进程 service 原子读-改-写：不做整表覆盖，因此与 agent 工具并发写不会互相覆盖。
+        if (editingId) await window.electronAPI.updateServer(editingId, draft)
+        else await window.electronAPI.createServer(draft)
+      } else {
+        // 浏览器降级：维持旧行为（localStorage 中不存在多写入方，无竞态）
+        const stored = JSON.parse(localStorage.getItem('mimir-servers') || '[]') as GpuServer[]
+        const next = editingId
+          ? stored.map((s) => (s.id === editingId ? { ...s, ...draft } : s))
+          : [...stored, { id: `srv-${Date.now()}`, status: 'offline' as const, gpus: [], ...draft }]
+        localStorage.setItem('mimir-servers', JSON.stringify(next))
+      }
+    } catch {
+      // ignore
+    }
+    // 写成功后统一从 service 重载，避免界面内存态与 store 脱节
+    await reload()
     setDialogOpen(false)
     setForm(EMPTY_FORM)
     setEditingId(null)
     setTestResult(null)
-  }, [editingId, form, servers, persistServers])
+  }, [editingId, form, reload])
 
   // Probe connectivity before saving (used on add)
   const handleTestAndSave = useCallback(async () => {
     if (!form.name || !form.host) return
+    // 探测会把 keyPath 送进 ssh 命令行，先校验再用（见 validateKeyPath 注释）。
+    const keyPathError = validateKeyPath(form.keyPath)
+    if (keyPathError !== null) {
+      setTestResult({ ok: false, message: `SSH 密钥路径不合法：${keyPathError}` })
+      return
+    }
     setTesting(true)
     setTestResult(null)
     try {
@@ -210,98 +247,150 @@ export function Servers() {
           setTestResult({ ok: false, message: result.message || '无法连接到服务器' })
           return
         }
-        // Online — save with detected GPU info
-        const newServer: GpuServer = {
-          id: `srv-${Date.now()}`,
-          name: form.name,
-          host: form.host,
-          port: form.port,
-          user: form.user,
-          password: form.password || undefined,
-          keyPath: form.keyPath || undefined,
+        // Online — 探测到的 GPU 型号/数量是有价值的配置信息，落盘；实时 gpus/status 不落盘
+        await handleSave({
           gpuCount: result.gpus.length > 0 ? result.gpus.length : form.gpuCount,
-          gpuModel: result.gpus[0]?.name || form.gpuModel || '未知',
-          status: 'online',
-          gpus: result.gpus || [],
-          notes: form.notes,
-          lastChecked: new Date().toISOString()
-        }
-        const updated = [...servers, newServer]
-        setServers(updated)
-        persistServers(updated)
-        setDialogOpen(false)
-        setForm(EMPTY_FORM)
-        setTestResult(null)
+          gpuModel: result.gpus[0]?.name || form.gpuModel || '未知'
+        })
         setTestResult({ ok: true, message: '连接成功，服务器已添加' })
       } else {
         // Browser fallback: just save
-        handleSave()
+        void handleSave()
       }
     } catch (error) {
       setTestResult({ ok: false, message: error instanceof Error ? error.message : '连接失败' })
     } finally {
       setTesting(false)
     }
-  }, [form, servers, persistServers, handleSave])
+  }, [form, handleSave])
 
   const handleDelete = useCallback(
-    (id: string) => {
+    async (id: string) => {
       if (terminalId === id) setTerminalId(null)
-      const updated = servers.filter((s) => s.id !== id)
-      setServers(updated)
-      persistServers(updated)
+      try {
+        if (window.electronAPI?.deleteServer) {
+          // 交给 service 原子删除，避免用界面旧快照整表覆盖
+          await window.electronAPI.deleteServer(id)
+        } else {
+          const next = servers.filter((s) => s.id !== id)
+          localStorage.setItem('mimir-servers', JSON.stringify(next))
+        }
+      } catch {
+        // ignore
+      }
+      await reload()
       setExpandedCards((prev) => {
         const next = new Set(prev)
         next.delete(id)
         return next
       })
     },
-    [terminalId, servers, persistServers]
+    [terminalId, servers, reload]
   )
 
-  const handleProbe = useCallback(
-    async (server: GpuServer, e: React.MouseEvent) => {
-      e.stopPropagation()
-      setProbing((prev) => ({ ...prev, [server.id]: true }))
-      try {
-        if (window.electronAPI?.probeServer) {
-          const result = await window.electronAPI.probeServer({
-            host: server.host,
-            port: server.port,
-            user: server.user,
-            gpuCount: server.gpuCount,
-            keyPath: server.keyPath || undefined
-          })
-          const updatedServer: GpuServer = {
-            ...server,
-            status: result.status,
-            gpus: result.gpus || [],
-            lastChecked: new Date().toISOString()
-          }
-          // Auto-detect GPU model from nvidia-smi output if available
-          if (result.gpus && result.gpus.length > 0 && result.gpus[0].name) {
-            updatedServer.gpuModel = result.gpus[0].name
-            updatedServer.gpuCount = result.gpus.length
-          }
-          const updated = servers.map((s) => (s.id === server.id ? updatedServer : s))
-          setServers(updated)
-          persistServers(updated)
+  /**
+   * 探测一台服务器（不依赖事件对象，便于挂载后自动探测复用）。
+   *
+   * `quiet`：自动探测模式 —— 不弹 alert（密钥路径不合法时静默记录到 probeMsg，
+   * 否则一进页面就可能连弹多个对话框）；用户手点探测仍用非 quiet 模式明确告知。
+   */
+  const probeOne = useCallback(async (server: GpuServer, opts?: { quiet?: boolean }) => {
+    // 库里已存了一个不合法的密钥路径（旧数据或手工改过配置）：明确告知并**不发起探测**——
+    // 既不静默忽略配置问题，也不会把危险值送进 ssh 命令行。
+    const keyPathError = validateKeyPath(server.keyPath ?? '')
+    if (keyPathError !== null) {
+      const msg = `SSH 密钥路径不合法：${keyPathError}`
+      setProbeMsg((prev) => ({ ...prev, [server.id]: msg }))
+      if (opts?.quiet !== true) {
+        window.alert(`服务器「${server.name}」的 ${msg}\n请编辑该服务器修正后再探测。`)
+      }
+      return
+    }
+    setProbing((prev) => ({ ...prev, [server.id]: true }))
+    try {
+      if (window.electronAPI?.probeServer) {
+        const result = await window.electronAPI.probeServer({
+          host: server.host,
+          port: server.port,
+          user: server.user,
+          gpuCount: server.gpuCount,
+          keyPath: server.keyPath || undefined
+        })
+        const updatedServer: GpuServer = {
+          ...server,
+          status: result.status,
+          gpus: result.gpus || [],
+          lastChecked: new Date().toISOString()
         }
-      } catch {
-        // If probe not available in browser, just toggle
-        const updated = servers.map((s) =>
+        // Auto-detect GPU model from nvidia-smi output if available
+        if (result.gpus && result.gpus.length > 0 && result.gpus[0].name) {
+          updatedServer.gpuModel = result.gpus[0].name
+          updatedServer.gpuCount = result.gpus.length
+          // 探测到的型号/数量是配置信息 → 经 service 原子写回（运行时 status/gpus 不落盘）
+          try {
+            await window.electronAPI.updateServer(server.id, {
+              gpuCount: result.gpus.length,
+              gpuModel: result.gpus[0].name
+            })
+          } catch {
+            // 写回失败不影响本次展示
+          }
+        }
+        setServers((prev) => prev.map((s) => (s.id === server.id ? updatedServer : s)))
+        // 在线但 GPU 探测失败（如 BatchMode 下密钥不可用）也要把原因摆出来
+        setProbeMsg((prev) => ({ ...prev, [server.id]: result.message ?? null }))
+      }
+    } catch {
+      // If probe not available in browser, just toggle in-memory only
+      setServers((prev) =>
+        prev.map((s) =>
           s.id === server.id
             ? { ...s, status: s.status === 'online' ? 'offline' as const : 'online' as const }
             : s
         )
-        setServers(updated)
-        persistServers(updated)
-      } finally {
-        setProbing((prev) => ({ ...prev, [server.id]: false }))
-      }
+      )
+    } finally {
+      setProbing((prev) => ({ ...prev, [server.id]: false }))
+    }
+  }, [])
+
+  const handleProbe = useCallback(
+    (server: GpuServer, e: React.MouseEvent) => {
+      e.stopPropagation()
+      void probeOne(server)
     },
-    [servers, persistServers]
+    [probeOne]
   )
+
+  /**
+   * 挂载后自动逐台探测。
+   *
+   * 为什么必须有这一步：`status` 是运行时字段、**不落盘**（见 serversService 的收敛规则），
+   * 重启/切页回来后列表里全是 `undefined`——界面若直接当「离线」显示就是误导
+   * （2026-09-16 用户反馈「服务器显示离线」即此）。这里进入模块后自动补探测，
+   * 逐台错峰 300ms 发起，避免同时打出 N 条 ssh 连接。
+   *
+   * 位置注意：必须放在 `probeOne` 声明之后——`useCallback` 是 `const`，
+   * 声明前引用会在渲染期触发暂时性死区（TDZ）直接崩溃白屏（2026-09-16 实测踩坑）。
+   */
+  const autoProbedRef = useRef<Set<string>>(new Set())
+  useEffect(() => {
+    if (!window.electronAPI?.probeServer) return
+    const pending = servers.filter((s) => !autoProbedRef.current.has(s.id))
+    if (pending.length === 0) return
+    let canceled = false
+    void (async () => {
+      for (const s of pending) {
+        if (canceled) return
+        autoProbedRef.current.add(s.id)
+        await probeOne(s, { quiet: true })
+        await new Promise((resolve) => setTimeout(resolve, 300))
+      }
+    })()
+    return () => {
+      canceled = true
+    }
+  }, [servers, probeOne])
 
   const openTerminal = useCallback(
     (id: string) => {
@@ -326,6 +415,13 @@ export function Servers() {
 
   const onlineCount = servers.filter((s) => s.status === 'online').length
   const selectedServer = servers.find((s) => s.id === terminalId)
+
+  /**
+   * 终端的 SSH 配置：密钥路径**校验通过才下传**（`-i <路径>` 独立参数，遵循 ssh 语法）。
+   * 校验不通过时不静默丢弃 —— 下方终端标题栏会显式显示被拒原因与后果。
+   */
+  const terminalKeyPath = selectedServer?.keyPath || undefined
+  const terminalKeyPathError = validateKeyPath(terminalKeyPath ?? '')
 
   return (
     <div className="flex h-full flex-col">
@@ -382,11 +478,19 @@ export function Servers() {
                           <span
                             className={cn(
                               'status-dot',
-                              server.status === 'online' ? 'bg-success' : 'bg-muted-foreground/30'
+                              server.status === 'online'
+                                ? 'bg-success'
+                                : server.status === 'offline'
+                                  ? 'bg-rose-400/80'
+                                  : 'bg-amber-400/80'
                             )}
                           />
                           <span className="text-[10px] text-muted-foreground shrink-0">
-                            {server.status === 'online' ? '在线' : '离线'}
+                            {server.status === 'online'
+                              ? '在线'
+                              : server.status === 'offline'
+                                ? '离线'
+                                : '未探测'}
                           </span>
                           {server.lastChecked && (
                             <span className="text-[9px] text-muted-foreground/50 flex items-center gap-0.5">
@@ -514,6 +618,30 @@ export function Servers() {
                         </div>
                       )}
 
+                      {/* 未在线：展开区不再一片空白——把「未探测 / 离线原因」讲清楚 */}
+                      {server.status !== 'online' && (
+                        <div className="rounded-md bg-muted/50 p-2 text-[11px] text-muted-foreground text-center">
+                          <Cpu className="h-4 w-4 mx-auto mb-1 opacity-50" />
+                          {server.status === 'offline' ? (
+                            <>
+                              <p>服务器离线或探测失败</p>
+                              {probeMsg[server.id] ? (
+                                <p className="mt-0.5 break-all text-[10px] opacity-70">{probeMsg[server.id]}</p>
+                              ) : (
+                                <p className="text-[10px] mt-0.5 opacity-70">点击右上角刷新图标重新探测</p>
+                              )}
+                            </>
+                          ) : (
+                            <>
+                              <p>尚未探测连接</p>
+                              <p className="text-[10px] mt-0.5 opacity-70">
+                                {probing[server.id] ? '探测中…' : '点击右上角刷新图标探测连接与 GPU 状态'}
+                              </p>
+                            </>
+                          )}
+                        </div>
+                      )}
+
                       {/* Notes */}
                       {server.notes && (
                         <p className="text-[11px] text-muted-foreground italic">{server.notes}</p>
@@ -551,6 +679,12 @@ export function Servers() {
                               <X className="h-3 w-3" />
                             </button>
                           </div>
+                          {/* 密钥路径被拒：显式说明「为什么不用它」，而不是让用户在「连不上」里猜 */}
+                          {terminalKeyPathError !== null && (
+                            <p className="border border-b-0 border-destructive/30 bg-destructive/5 px-3 py-1 text-[10px] text-destructive">
+                              已保存的 SSH 密钥路径不合法（{terminalKeyPathError}），本次连接未使用该密钥。请编辑服务器修正。
+                            </p>
+                          )}
                           <div className="rounded-b-md border border-border overflow-hidden">
                             <Terminal
                               id={`terminal-${server.id}`}
@@ -559,7 +693,7 @@ export function Servers() {
                                 host: selectedServer.host,
                                 port: selectedServer.port,
                                 user: selectedServer.user,
-                                keyPath: selectedServer.keyPath || undefined
+                                keyPath: terminalKeyPathError === null ? terminalKeyPath : undefined
                               }}
                             />
                           </div>
@@ -708,7 +842,7 @@ export function Servers() {
               取消
             </Button>
             {editingId ? (
-              <Button size="sm" className="h-7" onClick={handleSave} disabled={!form.name || !form.host}>
+              <Button size="sm" className="h-7" onClick={() => void handleSave()} disabled={!form.name || !form.host}>
                 保存
               </Button>
             ) : (

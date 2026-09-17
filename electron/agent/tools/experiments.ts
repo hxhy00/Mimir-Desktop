@@ -6,6 +6,7 @@
 import { tool } from 'langchain/tools'
 import { z } from 'zod'
 import { getStoreValue, setStoreValue, currentSpaceEpoch, assertSpaceUnchanged } from '../../library/store'
+import { listServers, findServer } from '../../servers/serversService'
 import { requireBusinessApproval } from '../approval'
 
 export type ExperimentStatus = 'running' | 'success' | 'failed'
@@ -40,6 +41,21 @@ function load(): ExperimentRecord[] {
 
 function save(list: ExperimentRecord[]): void {
   setStoreValue(EXPERIMENTS_KEY, list)
+}
+
+/**
+ * 校验 serverId 指向的服务器确实存在（P0-4：与 libraryService.updatePaper 的
+ * projectId 校验口径对齐，避免「写下任何不存在的 id 都照收」的双标准）。
+ *
+ * 返回错误文案（校验失败）或 null（通过）。空串表示「清空关联」，不在校验范围。
+ * 服务器的 id 与名称都可作为指代（与 server 工具一致）。
+ */
+function validateServerId(serverId: string | undefined): string | null {
+  if (serverId === undefined || serverId.trim() === '') return null
+  const hit = findServer(serverId.trim())
+  if (hit !== undefined) return null
+  const available = listServers().map((s) => `${s.id}(${s.name})`).join('、')
+  return `关联服务器「${serverId}」不存在。可用：${available || '(尚未注册任何服务器)'}。若暂不确定，可省略 serverId 或先到「GPU 服务器」界面添加。`
 }
 
 function describe(list: ExperimentRecord[]): string {
@@ -93,6 +109,8 @@ export const experimentTool = tool(
         if (list.some((exp) => exp.name === name.trim())) {
           return `创建失败：已存在同名实验「${name.trim()}」。若要记录新一轮运行，请改为 update 并明确目标 id，或在 name 中加入运行标记（种子/日期）。`
         }
+        const serverError = validateServerId(serverId)
+        if (serverError !== null) return `创建失败：${serverError}`
         const now = new Date().toISOString()
         const record: ExperimentRecord = {
           id: `exp-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
@@ -113,6 +131,8 @@ export const experimentTool = tool(
         if (name !== undefined && name.trim() !== '' && name.trim() !== target.name && list.some((exp) => exp.name === name.trim())) {
           return `更新失败：已存在同名实验「${name.trim()}」。`
         }
+        const serverError = validateServerId(serverId)
+        if (serverError !== null) return `更新失败：${serverError}`
         const next: ExperimentRecord = {
           ...target,
           name: name !== undefined && name.trim() !== '' ? name.trim() : target.name,
@@ -143,14 +163,14 @@ export const experimentTool = tool(
     name: 'experiment',
     description:
       '操作当前科研空间的实验记录（与「实验」模块同一份数据）。' +
-      'action=list 查看全部；create 新建（name 必填，status 可选 running/success/failed，metrics 为 key→数值/字符串 映射，serverId 可选）；update 按 id 更新（可改 name/status/metrics/serverId，清空 serverId 传空串）；delete 按 id 删除。写入前请先与用户确认。',
+      'action=list 查看全部；create 新建（name 必填，status 可选 running/success/failed，metrics 为 key→数值/字符串 映射，serverId 可选但必须是已注册的服务器）；update 按 id 更新（可改 name/status/metrics/serverId，清空 serverId 传空串）；delete 按 id 删除。写入前请先与用户确认。',
     schema: z.object({
       action: z.enum(['list', 'create', 'update', 'delete']),
       id: z.string().optional().describe('update/delete 时的实验 id'),
       name: z.string().optional().describe('实验名称（create 必填）'),
       status: z.enum(['running', 'success', 'failed']).optional(),
       metrics: z.record(z.union([z.string(), z.number()])).optional().describe('指标：accuracy=0.92、loss=0.13 …'),
-      serverId: z.string().optional().describe('关联服务器 id；清空传空字符串'),
+      serverId: z.string().optional().describe('关联服务器 id 或名称（必须是已注册的服务器；清空传空字符串）'),
     }),
   },
 )

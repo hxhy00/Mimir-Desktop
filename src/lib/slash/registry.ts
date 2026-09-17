@@ -256,6 +256,19 @@ export const COMMAND_ENTRIES: SlashEntry[] = [
     () => '',
     'clear',
   ),
+  // /reload：客户端重载界面，不走 Agent
+  entry(
+    'command',
+    'reload',
+    '重载界面（/reload）',
+    '重新加载渲染层：会中止在跑的回复，用于界面卡死 / 样式未生效时',
+    '界面出现异常、或想强制重载时。**注意**：会中止所有正在生成的回复。',
+    '',
+    '/reload',
+    false,
+    () => '',
+    'reload',
+  ),
   ...COMMAND_METAS.map((meta) =>
     entry(
       'command',

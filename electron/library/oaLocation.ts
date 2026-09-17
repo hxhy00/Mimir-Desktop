@@ -26,6 +26,21 @@ import { httpFetch } from '../http'
 const UNPAYWALL_EMAIL = 'hxhy@users.noreply.github.com'
 const REQUEST_TIMEOUT_MS = 15_000
 
+/**
+ * OpenAlex API key 接缝：设置页 `settings.openAlexApiKey` 优先，环境变量兜底。
+ * 与 paperSearch 同一套理由——不直读 process.env（打包后会被静态替换）。
+ * OpenAlex 已转 API Key 预算制，mailto 不再提供配额增益；未配置 key 时回退 mailto 标识。
+ */
+let openAlexKeyProvider: () => string = () => process.env['MIMIR_OPENALEX_API_KEY'] ?? ''
+export function setOpenAlexKeyProvider(provider: () => string): void {
+  openAlexKeyProvider = provider
+}
+/** OpenAlex 鉴权参数：配了 key 走账号配额（额度 ×10），否则回退 mailto 联系标识。 */
+function openAlexAuth(): string {
+  const key = openAlexKeyProvider().trim()
+  return key !== '' ? `api_key=${encodeURIComponent(key)}` : `mailto=${UNPAYWALL_EMAIL}`
+}
+
 /** 一个解析到的 OA PDF 位置。 */
 export interface OaPdfLocation {
   /** PDF 直链（已校验非空；`contentType` 是否为 PDF 由下载层实际校验） */
@@ -59,7 +74,7 @@ async function viaOpenAlex(doi: string): Promise<OaPdfLocation | null> {
   try {
     const url =
       `https://api.openalex.org/works/doi:${encodeURIComponent(doi)}` +
-      `?mailto=${UNPAYWALL_EMAIL}&select=id,doi,best_oa_location`
+      `?${openAlexAuth()}&select=id,doi,best_oa_location`
     const data = (await getJson(url)) as {
       best_oa_location?: { pdf_url?: string | null } | null
     }

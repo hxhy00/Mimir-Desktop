@@ -12,7 +12,17 @@
 export type SlashKind = 'command' | 'skill'
 
 /** 客户端特殊动作标记（不走 Agent，由前端直接处理）。 */
-export type ClientAction = 'clear' | 'help'
+export type ClientAction =
+  /**
+   * `reload`：重载渲染层（等同于开发者工具里的刷新）。
+   *
+   * 存在的理由：`main.ts` 里**同一窗口重新导航**（Cmd+R / F5）会触发 Electron 的
+   * 主框架导航，销毁并重建 renderer —— 而 `mainWindow.on('closed')` 之外**没有任何**
+   * 导航钩子在结束时中止在跑的 Agent 会话，于是「刷新一下」就会把正在生成的回复
+   * 连同其 `AbortController` 一起丢在后台（见 `reloadRenderer()` 的说明）。
+   * 提供一个显式入口，让用户能主动、可预期地重载，而不是去按 Cmd+R 踩坑。
+   */
+  'reload' | 'clear' | 'help'
 
 /** 注册表条目：一条指令或一个技能。 */
 export interface SlashEntry {

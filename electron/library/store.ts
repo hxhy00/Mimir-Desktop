@@ -13,7 +13,18 @@
  */
 import { app } from 'electron'
 import { randomUUID } from 'crypto'
-import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, unlinkSync, cpSync, rmSync, readdirSync } from 'fs'
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  writeFileSync,
+  renameSync,
+  unlinkSync,
+  cpSync,
+  rmSync,
+  readdirSync,
+  chmodSync
+} from 'fs'
 import { join, dirname, basename } from 'path'
 import { homedir } from 'os'
 
@@ -55,6 +66,46 @@ let globalStore: Record<string, unknown> = {}
 let spaceStore: Record<string, unknown> = {}
 let setupDone = false
 
+/**
+ * 各层「是否处于可以安全写盘的状态」：只有成功装入（含「文件不存在」的首装态）才为 true。
+ *
+ * 为什么要它：装入失败（损坏）时内存里是空对象，若照常 allow 写入，
+ * 一次 `setStoreValue` 就会把空对象写回磁盘 —— 用户数据被静默清空。
+ * 因此装入失败 = 该层只读（读取尚可，写入一律拒绝并给出可操作的报错）。
+ */
+let globalWritable = false
+let spaceWritable = false
+
+/**
+ * 运行期 store 层的显式异常清单（损坏路径 + 原因）。
+ *
+ * 上层（IPC / 渲染层）可查询它向用户展示「为什么设置保存不了」，
+ * 而不是让用户面对一个没有任何解释的写入失败。
+ */
+const storeIssues: string[] = []
+
+/** 当前累积的 store 层异常（只读副本）。 */
+export function storeLoadIssues(): string[] {
+  return [...storeIssues]
+}
+
+/** 记录一个 store 层异常：日志 + 清单，两处都留痕，便于事后定位。 */
+function recordStoreIssue(message: string, error: unknown): void {
+  const detail = error instanceof Error ? error.message : String(error)
+  const line = `${message} ${detail}`
+  console.error(`[store] ${line}`)
+  storeIssues.push(line)
+}
+
+/** 写盘前的收口：层未成功装入时拒绝写入（Fail-Closed，防止空数据覆盖磁盘）。 */
+function assertLayerWritable(layer: '全局' | '空间', path: string, writable: boolean): void {
+  if (writable) return
+  throw new Error(
+    `store 层未成功装入（${layer}层：${path}），已拒绝本次写入以避免覆盖磁盘上的真实数据。` +
+      '请修复或移走该损坏文件后重启应用。'
+  )
+}
+
 function globalFilePath(): string {
   return join(homedir(), '.mimir', 'store.json')
 }
@@ -75,31 +126,132 @@ function migrateLegacyGlobalFile(): void {
   if (existsSync(target) || !existsSync(legacy)) return
   try {
     mkdirSync(dirname(target), { recursive: true })
-    writeJsonAtomic(target, readJson(legacy))
+    // 目标即全局层 store（含凭据），权限按 0600 落盘。
+    writeJsonAtomic(target, readJson(legacy), { credential: true })
   } catch (error) {
-    console.error('[store] 迁移旧全局文件到 ~/.mimir 失败：', error)
+    // 迁移失败不阻塞启动；但要留痕（旧文件损坏也是一种「用户数据可能读不进来」的显式信号）。
+    recordStoreIssue('迁移旧全局文件到 ~/.mimir 失败：', error)
   }
 }
 
-function readJson(path: string): Record<string, unknown> {
-  try {
-    if (!existsSync(path)) return {}
-    return JSON.parse(readFileSync(path, 'utf-8')) as Record<string, unknown>
-  } catch {
-    return {}
+// ─── 完整性与权限 ─────────────────────────────────────────────────────────
+
+/**
+ * store 文件损坏（读不出来 / 不是合法 JSON / 顶层不是对象）。
+ *
+ * 与「文件不存在」严格分开：后者是全新安装的正常态（返回默认值、之后可以正常写）；
+ * 前者若也返回一个空对象，下一次 `setStoreValue` 就会用 `{ 该 key: value }` 全量覆盖
+ * 磁盘文件，用户几年的文献库/实验记录在没有任何提示的情况下消失 ——
+ * 这正是 readJson 原先 `catch { return {} }` 的致命点。故一律显式上抛，
+ * 并由调用方把该层标记为「不可写」（见 {@link globalWritable} / {@link spaceWritable}）。
+ *
+ * 磁盘上的原文件**不会被改动或删除**，便于用户自行抢救。
+ */
+export class StoreCorruptError extends Error {
+  readonly filePath: string
+  readonly reason: unknown
+  constructor(filePath: string, reason: unknown) {
+    super(
+      `store 文件损坏，无法读取：${filePath}。` +
+        '已停止对该文件的写入（避免用空数据覆盖磁盘上的真实数据），文件原样保留；' +
+        '请修复或移走该文件后重启应用。'
+    )
+    this.name = 'StoreCorruptError'
+    this.filePath = filePath
+    this.reason = reason
   }
+}
+
+/** 凭据类文件的 POSIX 权限位：仅属主可读写。 */
+const CREDENTIAL_FILE_MODE = 0o600
+/** 普通数据文件的权限位。 */
+const DEFAULT_FILE_MODE = 0o644
+
+/**
+ * 键名里出现这些词 → 该 store 文件按「凭据类」处理，权限收到 0600。
+ *
+ * 依据：`servers:list` 的记录里带**明文 password**（见 servers/types.ts），
+ * 全局层 store 因此与 SSH 凭据同级；0644 会让同机其它用户直接读到。
+ */
+const CREDENTIAL_KEY_RE =
+  /(password|passwd|secret|token|api[-_]?key|private[-_]?key|access[-_]?key|credential)/i
+
+/** 键名中含有凭据字样（递归、限深度）。 */
+function containsCredentialKeys(value: unknown, depth = 0): boolean {
+  if (depth > 6) return false
+  if (Array.isArray(value)) return value.some((item) => containsCredentialKeys(item, depth + 1))
+  if (typeof value !== 'object' || value === null) return false
+  for (const [key, nested] of Object.entries(value)) {
+    if (CREDENTIAL_KEY_RE.test(key)) return true
+    if (containsCredentialKeys(nested, depth + 1)) return true
+  }
+  return false
+}
+
+/**
+ * 收紧已有文件的权限（仅 POSIX；Windows 无 POSIX 权限位，跳过）。
+ *
+ * 收紧失败只记录日志、不上抛：权限是「降低暴露面」，而写入成功与否是另一个维度，
+ * 不应因为 chmod 失败就把一次成功的持久化判成失败。
+ */
+function tightenFileMode(path: string, mode: number): void {
+  if (process.platform === 'win32') return
+  try {
+    chmodSync(path, mode)
+  } catch (error) {
+    console.error(`[store] 收紧文件权限失败（${path}）：`, error)
+  }
+}
+
+/**
+ * 读取一个 store 层文件。
+ *
+ * - **文件不存在** → 返回 `fallback`（首装的正常形态，该层**允许写入**）；
+ * - **读失败 / 不是合法 JSON / 顶层不是对象** → 抛 {@link StoreCorruptError}，
+ *   由调用方显式上报并把该层置为不可写，杜绝「空对象覆盖真实数据」。
+ */
+function readJson(path: string, fallback: Record<string, unknown> = {}): Record<string, unknown> {
+  if (!existsSync(path)) return fallback
+  let text: string
+  try {
+    text = readFileSync(path, 'utf-8')
+  } catch (error) {
+    throw new StoreCorruptError(path, error)
+  }
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(text)
+  } catch (error) {
+    throw new StoreCorruptError(path, error)
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    throw new StoreCorruptError(
+      path,
+      new Error(`顶层结构不是 JSON 对象（实际为 ${Array.isArray(parsed) ? 'array' : String(parsed)}）`)
+    )
+  }
+  return parsed as Record<string, unknown>
 }
 
 /**
  * 原子写 JSON：先写同目录临时文件再 rename 覆盖，避免写一半崩溃损坏 store。
  * 失败会向调用方上抛（不再静默吞错，防止“看似成功实则丢数据”）。
+ *
+ * `credential: true`（或内容里检出凭据键名）时把文件权限收到 0600；
+ * 其余按 0644。rename 沿用临时文件的权限位，因此既有文件也会在本次写入被收紧。
  */
-function writeJsonAtomic(path: string, value: Record<string, unknown>): void {
+function writeJsonAtomic(
+  path: string,
+  value: Record<string, unknown>,
+  options: { credential?: boolean } = {}
+): void {
+  const credential = options.credential ?? containsCredentialKeys(value)
+  const mode = credential ? CREDENTIAL_FILE_MODE : DEFAULT_FILE_MODE
   const dir = dirname(path)
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
   const tempPath = join(dir, `.tmp-${basename(path)}-${process.pid}-${randomUUID()}`)
   try {
-    writeFileSync(tempPath, JSON.stringify(value, null, 2), 'utf-8')
+    writeFileSync(tempPath, JSON.stringify(value, null, 2), { encoding: 'utf-8', mode })
     renameSync(tempPath, path)
   } catch (error) {
     try {
@@ -109,10 +261,15 @@ function writeJsonAtomic(path: string, value: Record<string, unknown>): void {
     }
     throw error
   }
+  // 兜底：rename 在某些文件系统/umask 组合下未必达到目标权限位，显式收紧一次。
+  if (credential) tightenFileMode(path, CREDENTIAL_FILE_MODE)
 }
 
 function saveGlobal(): void {
-  writeJsonAtomic(globalFilePath(), globalStore)
+  const path = globalFilePath()
+  assertLayerWritable('全局', path, globalWritable)
+  // 全局层固定按凭据类处理：它承载 `servers:list`（含明文 password）与 settings（含 API Key）。
+  writeJsonAtomic(path, globalStore, { credential: true })
 }
 
 function spaceDataPath(spacePath: string): string {
@@ -128,7 +285,10 @@ function saveSpace(): void {
   // active 为 null 仅出现在「尚无任何空间」的短暂窗口：此时不再静默丢弃，
   // 而是落到 spaceRoot() 兜底目录（createWorkspace/switchWorkspace 生效后会读取真实空间文件）。
   const basePath = active === null ? spaceRoot() : active.path
-  writeJsonAtomic(spaceDataPath(basePath), spaceStore)
+  const path = spaceDataPath(basePath)
+  assertLayerWritable('空间', path, spaceWritable)
+  // 凭据键名由 writeJsonAtomic 自动检出（空间层平时是业务数据，不该一律 0600）。
+  writeJsonAtomic(path, spaceStore)
 }
 
 // ─── 空间代际令牌（防跨空间异步回写污染）────────────────────────────────
@@ -138,7 +298,19 @@ let spaceEpoch = 0
 
 /** 装载某空间数据到 spaceStore，并推进代际计数。 */
 function loadSpaceCache(spacePath: string): void {
-  spaceStore = readSpaceJson(spacePath)
+  const path = spaceDataPath(spacePath)
+  try {
+    spaceStore = readJson(path)
+    spaceWritable = true
+    // 空间层平时是业务数据（不入凭据），但用户若把含口令的数据存了进来，
+    // 历史文件可能仍是 0644 —— 检出后顺手收紧。
+    if (containsCredentialKeys(spaceStore)) tightenFileMode(path, CREDENTIAL_FILE_MODE)
+  } catch (error) {
+    // 损坏：显式上报 + 该层置为只读。绝不退回「空对象 + 允许写盘」——那等于下一次写入清空用户数据。
+    spaceStore = {}
+    spaceWritable = false
+    recordStoreIssue(`空间 store 装入失败（${path}）：`, error)
+  }
   spaceEpoch += 1
 }
 
@@ -202,7 +374,19 @@ export function spaceRoot(): string {
 export function loadStore(): void {
   if (setupDone) return
   migrateLegacyGlobalFile()
-  globalStore = readJson(globalFilePath())
+  const path = globalFilePath()
+  try {
+    globalStore = readJson(path)
+    globalWritable = true
+  } catch (error) {
+    // 损坏：内存里先给个空对象让应用能起来（可读），但**不允许写回**，
+    // 具体原因进 storeIssues 供上层展示，磁盘文件保持原样不动。
+    globalStore = {}
+    globalWritable = false
+    recordStoreIssue(`全局 store 装入失败（${path}）：`, error)
+  }
+  // 旧版本留下的 0644：即便本次不写盘也要就地收紧（全局层固定含凭据）。
+  if (existsSync(path)) tightenFileMode(path, CREDENTIAL_FILE_MODE)
   ensureWorkspaceSetup()
 }
 
@@ -419,6 +603,9 @@ export function ensureWorkspaceSetup(): void {
       delete globalStore[ACTIVE_KEY]
       saveGlobal()
       spaceStore = {}
+      // 尚无空间时写入落在 spaceRoot() 兜底目录（临时草稿，用户数据尚未产生），
+      // 保持可写，行为与旧版一致。
+      spaceWritable = true
       spaceEpoch += 1
       setupDone = true
       return
@@ -438,11 +625,12 @@ export function ensureWorkspaceSetup(): void {
     loadSpaceCache(active.path)
     setupDone = true
   } catch (error) {
-    // 启动时 userData 不可写等极端情况：不让初始化直接崩溃，但记录错误。
-    // 运行时写入失败仍会经 IPC 上抛给渲染进程。
-    console.error('[store] ensureWorkspaceSetup 失败：', error)
+    // 启动时 userData 不可写、或空间 store 损坏等：不让初始化直接崩溃，但必须留痕，
+    // 并把空间层置为只读（避免用空对象覆盖磁盘数据）。运行时写入失败仍会经 IPC 上抛给渲染进程。
+    recordStoreIssue('ensureWorkspaceSetup 失败：', error)
     setupDone = true
     spaceStore = {}
+    spaceWritable = false
     spaceEpoch += 1
   }
 }

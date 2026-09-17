@@ -33,6 +33,9 @@ const EDITOR_TEXT_STYLE: CSSProperties = {
 /** 高亮覆盖层全量渲染的源码长度上限；超过则退化为纯行号模式以保住输入响应。 */
 const HIGHLIGHT_RENDER_LIMIT = 80_000
 
+/** 行跳转高亮条的持续时间（ms）：到点自动熄灭。 */
+const FLASH_DURATION_MS = 1800
+
 /** 触发一次行跳转：`line` 为 1-based 行号，`nonce` 用于重复点击同一行。 */
 export interface EditorFlashRequest {
   readonly line: number
@@ -91,15 +94,20 @@ export function LatexEditor({
   /** textarea 当前的垂直滚动偏移，驱动闪动行的视口坐标。 */
   const [scrollTop, setScrollTop] = useState(0)
 
+  /**
+   * 上报光标位置。文本取自 **textarea 的当前 DOM 值** 而非 `value` prop：
+   * DOM 是「用户此刻看到的文本」的一手来源，同时也让本回调不随 `value` 变化，
+   * 从而不会把行跳转 effect 拖成「每敲一个键就重跑一次」（见下方 effect 注释）。
+   */
   const reportCursor = useCallback(() => {
     const textarea = textareaRef.current
     if (textarea === null || onCursorChange === undefined) return
     const pos = textarea.selectionStart ?? 0
-    const before = value.slice(0, pos)
+    const before = textarea.value.slice(0, pos)
     const line = before.split('\n').length
     const column = pos - (before.lastIndexOf('\n') + 1) + 1
     onCursorChange({ line, column })
-  }, [onCursorChange, value])
+  }, [onCursorChange])
 
   const handleScroll = useCallback((event: UIEvent<HTMLTextAreaElement>) => {
     const textarea = event.currentTarget
@@ -114,18 +122,31 @@ export function LatexEditor({
   }, [])
 
   // 行跳转：定位视口 + 聚焦选区 + 短暂闪动该行。
+  //
+  // 依赖只能是 `flash`：**不能带 `value` / `lineCount`**。它们每敲一个字符就变，
+  // 于是「从问题面板点一行跳过来」之后，后续每一次输入都会重跑整个跳转——
+  // 重新抢焦点、把光标拽回跳转行行首、把视口滚回去，且下面的熄灭定时器被无限重启
+  // （观感：高亮条永远不消失 + 编辑器没法正常打字）。跳转请求本身由父组件用
+  // `nonce` 生成新对象（见 Paper.tsx 的 `setFlash({ line, nonce })`），
+  // 所以「同一次跳转」只跑一次、「下一次跳转」一定会跑。
+  //
+  // 行号与行首偏移因此改从 **DOM 当前文本**现算（textarea 本身就是当前值的一手来源，
+  // 与 `value` prop 同样准确），不再需要把 `value` 放进依赖。
   useEffect(() => {
     if (flash === null) return
     const textarea = textareaRef.current
     if (textarea === null) return
-    const line = Math.max(1, Math.min(flash.line, lineCount))
+    const text = textarea.value
+    const totalLines = text.split('\n').length
+    const line = Math.max(1, Math.min(flash.line, totalLines))
     textarea.focus()
-    // 定位光标到目标行首。
+    // 定位光标到目标行首（找不到换行说明已在末行，停在当前偏移即可）。
     let idx = 0
-    for (let i = 1; i < line && i <= lineCount; i += 1) {
-      idx = value.indexOf('\n', idx) + 1
+    for (let i = 1; i < line; i += 1) {
+      const next = text.indexOf('\n', idx)
+      if (next === -1) break
+      idx = next + 1
     }
-    if (idx === 0) idx = value.indexOf('\n') === -1 ? value.length : 0
     try {
       textarea.setSelectionRange(idx, idx)
     } catch {
@@ -137,9 +158,13 @@ export function LatexEditor({
     setScrollTop(textarea.scrollTop)
     setFlashLine(line)
     reportCursor()
+    // 到点自动熄灭：先清掉上一次的定时器，保证「连点两次跳转」只留一个待触发的。
     if (flashTimerRef.current !== null) clearTimeout(flashTimerRef.current)
-    flashTimerRef.current = setTimeout(() => setFlashLine(null), 1800)
-  }, [flash, lineCount, value, reportCursor])
+    flashTimerRef.current = setTimeout(() => {
+      flashTimerRef.current = null
+      setFlashLine(null)
+    }, FLASH_DURATION_MS)
+  }, [flash, reportCursor])
 
   useEffect(() => {
     return () => {

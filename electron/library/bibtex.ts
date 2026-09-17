@@ -1,118 +1,148 @@
 /**
- * 依赖零的 BibTeX 解析/序列化（从 Mimir 移植），
- * 以及 PaperRecord → @misc 投影，用于文献库导入 references.bib。
+ * BibTeX 解析/序列化。
+ *
+ * 解析改用成熟库 `@retorquere/bibtex-parser`（BibTeX/BibLaTeX 解析事实标准，
+ * Zotero/better-bibtex 同源级工具链），不再自研词法器。
+ *
+ * ── 两条必须遵守的约束（否则会污染用户 .bib）──────────────────────
+ *
+ * 1. **解析强制 `raw: true` + `sentenceCase: false`**。
+ *    该库默认会把 LaTeX 转成 Unicode（`{\'c}` → `ć`）、把英文标题转句首大写。
+ *    这两个改写对"读取即回写"的流程等于篡改用户原文，必须关闭。
+ *
+ * 2. **回写一律原文保留**。库的每个条目都带 `entry.input`（该条目的原始文本片段，
+ *    含花括号、LaTeX 源、`@string` 引用名）。序列化时未改动的条目直接输出 `input`，
+ *    只有新增/改动的条目才生成新文本。这是"导入后再导出、未改动条目字节级不变"的保证。
+ *
+ * 之前的手写实现把整个文件重新格式化（压平花括号、展开宏、丢注释），是本模块的最高风险点。
  */
+import { parse as parseBibtexLib } from '@retorquere/bibtex-parser'
 import type { PaperRecord, BibEntry } from './types'
 
-/** 解析时跳过的条目类型 */
-const SKIPPED_TYPES = new Set(['string', 'preamble', 'comment'])
-
-/** 读取一个字段值：{花括号}（嵌套感知）、"引号"（转义感知）或裸 token */
-function readValue(text: string, start: number): { value: string; end: number } | undefined {
-  const opener = text[start]
-  if (opener === '{') {
-    let depth = 1
-    let index = start + 1
-    while (index < text.length && depth > 0) {
-      const char = text[index]
-      if (char === '\\') index += 1
-      else if (char === '{') depth += 1
-      else if (char === '}') depth -= 1
-      index += 1
-    }
-    if (depth !== 0) return undefined
-    return { value: text.slice(start + 1, index - 1), end: index }
-  }
-  if (opener === '"') {
-    let index = start + 1
-    while (index < text.length) {
-      const char = text[index]
-      if (char === '\\') index += 2
-      else if (char === '"') return { value: text.slice(start + 1, index), end: index + 1 }
-      else index += 1
-    }
-    return undefined
-  }
-  const match = /^[^,}\)\s]+/.exec(text.slice(start))
-  if (match === null) return undefined
-  return { value: match[0], end: start + match[0].length }
+/** 解析结果：条目 + 原文映射 + 错误列表 */
+export interface ParsedBib {
+  /** 文件顺序的条目列表（字段已拍平为字符串） */
+  entries: BibEntry[]
+  /** 引用键 → 该条目的原文片段（用于原样回写） */
+  rawByKey: Map<string, string>
+  /** 解析错误（非空时调用方应中止回写，避免把未解析出的条目当作"不存在"而丢弃） */
+  errors: string[]
 }
 
-/** 解析一个 @type{…} 块 */
-function readEntry(text: string, at: number): { entry: BibEntry | undefined; end: number } | undefined {
-  const head = /^@([a-zA-Z]+)\s*([{(])\s*/.exec(text.slice(at))
-  if (head === null) return undefined
-  const type = head[1]!.toLowerCase()
-  const closer = head[2] === '{' ? '}' : ')'
-  let index = at + head[0].length
-  if (SKIPPED_TYPES.has(type)) {
-    let depth = 1
-    while (index < text.length && depth > 0) {
-      const char = text[index]
-      if (char === '\\') index += 1
-      else if (char === '{' || char === '(') depth += 1
-      else if (char === '}' || char === ')') depth -= 1
-      index += 1
-    }
-    return { entry: undefined, end: index }
+/**
+ * 把库返回的字段值拍平回字符串，保持 `BibEntry.fields: Record<string, string>` 契约。
+ *
+ * 库对部分字段做了结构化：
+ * - creator 类（author/editor…）→ `[{lastName, firstName, ...}]`，需拼回 `A and B`
+ * - 数组类（keywords/publisher/institution…）→ `string[]`，需拼回 `a, b`
+ * - 其余 → `string`
+ */
+function flattenField(name: string, value: unknown): string {
+  if (typeof value === 'string') return value
+  if (Array.isArray(value)) {
+    const parts = value.map((item) => {
+      if (typeof item === 'string') return item
+      if (item !== null && typeof item === 'object') {
+        const c = item as { name?: unknown; firstName?: unknown; lastName?: unknown; prefix?: unknown; suffix?: unknown }
+        // 库已给现成的 name 时直接用（如机构作者）；否则按 bibtex 惯例拼
+        if (typeof c.name === 'string' && c.name !== '') return c.name
+        const given = typeof c.firstName === 'string' ? c.firstName : ''
+        const family = typeof c.lastName === 'string' ? c.lastName : ''
+        const prefix = typeof c.prefix === 'string' ? c.prefix : ''
+        const suffix = typeof c.suffix === 'string' ? c.suffix : ''
+        return [prefix, given, family, suffix].filter((s) => s !== '').join(' ').trim()
+      }
+      return String(item)
+    })
+    // creator 类字段用 ` and ` 连接（BibTeX 作者分隔符）；其余用 `, `
+    const isCreator = /^(author|bookauthor|collaborator|commentator|director|editor[a-z]?|editors|holder|scriptwriter|translator)$/i.test(name)
+    return parts.filter((p) => p !== '').join(isCreator ? ' and ' : ', ')
   }
-  const keyMatch = /^[^,\s}\)]+/.exec(text.slice(index))
-  if (keyMatch === null) return undefined
-  const key = keyMatch[0]
-  index += key.length
-  const fields: Record<string, string> = {}
-  let closed = false
-  while (index < text.length) {
-    const skip = /^(?:\s|%[^\n]*|,)+/.exec(text.slice(index))
-    if (skip !== null) index += skip[0].length
-    const char = text[index]
-    if (char === undefined) return undefined
-    if (char === closer) { closed = true; index += 1; break }
-    const nameMatch = /^[a-zA-Z][\w-]*\s*=\s*/.exec(text.slice(index))
-    if (nameMatch === null) return undefined
-    const name = nameMatch[0].replace(/[\s=]/g, '').toLowerCase()
-    index += nameMatch[0].length
-    const read = readValue(text, index)
-    if (read === undefined) return undefined
-    fields[name] = read.value
-    index = read.end
-    const concat = /^\s*#\s*/.exec(text.slice(index))
-    if (concat !== null) {
-      const next = readValue(text, index + concat[0].length)
-      if (next === undefined) return undefined
-      fields[name] += next.value
-      index = next.end
-    }
-  }
-  if (!closed) return undefined
-  return { entry: { key, type, fields }, end: index }
+  if (value === null || value === undefined) return ''
+  return String(value)
 }
 
-/** 解析 .bib 文本为条目列表（文件顺序） */
-export function parseBibtex(text: string): BibEntry[] {
+/**
+ * 解析 .bib 文本为条目列表（文件顺序）。
+ *
+ * 强制 `raw: true`（不转 Unicode）与 `sentenceCase: false`（不改标题大小写），
+ * 保证读取不改变用户原文语义。
+ */
+export function parseBibtex(text: string): ParsedBib {
+  const empty: ParsedBib = { entries: [], rawByKey: new Map(), errors: [] }
+  if (text.trim() === '') return empty
+
+  let library: ReturnType<typeof parseBibtexLib>
+  try {
+    library = parseBibtexLib(text, { raw: true, sentenceCase: false })
+  } catch (error) {
+    return {
+      entries: [],
+      rawByKey: new Map(),
+      errors: [error instanceof Error ? error.message : String(error)],
+    }
+  }
+
   const entries: BibEntry[] = []
-  let index = 0
-  while (index < text.length) {
-    const at = text.indexOf('@', index)
-    if (at === -1) break
-    const read = readEntry(text, at)
-    if (read === undefined) { index = at + 1; continue }
-    if (read.entry !== undefined) entries.push(read.entry)
-    index = Math.max(read.end, at + 1)
+  const rawByKey = new Map<string, string>()
+  for (const entry of library.entries) {
+    const fields: Record<string, string> = {}
+    for (const [name, value] of Object.entries(entry.fields)) {
+      fields[name.toLowerCase()] = flattenField(name, value)
+    }
+    entries.push({ key: entry.key, type: entry.type.toLowerCase(), fields })
+    // 原文片段：仅当非空时才可用于回写
+    if (typeof entry.input === 'string' && entry.input.trim() !== '') {
+      rawByKey.set(entry.key, entry.input.trim())
+    }
   }
-  return entries
+
+  const errors = library.errors.map((e) => (e.input ? `${e.error} :: ${e.input}` : e.error))
+  return { entries, rawByKey, errors }
 }
 
-/** 序列化条目回 .bib 文本 */
-export function serializeBibtex(entries: readonly BibEntry[]): string {
-  return entries.map((entry) => {
-    const fields = Object.entries(entry.fields)
-      .map(([name, value]) => `  ${name} = {${value}},`)
-      .join('\n')
-    return fields === ''
-      ? `@${entry.type}{${entry.key}}`
-      : `@${entry.type}{${entry.key},\n${fields}\n}`
-  }).join('\n\n') + (entries.length > 0 ? '\n' : '')
+/** 生成一条条目的规范化文本（仅用于新增/改动条目） */
+function renderEntry(entry: BibEntry): string {
+  const fields = Object.entries(entry.fields)
+    .map(([name, value]) => `  ${name} = {${value}},`)
+    .join('\n')
+  return fields === ''
+    ? `@${entry.type}{${entry.key}}`
+    : `@${entry.type}{${entry.key},\n${fields}\n}`
+}
+
+/**
+ * 序列化条目回 .bib 文本。
+ *
+ * `rawByKey` 提供时启用**原文保留**：键命中且条目内容未变 → 输出原文；
+ * 否则生成新文本。这保证"只定向修改、不重排其余条目"。
+ *
+ * 判定"是否改动"的方式是**逐字段比对**：调用方传来的 `entries` 与原文解析出的
+ * 内容一致时保留原文，任何字段真正变了才重写该条目。
+ */
+export function serializeBibtex(
+  entries: readonly BibEntry[],
+  rawByKey?: Map<string, string>,
+  originalByKey?: Map<string, BibEntry>
+): string {
+  const blocks = entries.map((entry) => {
+    if (rawByKey !== undefined) {
+      const raw = rawByKey.get(entry.key)
+      const original = originalByKey?.get(entry.key)
+      if (raw !== undefined && original !== undefined && sameEntry(entry, original)) return raw
+    }
+    return renderEntry(entry)
+  })
+  return blocks.join('\n\n') + (blocks.length > 0 ? '\n' : '')
+}
+
+/** 两个条目是否完全一致（键、类型、字段名与值） */
+function sameEntry(a: BibEntry, b: BibEntry): boolean {
+  if (a.key !== b.key || a.type.toLowerCase() !== b.type.toLowerCase()) return false
+  const ak = Object.keys(a.fields)
+  const bk = Object.keys(b.fields)
+  if (ak.length !== bk.length) return false
+  return ak.every((key) => b.fields[key] === a.fields[key])
 }
 
 /** 一个 arXiv id 的 BibTeX 合法引用键 */

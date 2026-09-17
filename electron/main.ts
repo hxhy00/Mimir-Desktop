@@ -1,20 +1,30 @@
-import { app, shell, BrowserWindow, protocol, net } from 'electron'
+import { app, shell, BrowserWindow, protocol, net, dialog } from 'electron'
 import { join, dirname } from 'path'
 import { fileURLToPath, pathToFileURL } from 'url'
 import { is } from '@electron-toolkit/utils'
-import { setupIpcHandlers } from './ipc'
+import { setupIpcHandlers, disposeIpcResources } from './ipc'
 import { agentService, stopAllAgentTasks } from './agent/agentService'
+import { shutdownOtel } from './agent/otelTrace'
+import { resetApprovalSender } from './agent/approval'
 import { isLatexPdfAllowed } from './latex'
 import { existsSync } from 'fs'
 import { paperPdfFileName } from './library/arxiv'
 import { figureFilePath } from './figures/figuresService'
 import { loadStore, getStoreValue, spaceRoot } from './library/store'
+import { setS2KeyProvider, setOpenAlexKeyProvider } from './agent/paperSearch'
+import { setOpenAlexKeyProvider as oaLocationSetOpenAlexKeyProvider } from './library/oaLocation'
 import { startVenueDeadlineLoop } from './venues/venuesService'
 import { setTokenCounter } from './agent/contextManager'
 import { countTokensCached } from './agent/tokenizer'
 import { isSafeExternalUrl } from './safeUrl'
+import { stopBridge } from './plugins/bridge'
+import log, { initLogger } from './logger'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
+
+// 日志设施初始化：必须在 app ready 之前完成，才能捕获后续启动流程中的日志。
+// （initLogger 内部只用 app.isPackaged / app.getName()，这两者在 ready 前可用。）
+initLogger()
 
 // 必须在 app ready 之前注册：mimir-pdf 协议供文献库 iframe 内嵌阅读本地 PDF；
 // mimir-tex 协议供论文模块 iframe 内嵌预览项目目录内编译出的 main.pdf
@@ -55,10 +65,29 @@ async function initAgentFromSettings(): Promise<void> {
         // 模型设置里的「支持推理」显式开关；未设置时由 autoReasoningFor(baseUrl) 兜底。
         reasoning: selected.supportsReasoning as boolean | undefined
       })
-      console.log('Agent 已从保存的设置初始化')
+      log.info('Agent 已从保存的设置初始化')
     } catch (error) {
-      console.error('Agent 初始化失败:', error)
+      // 非致命（用户可在设置里重填 Key 后继续用），但必须落日志而不是 console 里沉掉。
+      log.error('Agent 初始化失败:', error)
     }
+  }
+}
+
+/**
+ * 把致命失败**显式暴露**出来：落日志 + 系统错误框。
+ *
+ * 为什么必须有：启动链此前没有兜底，任何一步抛错都只让 `app.whenReady().then(...)` 的
+ * Promise 静默 reject —— 用户看到的是「双击图标后窗口永远不出现」，日志里也没有线索。
+ * 失败必须可见，因此这里同时写主进程日志并弹一个用户能看见的框。
+ */
+function reportFatalError(title: string, error: unknown): void {
+  const detail = error instanceof Error ? (error.stack ?? error.message) : String(error)
+  log.error(`[${title}] ${detail}`)
+  try {
+    dialog.showErrorBox(title, detail)
+  } catch (dialogError) {
+    // 极早期（对话框不可用）时至少别把原始错误吞掉。
+    console.error(title, detail, dialogError)
   }
 }
 
@@ -181,6 +210,22 @@ app.whenReady().then(async () => {
   // 并完成默认科研空间注册 / 恢复上次激活的空间
   loadStore()
 
+  // S2 API key 接缝：统一访问层经 provider 读设置页保存的 key（环境变量兜底）。
+  // 不直读 process.env——打包后的 ESM bundle 里它会被构建期静态替换，运行时改值失效。
+  setS2KeyProvider(() => {
+    const settings = getStoreValue<Record<string, unknown>>('settings') ?? {}
+    return typeof settings.s2ApiKey === 'string' ? settings.s2ApiKey : ''
+  })
+
+  // OpenAlex API key 接缝（免费 key，额度 ×10；未配置时回退 mailto 标识）。同 S2 理由。
+  // paperSearch 与 oaLocation 各持一份同形 provider，装配同一读取逻辑。
+  const readOpenAlexKey = (): string => {
+    const settings = getStoreValue<Record<string, unknown>>('settings') ?? {}
+    return typeof settings.openAlexApiKey === 'string' ? settings.openAlexApiKey : ''
+  }
+  setOpenAlexKeyProvider(readOpenAlexKey)
+  oaLocationSetOpenAlexKeyProvider(readOpenAlexKey)
+
   // 上下文治理的 token 计数接缝：把真实 tokenizer 注入 contextManager（见 agent/contextManager.ts）。
   // 在进程启动时一次性注入，而不是在 Agent 初始化时——因为治理在「Agent 未初始化」时也可能被调用，
   // 且 token 口径属于进程级约定，不该随模型配置反复切换（countTokens 自身按模型名选词表）。
@@ -198,4 +243,72 @@ app.whenReady().then(async () => {
   setupIpcHandlers(windowRef)
 
   createWindow()
+}).catch((error: unknown) => {
+  // 启动链兜底：协议注册 / store 装载 / IPC 注册 / 建窗任一步抛错都会落到这里。
+  // 不静默 —— 弹框告知用户，并显式退出（否则会留下一个没有窗口的僵尸进程）。
+  reportFatalError('Mimir 启动失败', error)
+  app.quit()
+})
+
+/** 退出清理是否已触发：防止 `app.quit()` 再次进入 `before-quit` 形成死循环。 */
+let quitting = false
+
+/** 退出清理的最长等待：某个清理卡住时也要保证进程能退出（见应用规则「禁止静默挂起」）。 */
+const SHUTDOWN_TIMEOUT_MS = 3_000
+
+/**
+ * 退出前的显式资源回收（复用各模块**已有**的关闭接口，不新造生命周期）：
+ *
+ * - `stopAllAgentTasks()`：中止所有在途 Agent 会话（各自持有 AbortController，
+ *   也是 arXiv / 网页抓取等在途网络请求的取消源）；
+ * - `resetApprovalSender()`：解绑批准通道并按 Fail-Closed 拒绝所有在途批准请求；
+ * - `disposeIpcResources()`：终止存活的 PTY 子进程（node-pty 不随主进程退出）；
+ * - `stopBridge()`：关闭本地桥接 HTTP 服务，释放端口；
+ * - `shutdownOtel()`：把 OTel batch processor 缓冲区里的 span 刷给后端（不刷会丢最后几条 trace）。
+ *
+ * 未覆盖（如实记录）：会议截稿的刷新定时器已 `unref()`，不阻塞退出；
+ * `library/arxiv` 的下载走 `AbortSignal.timeout`，随进程结束自然失效——两者都没有
+ * 对外暴露 dispose，且都不会拖住退出，故未做额外处理。
+ */
+async function shutdown(): Promise<void> {
+  try {
+    stopAllAgentTasks()
+  } catch (error) {
+    log.warn('[shutdown] 中止 Agent 任务失败：', error)
+  }
+  try {
+    resetApprovalSender()
+  } catch (error) {
+    log.warn('[shutdown] 重置批准通道失败：', error)
+  }
+  try {
+    disposeIpcResources()
+  } catch (error) {
+    log.warn('[shutdown] 回收 IPC 资源失败：', error)
+  }
+  try {
+    await stopBridge()
+  } catch (error) {
+    log.warn('[shutdown] 停止桥接服务失败：', error)
+  }
+  try {
+    await shutdownOtel()
+  } catch (error) {
+    log.warn('[shutdown] 停止可观测性上报失败：', error)
+  }
+}
+
+app.on('before-quit', (event) => {
+  if (quitting) return
+  quitting = true
+  // 先拦住退出，做完异步清理再真正 quit（Electron 不等待 before-quit 里的异步工作）。
+  event.preventDefault()
+  void Promise.race([
+    shutdown(),
+    new Promise<void>((resolve) => {
+      setTimeout(resolve, SHUTDOWN_TIMEOUT_MS).unref?.()
+    })
+  ]).finally(() => {
+    app.quit()
+  })
 })

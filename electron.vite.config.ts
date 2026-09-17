@@ -19,6 +19,13 @@ import { resolve } from 'path'
  *    `index.js` 当 CJS 解析并抛 `SyntaxError: Cannot use import statement outside a module`。
  *    打进 bundle 后由 Rollup 解析并内联，运行时不再读那棵坏树。
  *
+ * 3) **OpenTelemetry 生态必须打进 bundle（不能外置）**：`@opentelemetry/sdk-node` 会去
+ *    `require` 一批「可选 instrumentation」包（grpc、http 等），外置时 Electron 会把它们当
+ *    运行时依赖去 node_modules 找，没装就抛 `Cannot find module`。OTel 官方对 Electron 的
+ *    建议即是打进 bundle（见 OTel JS「Bundling」文档）。另外 `@langchain/*` 已被强制内联，
+ *    插桩包必须与它同时内联，否则会出现**两份 `@langchain/core` 实例**，插桩的
+ *    `register()` 会 hook 到另一份上而完全不生效。
+ *
  * 其余依赖保持外置（electron-vite 的默认行为）。
  */
 const BUNDLE_INSTEAD_OF_EXTERNAL = [
@@ -28,6 +35,9 @@ const BUNDLE_INSTEAD_OF_EXTERNAL = [
   '@langchain/core',
   '@langchain/langgraph',
   '@langchain/openai',
+  // OpenTelemetry 核心 + 导出器 + 插桩：理由见上文第 3 点
+  '@opentelemetry/',
+  '@arizeai/openinference-',
   // zod 必须一起内联：LangChain 生态内部用的是 zod **4**（`zod/v4/core` 里的 `$ZodNever`、
   // `toJSONSchema` 等内部符号），而本项目的顶层 zod 是 **3.25.x**（`^3.23.8`，只提供 v3 API）。
   // 若 zod 外置，被 bundle 的 LangChain 代码会在运行时去顶层 zod 解析 `zod/v4/core`，

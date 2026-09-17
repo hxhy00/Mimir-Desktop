@@ -16,6 +16,7 @@ import {
 } from 'lucide-react'
 import {
   activityOf as activityText,
+  isRunActive,
   summarizeRun,
   visibleSteps,
   type AgentRun,
@@ -30,10 +31,11 @@ import {
  * 左侧竖线 + 状态点构成时间线，右侧是步骤内容；标题行给**收据式摘要**
  * （工具次数 / 耗时 / 产物数 / 失败数 / 待批准）。
  *
- * ── 内部步骤默认隐藏 ──────────────────────────────────────────────────────
+ * ── 内部步骤默认显示 ──────────────────────────────────────────────────────
  * 技能路由、上下文治理这类**实现细节**，以及**模型思考**（草稿而非动作），
- * 都不占正文（`step.internal === true`），底部留一个开关按需展开；
- * 开关文案把「思考过程」与「内部步骤」分开报数（见 `summarizeRun`）。
+ * 都不占正文（`step.internal === true`）。默认**显示**（用户要求执行过程透明，
+ * 2026-09-16），底部开关可收起；开关文案把「思考过程」与「内部步骤」分开报数
+ * （见 `summarizeRun`）。
  *
  * ── 语义来源 ──────────────────────────────────────────────────────────────
  * 一切判断取自结构化字段（`step.stage` / `status` / `internal`），
@@ -372,9 +374,10 @@ export interface AgentTimelineProps {
 export function AgentTimeline({ run, isStreaming, pendingApprovalTool }: AgentTimelineProps) {
   // 用户是否手动开/关过；null = 未干预，按运行态自动决定
   const [manual, setManual] = useState<boolean | null>(null)
-  const [showInternal, setShowInternal] = useState(false)
+  // 内部步骤（思考/技能路由等）默认显示，用户可手动收起（产品要求执行过程透明）。
+  const [showInternal, setShowInternal] = useState(true)
 
-  const running = run.status === 'running' || isStreaming === true
+  const running = isRunActive(run, isStreaming)
 
   // 每秒走一次表：耗时必须是**活的**。
   // 否则工具跑几十秒期间没有任何事件到达，标题上的「35.9s」会一直冻着，看着就像卡死。

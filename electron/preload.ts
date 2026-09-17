@@ -1,4 +1,20 @@
 import { contextBridge, ipcRenderer } from 'electron'
+import type { ServerDraft, ServerPatch, ServerRecord } from './servers/types'
+import { checkSeq, type AgentStreamEvent } from './agent/streamProtocol'
+
+/**
+ * 渲染进程日志桥：把渲染层日志送到主进程统一写文件（与主进程日志同一时间轴）。
+ *
+ * 只做「转发」这一件事，不引入 electron-log 的 renderer 入口（打包下入口解析易踩坑）。
+ * 主进程侧见 electron/ipc/index.ts 的 `log:write` 处理器。
+ */
+const logBridge = {
+  log: (level: 'error' | 'warn' | 'info' | 'verbose' | 'debug' | 'silly', scope: string, message: string): void => {
+    // fire-and-forget：日志不允许阻塞业务，也不关心主进程是否处理成功
+    ipcRenderer.send('log:write', level, scope, message)
+  }
+}
+contextBridge.exposeInMainWorld('mimirLog', logBridge)
 
 /** 一条从 LaTeX 编译日志恢复的诊断信息。 */
 export interface LatexIssue {
@@ -93,35 +109,19 @@ export interface ElectronAPI {
 
   // Agent
   sendMessage: (message: string, conversationId: string) => Promise<string>
+  /**
+   * 发送消息并接收**结构化流式事件**。
+   *
+   * 事件协议见 `electron/agent/streamProtocol.ts`：每个事件带单调 `seq` 与 `streamId`。
+   * 本层（preload）负责 seq 校验：跳号即**确定丢包**，写入渲染层日志（经 `mimirLog`），
+   * 使「内容少了」从「靠长度猜」变成「有直接证据」。
+   *
+   * @param onEvent 事件回调（正文增量 / 过程事件 / 结束 / 出错）
+   */
   streamMessage: (
     message: string,
     conversationId: string,
-    onChunk: (chunk: string) => void,
-    /**
-     * @deprecated 过程事件已改为经 onChunk 的前缀信封（`\u0002MIMIR_AGENT_EVENT\u0002` + JSON）送达，
-     * 渲染层在 ChatView 中拆包。此参数保留仅为兼容历史调用点，传入后不会被回调。
-     */
-    onWorkerEvent?: (event: {
-      taskId: string
-      title: string
-      status: 'running' | 'done' | 'error'
-      text?: string
-      durationMs?: number
-      kind?: 'phase' | 'task' | 'tool' | 'think' | 'think-token'
-      /** 结构化步骤（调用/返回共享 callId）；见主进程 AgentWorkerEvent.step。 */
-      step?: {
-        callId: string
-        name: string
-        label?: string
-        stage: 'call' | 'result' | 'error'
-        argsSummary?: string
-        resultSummary?: string
-        /** 文件动作（内置文件工具才有）：时间线显示「写入 model.py +387」。 */
-        file?: { path: string; action: 'read' | 'write' | 'edit' | 'delete'; added?: number; removed?: number }
-      }
-      /** 内部工程阶段标记 → 时间线默认隐藏。 */
-      phase?: 'context' | 'routing' | 'main' | 'ultra'
-    }) => void,
+    onEvent: (event: AgentStreamEvent) => void,
     options?: {
       ultra?: {
         enabled: boolean
@@ -145,8 +145,9 @@ export interface ElectronAPI {
     message?: string
   }>
   /**
-   * 重置某会话的上下文治理状态（清失效提醒与压缩熔断计数；`/clear` 时调用）。
-   * @param includeArchive 连归档原文一并清除（删除会话时传 true）。
+   * 重置某会话的上下文治理状态（`/clear` 与删除会话时调用）。
+   * @param includeArchive 连归档原文一并清除。`/clear` 传 true（清空后旧历史不该留下），
+   *   仅重置提醒/熔断计数时才传 false。
    */
   resetConversationContext: (conversationId: string, includeArchive?: boolean) => Promise<boolean>
   /** 停止生成；传入会话 id 则只停该会话（多会话并行时避免误停其它会话）。 */
@@ -268,6 +269,11 @@ export interface ElectronAPI {
     tcpLatencyMs: number | null
     gpus: { name: string; utilizationPct: number; memoryUsedMb: number; memoryTotalMb: number }[]
   }>
+  // 服务器 CRUD（经主进程 serversService 原子读改写，避免整表覆盖竞态）
+  listServers: () => Promise<ServerRecord[]>
+  createServer: (draft: ServerDraft) => Promise<ServerRecord>
+  updateServer: (id: string, patch: ServerPatch) => Promise<ServerRecord>
+  deleteServer: (id: string) => Promise<boolean>
 
   // Agent 副作用确认（三态）
   onApprovalRequest: (callback: (request: { id: string; tool: string; summary: string; detail?: string; source?: { origin: 'main' | 'subagent'; subagentId?: string; subagentLabel?: string } }) => void) => () => void
@@ -427,6 +433,9 @@ export interface ElectronAPI {
   }
 }
 
+/** 诊断用：`streamMessage` 被调用的累计次数（区分「一次发送」与「多次重入」）。 */
+let streamCallSeq = 0
+
 const electronAPI: ElectronAPI = {
   getAppVersion: () => ipcRenderer.invoke('app:getVersion'),
   getPlatform: () => process.platform,
@@ -434,16 +443,120 @@ const electronAPI: ElectronAPI = {
   sendMessage: (message, conversationId) =>
     ipcRenderer.invoke('agent:sendMessage', message, conversationId),
 
-  streamMessage: (message, conversationId, onChunk, onWorkerEvent, options) => {
+  streamMessage: (message, conversationId, onEvent, options) => {
     const channel = `agent:chunk:${conversationId}`
+    // 【诊断埋点】记录调用序号：若一次用户发送对应多次进入本函数，说明渲染层重复触发，
+    // 而每次进入都会 removeAllListeners → 摘掉上一轮正在收事件的监听器（丢包根因候选）。
+    const callNo = ++streamCallSeq
+    logBridge.log('error', 'stream', `stream.enter callNo=${callNo} conv=${conversationId}`)
     // 先移除同会话旧监听，避免每次发送叠加监听导致后续同会话重复回调
     ipcRenderer.removeAllListeners(channel)
-    const chunkListener = (_event: unknown, chunk: string): void => {
-      onChunk(chunk)
+    // seq 校验状态：跨事件保持，用于检测跳号（丢失的**直接证据**）。
+    //
+    // 关于「陈旧流判定」：这里**不再**用「首条事件锚定 streamId」的写法。
+    // 那套写法的致命缺陷——上一轮的迟到事件若先于本轮首条事件到达，会把 activeStreamId
+    // 锚定成**上一轮**的 id，导致本轮自己的事件全部被误判为 stale 而静默丢弃（表现为
+    // 「回复说一半就断了」，且渲染层日志里什么都看不到）。对会话级的**本轮/陈旧**区分，
+    // 渲染层已用 epoch（currentEpoch(convId) !== sendId）做了权威判断；此处只保证 seq 校验即可。
+    let lastSeq = -1
+    let streamId = ''
+    let received = 0
+    let forwarded = 0
+    let forwardedChars = 0
+    /**
+     * 【诊断】本轮实际收到的 seq 明细，收尾时一并落盘。
+     *
+     * 只在收尾汇总、**不逐事件打日志**：逐条 error 级写盘本身也是高频 IPC，会放大我们正在
+     * 排查的投递压力（观测行为干扰被观测对象）。字段保留 seq/type，足以判定丢包位置
+     * （头部 / 中段 / 尾部）与是否收到 end。
+     */
+    const seenEvents: Array<{ seq: number; type: string }> = []
+    /** 摘除监听+收尾统计。幂等：end 事件与 invoke.finally 两条路径都可能触发。 */
+    let cleaned = false
+    const cleanup = (): void => {
+      if (cleaned) return
+      cleaned = true
+      logBridge.log(
+        'error',
+        'stream',
+        `stream.preload.done callNo=${callNo} stream=${streamId} forwarded=${forwarded} forwardedChars=${forwardedChars} got=${received} seqs=[${seenEvents.map((e) => e.seq).join(',')}]`
+      )
+      ipcRenderer.removeListener(channel, eventListener)
     }
-    ipcRenderer.on(channel, chunkListener)
+    const eventListener = (_event: unknown, evt: AgentStreamEvent): void => {
+      seenEvents.push({ seq: evt.seq, type: evt.type })
+      // 同一轮回复内 streamId 恒定；若发生变化说明是新的一轮（旧监听本应已被移除，
+      // 这里再兜底丢弃，避免迟到事件污染）。首次收到事件时锚定本轮 streamId。
+      if (streamId === '') {
+        streamId = evt.streamId
+      } else if (evt.streamId !== streamId) {
+        logBridge.log(
+          'warn',
+          'stream',
+          `stream.evt.stale stream=${evt.streamId} active=${streamId} type=${evt.type} seq=${evt.seq}`
+        )
+        return
+      }
+      const check = checkSeq(lastSeq, evt.seq)
+      if (check.skipped) {
+        // 跳号 = 确定性丢包（旧设计只能靠最终长度对不上反推）。类型与缺失量都记下来。
+        logBridge.log(
+          'warn',
+          'stream',
+          `stream.seq.gap stream=${evt.streamId} type=${evt.type} expected=${check.expected} got=${evt.seq} missing=${check.missing}`
+        )
+      }
+      if (evt.seq > lastSeq) lastSeq = evt.seq
+      received += 1
+      forwarded += 1
+      if (evt.type === 'text-delta') forwardedChars += evt.delta.length
+      if (evt.type === 'end') {
+        // 对账闸门：`forwardedChars` 应等于主进程声明的 `finalLength`（两者都只统计正文增量）。
+        // 相等 = 正文传输零丢失；不等 = 仍存在丢包，差值即丢失字符数。
+        // 用 error 级确保落盘（此前 info 级埋点从未出现在 main.log，无法判断链路是否走过）。
+        logBridge.log(
+          'error',
+          'stream',
+          `stream.recv.end stream=${evt.streamId} events=${received} declaredChars=${evt.finalLength} forwardedChars=${forwardedChars} lost=${evt.finalLength - forwardedChars}`
+        )
+      }
+      onEvent(evt)
+      // ── 监听器摘除时机的**唯一正确位置** ──────────────────────────────────
+      // 必须在收到 `end`（协议自带的「本轮流结束」信号）后才摘，且要等事件队列排空。
+      //
+      // 曾经的致命缺陷：把 removeListener 放在 `invoke(...).finally()` 里。而 invoke 的
+      // resolve 与 webContents.send 的事件走**同一个渲染进程消息队列**——主进程 `send`
+      // 242 个事件后立即 `return response`，resolve 排在队列里；渲染主线程先派发队列头部
+      // 约 10 个事件，随后 resolve 到达触发 finally → **监听器被摘**，而队列中剩余的
+      // ~232 个事件仍在等待派发 → 全部因无监听器而被静默丢弃。
+      //
+      // 现象即「主进程 events=242 / preload forwarded=10」，且数字恒定（确定性队列顺序，
+      // 非随机竞态）。修复：把摘除时机前移到 `end` 事件，此时正文已全部送达。
+      if (evt.type === 'end') {
+        // 目的：让「end 之后仍在途的事件」——工具收尾、子代理 done、`status:done`——
+        // 先派发完，再摘监听器。因此不能立即 removeListener，而要让出足够多的宏任务。
+        //
+        // 为何是「多个 setTimeout(0) 串联」而非单个：事件与 invoke 的 resolve 共享同一个
+        // 渲染进程消息队列，主线程每个 tick 只派发队列中的一批。单个 setTimeout 只让出 1 个
+        // tick，可能仍有事件滞留。串联若干次可稳定排空队列，同时对「无后续事件」的场景无副作用。
+        let drains = 0
+        const drainAndCleanup = (): void => {
+          drains += 1
+          if (drains >= 3) {
+            cleanup()
+            return
+          }
+          setTimeout(drainAndCleanup, 0)
+        }
+        setTimeout(drainAndCleanup, 0)
+      }
+    }
+    ipcRenderer.on(channel, eventListener)
     return ipcRenderer.invoke('agent:sendMessage', message, conversationId, options).finally(() => {
-      ipcRenderer.removeListener(channel, chunkListener)
+      // **仅兜底**：正常路径已由 `end` 事件的 `cleanup()` 摘除（见 eventListener 内说明）。
+      // 这里覆盖「主进程异常/未初始化导致根本没有 end 事件」的场景，避免监听器泄漏。
+      // 绝不可在此处提前摘除正常路径的监听器——那正是历史丢包（242 发 / 10 收）的成因。
+      cleanup()
     })
   },
   compressConversation: (history) => ipcRenderer.invoke('agent:compress', history),
@@ -515,6 +628,11 @@ const electronAPI: ElectronAPI = {
   },
 
   probeServer: (config) => ipcRenderer.invoke('server:probe', config),
+
+  listServers: () => ipcRenderer.invoke('servers:list'),
+  createServer: (draft) => ipcRenderer.invoke('servers:create', draft),
+  updateServer: (id, patch) => ipcRenderer.invoke('servers:update', id, patch),
+  deleteServer: (id) => ipcRenderer.invoke('servers:delete', id),
 
   onApprovalRequest: (callback) => {
     const listener = (

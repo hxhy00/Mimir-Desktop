@@ -1,25 +1,19 @@
 /// <reference types="vite/client" />
 
+import type { AgentStreamEvent } from '../../electron/agent/streamProtocol'
+
 interface ElectronAPI {
   getAppVersion: () => Promise<string>
   getPlatform: () => string
   sendMessage: (message: string, conversationId: string) => Promise<string>
+  /**
+   * 发送消息并接收**结构化流式事件**（协议见 `electron/agent/streamProtocol.ts`）。
+   * 每个事件带单调 `seq` 与 `streamId`；跳号检测在 preload 层完成并写入日志。
+   */
   streamMessage: (
     message: string,
     conversationId: string,
-    onChunk: (chunk: string) => void,
-    /**
-     * @deprecated 过程事件已改为经 onChunk 的前缀信封（`\u0002MIMIR_AGENT_EVENT\u0002` + JSON）送达，
-     * 由 ChatView 拆包。此参数仅为兼容历史调用点保留，传入后不会被回调。
-     */
-    onWorkerEvent?: (event: {
-      taskId: string
-      title: string
-      status: 'running' | 'done' | 'error'
-      text?: string
-      durationMs?: number
-      kind?: 'phase' | 'task' | 'tool' | 'think' | 'think-token'
-    }) => void,
+    onEvent: (event: AgentStreamEvent) => void,
     options?: {
       ultra?: {
         enabled: boolean
@@ -41,8 +35,8 @@ interface ElectronAPI {
     message?: string
   }>
   /**
-   * 重置某会话的上下文治理状态（清失效提醒与压缩熔断计数；`/clear` 时调用）。
-   * @param includeArchive 连归档原文一并清除（删除会话时传 true）。
+   * 重置某会话的上下文治理状态（`/clear` 时调用）。
+   * @param includeArchive 连归档原文一并清除。`/clear` 与删除会话都应传 true。
    */
   resetConversationContext: (conversationId: string, includeArchive?: boolean) => Promise<boolean>
   /** 停止生成；传入会话 id 则只停该会话（多会话并行时避免误停其它会话）。 */
@@ -137,6 +131,11 @@ interface ElectronAPI {
     tcpLatencyMs: number | null
     gpus: { name: string; utilizationPct: number; memoryUsedMb: number; memoryTotalMb: number }[]
   }>
+  /** 服务器 CRUD：经主进程 serversService 原子读改写，勿再用 store:set 整表覆盖（竞态）。 */
+  listServers: () => Promise<Record<string, unknown>[]>
+  createServer: (draft: Record<string, unknown>) => Promise<Record<string, unknown>>
+  updateServer: (id: string, patch: Record<string, unknown>) => Promise<Record<string, unknown>>
+  deleteServer: (id: string) => Promise<boolean>
 
   // Agent 副作用确认（三态：拒绝 / 允许一次 / 允许并记住）
   onApprovalRequest: (callback: (request: { id: string; tool: string; summary: string; detail?: string; source?: { origin: 'main' | 'subagent'; subagentId?: string; subagentLabel?: string } }) => void) => () => void
@@ -383,6 +382,17 @@ declare global {
 
   interface Window {
     electronAPI?: ElectronAPI
+    /**
+     * 渲染进程日志桥（由 electron/preload.ts 注入）：把渲染层日志送主进程统一写文件。
+     * 非 Electron 环境下为 undefined，`src/lib/logger.ts` 会自动降级到 console。
+     */
+    mimirLog?: {
+      log: (
+        level: 'error' | 'warn' | 'info' | 'verbose' | 'debug' | 'silly',
+        scope: string,
+        message: string
+      ) => void
+    }
   }
 }
 

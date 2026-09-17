@@ -30,8 +30,8 @@ interface ArxivAtomEntry {
  * 1. 结果缓存：同 key（关键词 + 数量 + 排序 / 论文 id）TTL 内直接复用，重复查询不发 HTTP；
  * 2. 在途合并：同一 key 的并发调用共享同一个 pending Promise，网络只发一次；
  * 3. 串行节流：所有请求经一条队列逐次发出，间隔 ≥ `MIN_REQUEST_INTERVAL_MS`（对齐 ToS 的 3s）；
- * 4. 退避重试：429/503 是公共接口的常态抖动，先退避重试，**只有连续失败才把错误交给 Agent**
- *    —— 而不是一见限流就让整个任务失败。
+ * 4. 单次尝试 + 冷却让路：撞 429/503 后读 Retry-After 设冷却并立即抛错降级，不在同一次
+ *    调用里循环重试（见 `fetchArxiv`）；连续多个独立事件被限流则熔断停手。
  *
  * 仅成功的正常结果（含“未找到”）写入缓存；HTTP 错误/限流/异常不缓存。
  */
@@ -55,10 +55,10 @@ const MIN_REQUEST_INTERVAL_MS = 3000
 const INTERVAL_JITTER_MAX_MS = 400
 /** 被限流后的"不早于"时刻（ms）。它不是错误状态：排队时跳过这段即可，不该抛错。 */
 let arxivCoolUntil = 0
-/** 连续失败后的冷却时长。 */
-const ARXIV_COOL_DOWN_MS = 8_000
+/** 无 Retry-After 头时的默认退避时长（ms）。 */
+const DEFAULT_THROTTLE_WAIT_MS = 60_000
 /**
- * 熔断阈值（L2）：连续 N 次限流后进入 OPEN 态，暂停一段时间不再发请求。
+ * 熔断阈值（L2）：连续 N 个**独立请求事件**被限流后进入 OPEN 态，暂停一段时间不再发请求。
  * 比"每次撞 429 再退避"更省时间——上游明确在限流时，硬撞只会拉长总耗时。
  */
 const CIRCUIT_OPEN_THRESHOLD = 3
@@ -66,8 +66,6 @@ const CIRCUIT_OPEN_THRESHOLD = 3
 const CIRCUIT_OPEN_MS = 180_000
 /** Retry-After 的合理上限：超过则截断，避免异常头把任务挂死。 */
 const RETRY_AFTER_MAX_MS = 60_000
-/** 单个请求的退避等待（ms）：吸收瞬时限流，避免把抖动直接变成任务失败。 */
-const RETRY_WAITS_MS = [5_000, 15_000]
 
 /**
  * 解析 HTTP `Retry-After` 头为毫秒。支持两种格式：
@@ -225,44 +223,39 @@ function runSerialized<T>(fn: () => Promise<T>): Promise<T> {
 }
 
 /**
- * 发一个 arXiv 请求：带 UA、走节流队列、429/503 退避重试。
+ * 发一个 arXiv 请求：带 UA、走节流队列。
  *
- * 退避时长优先采用服务器返回的 `Retry-After`（成熟做法：尊重上游明示的等待时间，
- * 比固定值更快恢复、也更合规）；无该头时回落到 `RETRY_WAITS_MS` 的指数退避。
+ * **单次尝试**（成熟做法）：一次 HTTP 只算一个限流事件——撞 429/503 后读 `Retry-After`
+ * （无头则默认 60s）设置冷却、记一次熔断计数，然后**立即抛错降级**，不在本次调用里循环重试。
+ *
+ * 为什么取消旧的「同调用内退避重试」：旧实现里重试循环与全局冷却互相打架——排队中的下一个
+ * 请求撞上同一冷却窗口再吃一发 429，同一次限流事件被计成多次、熔断误开；且熔断打开后
+ * tool call 挂死 180s，Agent 层超时会重发整个任务，反而放大流量。恢复交给下一次自然探测。
  *
  * @returns 响应体文本
  */
 async function fetchArxiv(url: string): Promise<string> {
-  let lastStatus = 0
-  for (let attempt = 0; attempt <= RETRY_WAITS_MS.length; attempt += 1) {
-    const response = await runSerialized(() =>
-      fetch(url, {
-        headers: { 'User-Agent': ARXIV_USER_AGENT, Accept: 'application/atom+xml' }
-      })
-    )
-    if (response.ok) {
-      circuitRecordSuccess()
-      return response.text()
-    }
-    lastStatus = response.status
-    const retryable = response.status === 429 || response.status === 503
-    // 退避基准：Retry-After 优先，否则用预设指数退避；两者都没有则不再重试。
-    const wait = parseRetryAfterMs(response.headers.get('retry-after')) ?? RETRY_WAITS_MS[attempt]
-    if (!retryable || wait === undefined) break
+  const response = await runSerialized(() =>
+    fetch(url, {
+      headers: { 'User-Agent': ARXIV_USER_AGENT, Accept: 'application/atom+xml' }
+    })
+  )
+  if (response.ok) {
+    circuitRecordSuccess()
+    return response.text()
+  }
+  if (response.status === 429 || response.status === 503) {
+    const wait = parseRetryAfterMs(response.headers.get('retry-after')) ?? DEFAULT_THROTTLE_WAIT_MS
     circuitRecordThrottle()
     // 记冷却截止：让队列里其它请求也一起让路，避免退避后并发再撞限流
     arxivCoolUntil = Date.now() + wait
-    console.warn(`[arxiv] HTTP ${response.status}，${Math.round(wait / 1000)}s 后重试（第 ${attempt + 1} 次）`)
-    await new Promise((resolve) => setTimeout(resolve, wait))
-  }
-  if (lastStatus === 429 || lastStatus === 503) {
-    arxivCoolUntil = Date.now() + ARXIV_COOL_DOWN_MS
+    console.warn(`[arxiv] HTTP ${response.status}，${Math.round(wait / 1000)}s 内不再请求（熔断态：${circuitState}）`)
     throw new Error(
-      `arXiv 限流（HTTP ${lastStatus}）：已按官方要求 3 秒/次节流并退避重试 ${RETRY_WAITS_MS.length} 次仍未成功。` +
-        '稍后再试，或把同一主题合并成一次查询以减少请求数。'
+      `arXiv 限流（HTTP ${String(response.status)}）：已按官方要求 3 秒/次节流，本次仍被限流，` +
+        `约 ${String(Math.round(wait / 1000))} 秒后可用。请直接使用 OpenAlex 已有结果，不要重试本工具。`
     )
   }
-  throw new Error(`arXiv API 请求失败: HTTP ${lastStatus}`)
+  throw new Error(`arXiv API 请求失败: HTTP ${String(response.status)}`)
 }
 
 /**
@@ -293,6 +286,8 @@ async function execArxiv<THttp extends () => Promise<string>>(key: string, http:
 interface FetchPending {
   resolve: (value: string) => void
   reject: (error: Error) => void
+  /** 需要 ArxivEntry 形状的调用方（paperSearch.resolvePaperById 主源）；与 resolve 二选一。 */
+  resolveEntry?: (value: ArxivAtomEntry | null) => void
 }
 /** cleanId -> 等待该篇的调用方（同篇并发只等一份）。 */
 const fetchRequests = new Map<string, FetchPending[]>()
@@ -343,7 +338,10 @@ async function flushFetchBatch(): Promise<void> {
       const entry = byId.get(id)
       const text = entry !== undefined ? formatFetchText(id, entry) : `arXiv 中未找到 id 为 '${id}' 的记录。`
       if (entry !== undefined) writeCache(arxivCacheKey({ kind: 'fetch', id }), text)
-      for (const p of pendings) p.resolve(text)
+      for (const p of pendings) {
+        if (p.resolveEntry !== undefined) p.resolveEntry(entry ?? null)
+        else p.resolve(text)
+      }
     }
   } catch (error) {
     const reason = error instanceof Error ? error : new Error(String(error))
@@ -367,6 +365,40 @@ function queueArxivFetch(cleanId: string): Promise<string> {
       }, FETCH_BATCH_WINDOW_MS)
     }
   })
+}
+
+/**
+ * 按 id 读取多篇的 **LibraryEntry（ArxivEntry）形状**（统一访问层 resolvePaperById
+ * 的 arXiv 主源）。与 queueArxivFetch 共享同一批量合并队列/节流，只是分发时返回
+ * 条目而非文本。找不到的 id 不出现在结果里（不是错误——arXiv 官方也查不到才算
+ * 真的不存在）。注意：不读 text 缓存（那是格式化文本，无法还原条目）。
+ */
+export async function fetchArxivEntriesByIds(ids: string[]): Promise<LibraryEntry[]> {
+  const cleanIds = ids.map(normalizeArxivId).filter((id) => id !== '')
+  if (cleanIds.length === 0) return []
+  const slots: Array<LibraryEntry | null> = cleanIds.map(() => null)
+  await Promise.all(
+    cleanIds.map((id, index) =>
+      new Promise<void>((resolve) => {
+        const pendings = fetchRequests.get(id) ?? []
+        pendings.push({
+          resolve: () => resolve(),
+          reject: () => resolve(),
+          resolveEntry: (entry) => {
+            if (entry !== null) slots[index] = toLibraryEntry(entry)
+            resolve()
+          }
+        })
+        fetchRequests.set(id, pendings)
+      })
+    )
+  )
+  if (fetchTimer === null) {
+    fetchTimer = setTimeout(() => {
+      void flushFetchBatch()
+    }, FETCH_BATCH_WINDOW_MS)
+  }
+  return slots.filter((e): e is LibraryEntry => e !== null)
 }
 
 /** 把统一访问层 / arXiv 原生接口的条目渲染成工具返回文本（两种形状都支持）。 */
@@ -438,9 +470,12 @@ export const paperSearchTool = tool(
   {
     name: 'paper_search',
     description:
-      '检索学术论文（默认源 OpenAlex，覆盖 arXiv 预印本与期刊正式版；并自动补充 arXiv 最新预印本），返回标题、id、作者、摘要与链接。' +
+      '检索学术论文（默认源 OpenAlex，覆盖 arXiv 预印本与期刊正式版；主题近期活跃时自动补充 arXiv 最新预印本，' +
+      'OpenAlex 无结果时用 Semantic Scholar 语义检索兜底），返回标题、id、作者、摘要与链接。' +
       '检索纪律：一次调用尽量覆盖——把同义/相近表述合并进同一个 query，不要为同一主题换措辞逐次搜索；' +
       '同一关键词短时间重复调用会直接复用缓存，不重复请求外部接口。' +
+      '降级纪律：返回内容提示 arXiv 限流/不可用时，说明 OpenAlex 等主源结果已照常返回，' +
+      '**直接使用现有结果，禁止重试本工具**。' +
       '只有确需「按最新提交时间」时才用 sortBy=submittedDate，该排序依赖 arXiv 原生接口，会有每 3 秒 1 次的排队等待。',
     schema: z.object({
       query: z.string().describe('搜索关键词，如 "vision language model"'),

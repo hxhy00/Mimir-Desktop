@@ -5,18 +5,23 @@ import { app } from 'electron'
 import { join, basename, extname, dirname, relative, resolve } from 'path'
 import { existsSync, mkdirSync } from 'fs'
 import { agentService } from '../agent/agentService'
+import { isControlPlanePath } from '../agent/controlPlane'
 import { isSafeExternalUrl } from '../safeUrl'
 import { startBridge, stopBridge, isBridgeRunning, getBridgePort, getConfirmToken } from '../plugins/bridge'
 import { setApprovalSender, settleApproval } from '../agent/approval'
 import { permissionsService } from '../agent/permissionService'
 import { probeServer, type ProbeConfig } from '../servers/probe'
+import {
+  listServers,
+  createServer,
+  updateServer,
+  deleteServer,
+} from '../servers/serversService'
+import type { ServerDraft, ServerPatch } from '../servers/types'
 import { httpFetch } from '../http'
-import { compileLatex, registerLatexPdfDir } from '../latex'
 import {
   TECTONIC_RESOURCE_ID,
-  availableEngine,
   downloadTectonicEngine,
-  pickEngineExecutable,
   tectonicResourceInfo
 } from '../latex/runtime'
 import * as pty from 'node-pty'
@@ -25,16 +30,7 @@ import {
   getStoreValue,
   setStoreValue,
   spaceRoot,
-  listWorkspaces,
-  getActiveWorkspace,
-  getDefaultWorkspace,
-  createWorkspace,
-  renameWorkspace,
-  removeWorkspace,
-  switchWorkspace,
-  setDefaultWorkspace,
 } from '../library/store'
-import * as library from '../library/libraryService'
 import { fetchArxivPdf, paperPdfFileName } from '../library/arxiv'
 import {
   appendLedger,
@@ -42,99 +38,105 @@ import {
   type LedgerEntryType
 } from '../ledger/ledgerService'
 import { getModelStatus, downloadModel, transcribeAudioBase64, SENSE_VOICE_MODEL } from '../speech/senseVoice'
-import {
-  activeMeetingModel,
-  deleteMeetingDeck,
-  generateMeetingDeck,
-  listMeetingDecks,
-  meetingDeckPath,
-} from '../meetings/service'
-import type { GenerateDeckRequest } from '../meetings/types'
-import {
-  applyFigureRename,
-  importFigure,
-  listFigures,
-  previewFigureRename,
-  removeFigure,
-} from '../figures/figuresService'
-import {
-  listVenueDeadlines,
-  refreshVenueDeadlines,
-  setVenueWatch,
-} from '../venues/venuesService'
-import {
-  capturePaperSnapshot,
-  deletePaperSnapshot,
-  listPaperSnapshots,
-  readSnapshotFile,
-  revertPaperSnapshot,
-} from '../paper/snapshots'
 import { listModels } from '../modelDiscovery'
-import { aiFixIssue } from '../paper/aiFix'
-import { readPaperBib, writePaperBib } from '../paper/bib'
-import { VENUE_TEMPLATES, applyVenueTemplate } from '../paper/venueTemplates'
-
-export interface ArxivPaper {
-  id: string
-  title: string
-  authors: string[]
-  summary: string
-  published: string
-  link: string
-}
-
-function parseArxivXml(xml: string): ArxivPaper[] {
-  const entries: ArxivPaper[] = []
-  const entryRegex = /<entry>([\s\S]*?)<\/entry>/g
-  let match: RegExpExecArray | null
-
-  while ((match = entryRegex.exec(xml)) !== null) {
-    const entryXml = match[1]
-    const getTag = (tag: string) => {
-      const m = entryXml.match(new RegExp(`<${tag}[^>]*>([\\s\\S]*?)<\\/${tag}>`))
-      return m ? m[1].trim() : ''
-    }
-
-    const id = getTag('id')
-    const title = getTag('title').replace(/\s+/g, ' ').trim()
-    const summary = getTag('summary').replace(/\s+/g, ' ').trim()
-    const published = getTag('published')
-
-    const authors: string[] = []
-    const authorRegex = /<name>([\s\S]*?)<\/name>/g
-    let authorMatch: RegExpExecArray | null
-    while ((authorMatch = authorRegex.exec(entryXml)) !== null) {
-      authors.push(authorMatch[1].trim())
-    }
-
-    entries.push({ id, title, authors, summary, published, link: `https://arxiv.org/abs/${id}` })
-  }
-
-  return entries
-}
+// 论文创作域按域拆分的子模块（每个文件注册一组同前缀的 IPC handler）
+import { registerLatexHandlers } from './latex'
+import { registerLibraryHandlers } from './library'
+import { registerMeetingsHandlers } from './meetings'
+import { registerFiguresHandlers } from './figures'
+import { registerWorkspacesHandlers } from './workspaces'
+import { registerVenuesHandlers } from './venues'
+import { registerPaperHandlers } from './paper'
 
 // Maximum PDF download size (64 MB)
 const ARXIV_PDF_DOWNLOAD_TIMEOUT_MS = 60_000
 
-/** Agent 过程事件信封前缀（与渲染层 ChatView 保持一致），经文本 chunk 通道随流发送。 */
-const AGENT_EVENT_PREFIX = '\u0002MIMIR_AGENT_EVENT\u0002'
+/** 流式事件协议（结构化事件 + seq/streamId），见 `agent/streamProtocol.ts`。 */
+import { createSequencer, type AgentStreamEventDraft } from '../agent/streamProtocol';
+/** 统一日志设施（主进程落盘）；`streamLog` 用于流式链路埋点。 */
+import log, { streamLog } from '../logger'
 
 /**
- * 用户在原生文件对话框里**显式选中**过的文件（绝对路径）。
+ * 存活的终端（PTY）实例，按 id 索引。
+ *
+ * 放在模块作用域而非 `setupIpcHandlers` 内：退出时要能遍历回收
+ * （见 {@link disposeIpcResources}），否则 `node-pty` 的子进程会拖住主进程退出。
+ */
+const ptyInstances = new Map<string, pty.IPty>()
+
+/**
+ * 用户在原生文件对话框里**显式选中**过的路径（文件与目录，绝对路径）。
  *
  * `fs:readFile` 是渲染层唯一能读任意文本的通道（附件解析用）。若无边界，任何被注入的
  * 渲染内容都能借它读走整块磁盘 —— 与 Agent 侧 fsBackend 的权限矩阵形成两条口径不一的
- * 旁路。这里改为**白名单**：只有用户自己在对话框里点过的文件才可读。
+ * 旁路。这里改为**白名单**：只有用户自己在对话框里点过的路径才可访问。
+ *
+ * 目录同样收进来：论文模块的项目目录（`latex:*` / `snapshots:*` / `paper:*`）都由
+ * `dialog:open`（`openDirectory`）选出，与「选中文件」是同一类用户意图。
  *
  * 用 `Set` 而非持久化：选择是本次会话的行为，关窗即失效，避免长期漂开放大攻击面。
  */
-const pickedFiles = new Set<string>()
+const pickedPaths = new Set<string>()
+
+/** 当前科研空间根目录；取不到（store 未就绪等）时返回空串，由调用方按「越界」处理。 */
+function safeSpaceRoot(): string {
+  try {
+    return resolve(spaceRoot())
+  } catch {
+    return ''
+  }
+}
 
 /**
- * 校验渲染层文件通道的目标路径（`fs:readFile` / `fs:readImageDataUrl` / `fs:writeFile`）。
+ * `target` 是否等于 `root` 或位于 `root` 之下。
  *
- * - 读：放行「用户经原生对话框显式选择过」的文件（见 {@link pickedFiles}），
- *   或**用户已保存进设置的工作台背景图**（跨重启仍然有效，否则重启后背景图读取会被误拒）；
+ * 口径与 Agent 侧 `electron/agent/permissions.ts` 的 `isInside` 一致（该函数未导出，
+ * 这里按同样规则实现，避免 IPC 与 Agent 两条通道出现不同的边界判定）。
+ */
+function isWithin(target: string, root: string): boolean {
+  if (root === '') return false
+  const t = resolve(target)
+  const r = resolve(root)
+  return t === r || t.startsWith(r.endsWith('/') ? r : `${r}/`)
+}
+
+/** 控制平面拒绝文案（settings / 能力域 / 技能 / 桥接凭据；与 Agent 侧同一条硬约束）。 */
+const CONTROL_PLANE_REJECTED = '已拒绝：该路径属于 Mimir 的配置/能力控制平面，不允许经此通道访问。'
+
+/**
+ * **渲染层路径边界的唯一入口**：所有接收路径参数的 IPC 处理器都必须先过这里。
+ *
+ * 放行三条（顺序即优先级）：
+ * 1. 控制平面 → 硬拒绝（与 Agent 侧同口径，见 {@link isControlPlanePath}）；
+ * 2. 当前科研空间根目录内 —— 用户自己的资料库；
+ * 3. 用户在本会话里经原生对话框显式选中的路径及其子路径（见 {@link pickedPaths}）。
+ *
+ * 其余一律拒绝并给出可见原因（渲染层的 `dialog:open` 可重新授权）。
+ *
+ * @throws 越界时抛错（IPC invoke 会把错误回传渲染层，调用方已在 try/catch 内）。
+ */
+function assertRendererPath(input: unknown, mode: 'read' | 'write' = 'read'): string {
+  if (typeof input !== 'string' || input.trim() === '') throw new Error('无效路径')
+  const target = resolve(input)
+  if (isControlPlanePath(target)) throw new Error(CONTROL_PLANE_REJECTED)
+  if (isWithin(target, safeSpaceRoot())) return target
+  for (const picked of pickedPaths) {
+    if (isWithin(target, picked)) return target
+  }
+  throw new Error(
+    mode === 'write'
+      ? '已拒绝：写入目标不在当前科研空间内，也不是你在本会话中选择过的目录。请重新选择该目录后再试。'
+      : '已拒绝：目标不在当前科研空间内，也不是你在本会话中选择过的文件或目录。请重新选择后再试。'
+  )
+}
+
+/**
+ * 校验渲染层**文件**通道的目标路径（`fs:readFile` / `fs:readImageDataUrl` / `fs:writeFile`）。
+ *
+ * 在 {@link assertRendererPath} 的同一套基元（控制平面 / {@link isWithin}）之上再收紧一层：
+ * - 读：只放行「用户经原生对话框显式选择过的**这个文件自身**」，或**用户已保存进设置的
+ *   工作台背景图**（跨重启仍然有效，否则重启后背景图读取会被误拒）—— 读通道比目录通道
+ *   更敏感：它能把任意文本读进上下文，因此不放行「选中目录下的任意子文件」；
  * - 写：仅放行科研空间根目录内（渲染层的 `fs:writeFile` 当前无调用方，
  *   保留通道但把边界收到与 Agent 侧一致）。
  *
@@ -143,15 +145,27 @@ const pickedFiles = new Set<string>()
 function assertRendererFilePath(input: unknown, mode: 'read' | 'write' = 'read'): string {
   if (typeof input !== 'string' || input.trim() === '') throw new Error('无效路径')
   const target = resolve(input)
+  if (isControlPlanePath(target)) throw new Error(CONTROL_PLANE_REJECTED)
   if (mode === 'read') {
-    if (pickedFiles.has(target) || target === resolveWallpaperPath()) return target
+    if (pickedPaths.has(target) || target === resolveWallpaperPath()) return target
     throw new Error('已拒绝：仅允许读取你在文件对话框中主动选择的文件。')
   }
-  const root = resolve(spaceRoot())
-  if (target !== root && !target.startsWith(root.endsWith('/') ? root : `${root}/`)) {
+  if (!isWithin(target, safeSpaceRoot())) {
     throw new Error('已拒绝：写入目标必须位于当前科研空间内。')
   }
   return target
+}
+
+/**
+ * 校验「项目目录数组」（`figures:renamePreview` / `figures:renameApply`）。
+ *
+ * 数组形态的入参不能逐个手写在处理器里——漏一个就是一个旁路，因此统一走这里。
+ * 空数组是合法输入（不在任何项目里改名）。
+ */
+function assertProjectDirs(input: unknown): string[] {
+  if (input === undefined || input === null) return []
+  if (!Array.isArray(input)) throw new Error('无效路径')
+  return input.map((dir) => assertRendererPath(dir, 'write'))
 }
 
 /**
@@ -351,9 +365,10 @@ export function setupIpcHandlers(winRef: { current: BrowserWindow | null }): voi
   ipcMain.handle('dialog:open', async (_event, options) => {
     const win = winRef.current
     const result = win === null ? await dialog.showOpenDialog(options) : await dialog.showOpenDialog(win, options)
-    // 记住用户显式选择的文件：它们是 `fs:readFile` 白名单的唯一来源（见 assertRendererFilePath）。
+    // 记住用户显式选择的路径（文件与目录）：它们是渲染层路径白名单的唯一来源
+    // （见 assertRendererPath / assertRendererFilePath）。
     if (!result.canceled) {
-      for (const p of result.filePaths) pickedFiles.add(resolve(p))
+      for (const p of result.filePaths) pickedPaths.add(resolve(p))
     }
     return result
   })
@@ -365,8 +380,15 @@ export function setupIpcHandlers(winRef: { current: BrowserWindow | null }): voi
 
   // Shell
   ipcMain.handle('shell:openPath', async (_event, path: string) => {
-    if (typeof path !== 'string' || path === '') return '无效路径'
-    return shell.openPath(path)
+    // 与 fs 通道同一边界：只打开用户选中过 / 科研空间内的路径，避免借系统默认程序
+    // 打开任意文件（可执行文件等）。
+    try {
+      return shell.openPath(assertRendererPath(path, 'read'))
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '无效路径'
+      console.warn('[shell] 拒绝打开越界路径：', path, message)
+      return message
+    }
   })
 
   /**
@@ -388,8 +410,18 @@ export function setupIpcHandlers(winRef: { current: BrowserWindow | null }): voi
 
   // 在系统文件管理器中定位到文件（对话内产物「打开所在文件夹」）
   ipcMain.handle('shell:revealPath', async (_event, path: string) => {
-    if (typeof path !== 'string' || path === '' || !existsSync(path)) return
-    shell.showItemInFolder(path)
+    // 同一边界：越界路径直接拒绝（渲染层会拿到 ok=false 的原因）。
+    try {
+      const target = assertRendererPath(path, 'read')
+      if (!existsSync(target)) return
+      shell.showItemInFolder(target)
+    } catch (error) {
+      console.warn(
+        '[shell] 拒绝定位越界路径：',
+        path,
+        error instanceof Error ? error.message : String(error)
+      )
+    }
   })
 
   // File system
@@ -430,42 +462,24 @@ export function setupIpcHandlers(winRef: { current: BrowserWindow | null }): voi
     }
   })
 
-  // arXiv search
+  // arXiv search（渲染层无调用方；保留 handler 时改走统一访问层，不再裸调 export.arxiv.org——
+  // 旧实现绕过 UA/节流/缓存，一次调用即可把后续真实检索全部打进 429 冷却）
   ipcMain.handle('arxiv:search', async (_event, query: string, maxResults = 10, sortBy = 'relevance') => {
     try {
-      const sortParam =
-        sortBy === 'submittedDate'
-          ? '&sortBy=submittedDate&sortOrder=descending'
-          : '&sortBy=relevance'
-      const url = `https://export.arxiv.org/api/query?search_query=all:${encodeURIComponent(
-        query
-      )}&start=0&max_results=${maxResults}${sortParam}`
-
-      const response = await httpFetch(url)
-      if (!response.ok) {
-        return { error: `arXiv API 请求失败: HTTP ${response.status}` }
-      }
-      const xml = await response.text()
-      return parseArxivXml(xml)
+      const { searchPapers } = await import('../agent/paperSearch')
+      return await searchPapers(query, maxResults)
     } catch (error) {
       return { error: error instanceof Error ? error.message : '搜索失败' }
     }
   })
 
-  // Fetch a single paper by arXiv id
+  // Fetch a single paper by arXiv id（同上：走统一访问层 OpenAlex → S2 回退链）
   ipcMain.handle('arxiv:fetchPaper', async (_event, id: string) => {
     try {
       const cleanId = id.trim().replace(/^https?:\/\/arxiv\.org\/abs\//, '')
       if (!cleanId) return { error: '无效的 arXiv id' }
-      const url = `https://export.arxiv.org/api/query?id_list=${encodeURIComponent(cleanId)}&max_results=1`
-      const response = await httpFetch(url)
-      if (!response.ok) {
-        return { error: `arXiv API 请求失败: HTTP ${response.status}` }
-      }
-      const xml = await response.text()
-      const entries = parseArxivXml(xml)
-      if (entries.length === 0) return { error: `arXiv 中未找到 id 为 '${cleanId}' 的记录` }
-      return entries[0]
+      const { resolvePaperById } = await import('../agent/paperSearch')
+      return await resolvePaperById(cleanId)
     } catch (error) {
       return { error: error instanceof Error ? error.message : '获取论文失败' }
     }
@@ -637,35 +651,66 @@ export function setupIpcHandlers(winRef: { current: BrowserWindow | null }): voi
       }
     ) => {
       const chunkChannel = `agent:chunk:${conversationId}`
+      // 本次回复流的编排器：给每个事件补单调 seq 与 streamId。
+      // 渲染层据此（a）检测跳号=确定丢包（b）丢弃陈旧流的迟到事件。
+      const sequencer = createSequencer()
+      // 主进程侧正文累计长度：由 text-delta 的 delta 长度累加，用于结束事件对账。
+      let outboundChars = 0
+      // 正文 text-delta 的外发**批数**。攒批后事件总数不再等于模型产出量，
+      // 单看 events 会误判；用本值 + outboundChars 一起对账（批数≈时长/50ms）。
+      let textDeltas = 0
+      /** 统一外发：编排 seq/streamId 后经 IPC 送出（单一出口，杜绝多处直发）。 */
+      const sendEvent = (draft: AgentStreamEventDraft): void => {
+        if (draft.type === 'text-delta') {
+          outboundChars += draft.delta.length
+          textDeltas += 1
+        }
+        winSend(chunkChannel, sequencer.next(draft))
+      }
 
       try {
         if (!agentService.isInitialized()) {
           const response = '请先在设置中配置 API Key 和模型，然后重新启动应用。'
-          winSend(chunkChannel, response)
+          sendEvent({ type: 'text-delta', delta: response })
+          // 未初始化路径同样发结束事件，保证渲染层能定稿并关灯。
+          sendEvent({ type: 'end', finalLength: response.length })
           return response
         }
 
         const response = await agentService.streamMessage(
           message,
           conversationId,
-          (chunk) => {
-            winSend(chunkChannel, chunk)
-          },
-          (event) => {
-            // 过程事件与文本走同一条 chunk 通道：用前缀信封包裹，渲染层拆包后喂给
-            // 过程事件树。不依赖额外 IPC 通道，避免 preload 版本不一致导致事件丢。
-            winSend(chunkChannel, `${AGENT_EVENT_PREFIX}${JSON.stringify(event)}`)
-          },
+          sendEvent,
           options
+        )
+        // stream.end.out：正文流结束 + 主进程实际转发字符数。
+        // 与渲染层 stream.end.in 对照，可判断「主进程没发全」还是「渲染层没接全」。
+        streamLog.info(
+          `stream.end.out conv=${conversationId} stream=${sequencer.streamId} events=${sequencer.count} textDeltas=${textDeltas} chars=${outboundChars} finalLen=${response.length}`
         )
         return response
       } catch (error) {
         const errorMessage = `Agent 错误: ${error instanceof Error ? error.message : '未知错误'}`
-        winSend(chunkChannel, errorMessage)
+        streamLog.error(
+          `stream.error conv=${conversationId} stream=${sequencer.streamId} chars=${outboundChars} err=${error instanceof Error ? error.message : String(error)}`
+        )
+        sendEvent({ type: 'error', message: errorMessage })
+        // 异常路径补发结束事件（零长度）：agentService 抛错时内部来不及发，
+        // 这里兜底确保渲染层能定稿并释放运行态。
+        sendEvent({ type: 'end', finalLength: outboundChars })
         return errorMessage
       }
     }
   )
+
+  // 渲染进程日志桥：渲染层经此把日志送到主进程统一写文件（见 electron/preload.ts 的 mimirLog）。
+  // `send`（非 invoke）语义：日志是 fire-and-forget，不应阻塞渲染层。
+  ipcMain.on('log:write', (_event, level: string, scope: string, message: string) => {
+    const scoped = scope ? log.scope(scope) : log
+    const lvl = level as 'error' | 'warn' | 'info' | 'verbose' | 'debug' | 'silly'
+    const fn = typeof scoped[lvl] === 'function' ? scoped[lvl].bind(scoped) : scoped.info.bind(scoped)
+    fn(message)
+  })
 
   ipcMain.handle('agent:subagentCatalog', () => agentService.getSubagentCatalog())
 
@@ -687,8 +732,17 @@ export function setupIpcHandlers(winRef: { current: BrowserWindow | null }): voi
   // 探测实现见 electron/servers/probe.ts（IPC 与 Agent 工具共用同一实现）。
   ipcMain.handle('server:probe', async (_event, config: ProbeConfig) => probeServer(config))
 
+  // 服务器 CRUD：**必须**经 serversService（唯一写入口）。
+  // 界面不要再走 store:set('servers:list', 整表) —— 那是竞态来源（见 service 文件头注释）。
+  ipcMain.handle('servers:list', () => listServers())
+  ipcMain.handle('servers:create', (_event, draft: ServerDraft) => createServer(draft))
+  ipcMain.handle('servers:update', (_event, id: string, patch: ServerPatch) => updateServer(id, patch))
+  ipcMain.handle('servers:delete', (_event, id: string) => {
+    deleteServer(id)
+    return true
+  })
+
   // ─── Terminal (PTY) ──────────────────────────────────────────────
-  const ptyInstances = new Map<string, pty.IPty>()
 
   ipcMain.handle(
     'terminal:create',
@@ -712,7 +766,15 @@ export function setupIpcHandlers(winRef: { current: BrowserWindow | null }): voi
           '-o', 'StrictHostKeyChecking=accept-new'
         ]
         if (options.ssh.keyPath) {
-          args.push('-i', options.ssh.keyPath)
+          // SSH 私钥路径来自「服务器配置」（用户在表单里填的持久化配置），不是文件对话框，
+          // 因此走不了 pickedPaths 白名单；且 PTY 本身就是完整 shell，限制该路径并不增加
+          // 实际安全边界。这里仍做两件必做的事：拒绝控制平面路径、拒绝含 NUL 的入参
+          // （NUL 会截断 execve 参数，属注入面）。
+          const keyPath = options.ssh.keyPath
+          if (keyPath.includes('\0') || isControlPlanePath(resolve(keyPath))) {
+            throw new Error('已拒绝：无效的 SSH 私钥路径。')
+          }
+          args.push('-i', keyPath)
         }
         args.push(`${options.ssh.user}@${options.ssh.host}`)
       } else {
@@ -762,689 +824,35 @@ export function setupIpcHandlers(winRef: { current: BrowserWindow | null }): voi
     }
   })
 
-  // ─── LaTeX 论文编译 ────────────────────────────────────────────────
-  const LATEX_COMPILE_TIMEOUT_MS = 120_000
+  // ─── 论文创作域（LaTeX / 文献库 / 组会 / 图表 / 空间 / 截稿 / 快照）──────
+  // 各域拆到 electron/ipc/<domain>.ts，只注入其真正依赖的边界校验函数。
+  registerLatexHandlers({ assertRendererPath })
+  registerLibraryHandlers({ assertRendererPath })
+  registerMeetingsHandlers()
+  registerFiguresHandlers({ assertProjectDirs })
+  registerWorkspacesHandlers({ assertRendererPath })
+  registerVenuesHandlers()
+  registerPaperHandlers({ assertRendererPath })
+}
 
-  // 探测可用的 LaTeX 引擎（系统 latexmk / tectonic，其次内置 Tectonic）
-  ipcMain.handle('latex:detectEngine', async () => {
-    const engine = await availableEngine()
-    if (engine === null) {
-      return {
-        ok: false,
-        message: '未找到 LaTeX 引擎，请到「设置 → 资源下载」下载 Tectonic 引擎或安装 TeX 发行版'
-      }
-    }
-    return { ok: true, engine: engine.kind as 'latexmk' | 'tectonic', executable: engine.executable }
-  })
-
-  // 编译项目目录中的 main.tex（自动选择系统引擎或内置 Tectonic）
-  ipcMain.handle('latex:compile', async (_event, projectDir: string) => {
+/**
+ * 回收 IPC 层持有的资源（应用退出时由 `main.ts` 的 `before-quit` 调用）。
+ *
+ * 只做「不回收就会拖住/污染退出」的两件事：
+ * - 终止存活的 PTY 子进程（node-pty 不随主进程自动退出）；
+ * - 清空会话级路径白名单（进程已退出，语义上等同于关窗失效）。
+ *
+ * 刻意**不**在这里 unregister ipcMain handler：进程即将结束，卸载没有意义，
+ * 反而可能在 handler 仍在途时制造「通道不存在」的竞态。
+ */
+export function disposeIpcResources(): void {
+  for (const [id, term] of ptyInstances) {
     try {
-      const engineExecutable = await pickEngineExecutable()
-      const result = await compileLatex(projectDir, engineExecutable, LATEX_COMPILE_TIMEOUT_MS)
-      // 存在可预览的编译产物（main.pdf）时登记该目录，供 mimir-tex 协议白名单校验
-      if (result.pdfPath !== null) {
-        registerLatexPdfDir(projectDir)
-        // 自动沉淀：编译成功记入科研记录（同一项目同一天只记一次，避免频繁编译刷屏）
-        const projectName = basename(projectDir)
-        appendLedger({
-          title: `论文编译成功：${projectName}`,
-          content: `项目目录：${projectDir}`,
-          type: 'paper',
-          auto: { source: 'latex-compile', refKey: `${projectDir}#${new Date().toISOString().slice(0, 10)}` }
-        })
-      }
-      return { ok: true, ...result }
+      term.kill()
     } catch (error) {
-      return { ok: false, message: error instanceof Error ? error.message : '编译失败' }
-    }
-  })
-
-  // ─── LaTeX 论文项目 ────────────────────────────────────────────────
-  const LATEX_SKIP_DIRS = new Set(['build', 'aux', 'out', 'dist', 'node_modules', '.git', '.vscode'])
-
-  // 递归收集目录内所有 .tex 相对路径，跳过产物与隐藏目录
-  async function collectTexFiles(dir: string, base: string, out: string[]): Promise<void> {
-    const entries = await readdir(dir, { withFileTypes: true })
-    for (const entry of entries) {
-      if (entry.name.startsWith('.')) continue
-      if (entry.isDirectory()) {
-        if (LATEX_SKIP_DIRS.has(entry.name)) continue
-        await collectTexFiles(join(dir, entry.name), base, out)
-      } else if (entry.isFile() && extname(entry.name).toLowerCase() === '.tex') {
-        out.push(relative(base, join(dir, entry.name)))
-      }
+      console.warn(`[ipc] 终止终端 ${id} 失败：`, error)
     }
   }
-
-  // 把客户端传来的相对 .tex 路径解析到项目目录内；非法输入返回 null
-  function resolveTexPath(projectDir: string, fileName: string): string | null {
-    if (fileName === '' || fileName.includes('\0')) return null
-    if (fileName.startsWith('/') || /^[a-zA-Z]:[\\/]/.test(fileName)) return null
-    const parts = fileName.split(/[\\/]/)
-    if (parts.some((p) => p === '..' || p === '.')) return null
-    const full = join(projectDir, fileName)
-    if (!full.startsWith(join(projectDir)) || extname(full).toLowerCase() !== '.tex') return null
-    return full
-  }
-
-  // 列出项目目录中的 .tex 文件（递归，跳过产物与隐藏目录；main.tex 优先）
-  ipcMain.handle('latex:listFiles', async (_event, projectDir: string) => {
-    try {
-      const files: string[] = []
-      await collectTexFiles(projectDir, projectDir, files)
-      files.sort((a, b) => {
-        const mainA = basename(a) === 'main.tex' ? 0 : 1
-        const mainB = basename(b) === 'main.tex' ? 0 : 1
-        if (mainA !== mainB) return mainA - mainB
-        return a.localeCompare(b)
-      })
-      return { ok: true, files }
-    } catch (error) {
-      return { ok: false, message: error instanceof Error ? error.message : '读取目录失败' }
-    }
-  })
-
-  // 读取项目内的 .tex 文件（相对路径，支持子目录章节文件）
-  ipcMain.handle('latex:readFile', async (_event, projectDir: string, fileName: string) => {
-    const full = resolveTexPath(projectDir, fileName)
-    if (full === null) {
-      return { ok: false, message: '非法文件路径：仅允许项目目录内的 .tex 相对路径' }
-    }
-    try {
-      const content = await readFile(full, 'utf-8')
-      return { ok: true, content }
-    } catch (error) {
-      return { ok: false, message: error instanceof Error ? error.message : '读取文件失败' }
-    }
-  })
-
-  // 写入项目内的 .tex 文件（相对路径，支持子目录章节文件）
-  ipcMain.handle('latex:writeFile', async (_event, projectDir: string, fileName: string, content: string) => {
-    const full = resolveTexPath(projectDir, fileName)
-    if (full === null) {
-      return { ok: false, message: '非法文件路径：仅允许项目目录内的 .tex 相对路径' }
-    }
-    try {
-      const dir = dirname(full)
-      if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
-      await writeFile(full, content, 'utf-8')
-      return { ok: true }
-    } catch (error) {
-      return { ok: false, message: error instanceof Error ? error.message : '写入文件失败' }
-    }
-  })
-
-  // 在父目录下创建新论文项目（main.tex 模板）
-  ipcMain.handle('latex:createProject', async (_event, parentDir: string, name: string) => {
-    try {
-      const safeName = name.trim().replace(/[\\/:*?"<>|]/g, '_')
-      if (!safeName) return { ok: false, message: '项目名不能为空' }
-      const projectDir = join(parentDir, safeName)
-      if (existsSync(projectDir)) {
-        return { ok: false, message: `目录已存在: ${projectDir}` }
-      }
-      mkdirSync(projectDir, { recursive: true })
-      const template = `\\documentclass[12pt]{article}
-\\usepackage[utf8]{inputenc}
-\\usepackage{graphicx}
-\\usepackage{amsmath}
-\\usepackage{hyperref}
-
-\\title{${safeName}}
-\\author{Author Name\\\\\\texttt{author@example.com}}
-\\date{\\today}
-
-\\begin{document}
-
-\\maketitle
-
-\\begin{abstract}
-Write your abstract here.
-\\end{abstract}
-
-\\section{Introduction}
-% Start writing here...
-
-\\section{Related Work}
-% Discuss related work...
-
-\\section{Method}
-% Describe your method...
-
-\\section{Experiments}
-% Present your experiments...
-
-\\section{Conclusion}
-% Conclude your work...
-
-\\bibliographystyle{plain}
-\\bibliography{references}
-
-\\end{document}`
-      await writeFile(join(projectDir, 'main.tex'), template, 'utf-8')
-      return { ok: true, projectDir }
-    } catch (error) {
-      return { ok: false, message: error instanceof Error ? error.message : '创建项目失败' }
-    }
-  })
-
-  // ─── 文献库（Library）────────────────────────────────────────────
-  ipcMain.handle('library:listPapers', async () => {
-    try {
-      return { ok: true, papers: library.listPapers() }
-    } catch (error) {
-      return { ok: false, message: error instanceof Error ? error.message : '读取文献库失败' }
-    }
-  })
-
-  ipcMain.handle('library:searchArxiv', async (_event, query: string, maxResults?: number, sortBy?: 'relevance' | 'submittedDate') => {
-    try {
-      const entries = await library.searchArxiv(query, maxResults, sortBy)
-      return { ok: true, entries }
-    } catch (error) {
-      return { ok: false, message: error instanceof Error ? error.message : 'arXiv 搜索失败' }
-    }
-  })
-
-  ipcMain.handle('library:searchWeb', async (_event, query: string, maxResults?: number) => {
-    try {
-      const entries = await library.searchWeb(query, maxResults)
-      return { ok: true, entries }
-    } catch (error) {
-      return { ok: false, message: error instanceof Error ? error.message : 'Web 搜索失败' }
-    }
-  })
-
-  ipcMain.handle('library:importPaper', async (_event, entry: unknown, projectId?: string) => {
-    try {
-      const result = await library.importPaper(entry as Parameters<typeof library.importPaper>[0], projectId)
-      return { ok: true, ...result }
-    } catch (error) {
-      return { ok: false, message: error instanceof Error ? error.message : '导入论文失败' }
-    }
-  })
-
-  ipcMain.handle('library:removePaper', async (_event, arxivId: string) => {
-    try {
-      await library.removePaper(arxivId)
-      return { ok: true }
-    } catch (error) {
-      return { ok: false, message: error instanceof Error ? error.message : '删除论文失败' }
-    }
-  })
-
-  ipcMain.handle('library:updatePaper', async (_event, request: unknown) => {
-    try {
-      const paper = await library.updatePaper(request as Parameters<typeof library.updatePaper>[0])
-      return { ok: true, paper }
-    } catch (error) {
-      return { ok: false, message: error instanceof Error ? error.message : '更新论文失败' }
-    }
-  })
-
-  ipcMain.handle('library:fetchPaperPdf', async (_event, arxivId: string) => {
-    try {
-      const paper = await library.fetchPaperPdf(arxivId)
-      return { ok: true, paper }
-    } catch (error) {
-      return { ok: false, message: error instanceof Error ? error.message : 'PDF 下载失败' }
-    }
-  })
-
-  // 项目
-  ipcMain.handle('library:listProjects', async () => {
-    try {
-      return { ok: true, projects: library.listProjects() }
-    } catch (error) {
-      return { ok: false, message: error instanceof Error ? error.message : '读取项目失败' }
-    }
-  })
-
-  ipcMain.handle('library:createProject', async (_event, title: string, paperDir?: string) => {
-    try {
-      const project = library.createProject(title, paperDir)
-      return { ok: true, project }
-    } catch (error) {
-      return { ok: false, message: error instanceof Error ? error.message : '创建项目失败' }
-    }
-  })
-
-  ipcMain.handle('library:updateProject', async (_event, id: string, patch: unknown) => {
-    try {
-      const project = library.updateProject(id, patch as Parameters<typeof library.updateProject>[1])
-      return { ok: true, project }
-    } catch (error) {
-      return { ok: false, message: error instanceof Error ? error.message : '更新项目失败' }
-    }
-  })
-
-  ipcMain.handle('library:deleteProject', async (_event, id: string) => {
-    try {
-      await library.deleteProject(id)
-      return { ok: true }
-    } catch (error) {
-      return { ok: false, message: error instanceof Error ? error.message : '删除项目失败' }
-    }
-  })
-
-  // BibTeX 导出
-  ipcMain.handle('library:importPapersToBib', async (_event, projectId: string, arxivIds: string[]) => {
-    try {
-      const result = await library.importPapersToBib(projectId, arxivIds)
-      return { ok: true, ...result }
-    } catch (error) {
-      return { ok: false, message: error instanceof Error ? error.message : 'BibTeX 导出失败' }
-    }
-  })
-
-  // arXiv 订阅
-  ipcMain.handle('library:listSubscriptions', async () => {
-    try {
-      const subscriptions = await library.listArxivSubscriptions()
-      return { ok: true, subscriptions }
-    } catch (error) {
-      return { ok: false, message: error instanceof Error ? error.message : '读取订阅失败' }
-    }
-  })
-
-  ipcMain.handle('library:saveSubscription', async (_event, query: string) => {
-    try {
-      const subscription = await library.saveArxivSubscription(query)
-      return { ok: true, subscription }
-    } catch (error) {
-      return { ok: false, message: error instanceof Error ? error.message : '保存订阅失败' }
-    }
-  })
-
-  ipcMain.handle('library:deleteSubscription', async (_event, id: string) => {
-    try {
-      await library.deleteArxivSubscription(id)
-      return { ok: true }
-    } catch (error) {
-      return { ok: false, message: error instanceof Error ? error.message : '删除订阅失败' }
-    }
-  })
-
-  ipcMain.handle('library:checkSubscriptions', async (_event, id?: string) => {
-    try {
-      const outcomes = await library.checkArxivSubscriptions(id)
-      return { ok: true, outcomes }
-    } catch (error) {
-      return { ok: false, message: error instanceof Error ? error.message : '检查订阅失败' }
-    }
-  })
-
-  // Zotero
-  ipcMain.handle('library:checkZotero', async () => {
-    try {
-      return { ok: true, ...library.checkZotero() }
-    } catch (error) {
-      return { ok: false, message: error instanceof Error ? error.message : 'Zotero 检查失败' }
-    }
-  })
-
-  ipcMain.handle('library:listZoteroCollections', async () => {
-    try {
-      const collections = await library.listZoteroCollections()
-      return { ok: true, collections }
-    } catch (error) {
-      return { ok: false, message: error instanceof Error ? error.message : '读取 Zotero 集合失败' }
-    }
-  })
-
-  ipcMain.handle('library:searchZotero', async (_event, query: string) => {
-    try {
-      const items = await library.searchZotero(query)
-      return { ok: true, items }
-    } catch (error) {
-      return { ok: false, message: error instanceof Error ? error.message : 'Zotero 搜索失败' }
-    }
-  })
-
-  ipcMain.handle('library:exportZoteroCollectionToBib', async (_event, projectId: string, collectionKey: string) => {
-    try {
-      const result = await library.exportZoteroCollectionToBib(projectId, collectionKey)
-      return { ok: true, ...result }
-    } catch (error) {
-      return { ok: false, message: error instanceof Error ? error.message : 'Zotero 导出失败' }
-    }
-  })
-
-  // AI 相关性评分：让 Agent 用 set_paper 工具写入评分
-  ipcMain.handle(
-    'library:scoreRelevance',
-    async (_event, paper: unknown, projectId: string, projectTitle: string) => {
-      try {
-        if (!agentService.isInitialized()) {
-          return { ok: false, message: '请先在设置中配置 API Key 和模型' }
-        }
-        const p = paper as { arxivId: string; title: string; authors: string[]; summary: string }
-        const prompt = `请评估以下论文与项目「${projectTitle}」的相关性，并调用 set_paper 工具写入评分（0-10 分）和理由。
-
-论文标题: ${p.title}
-作者: ${p.authors.join(', ')}
-摘要: ${p.summary}
-
-项目主题: ${projectTitle}
-
-评分标准：
-- 9-10: 直接相关，是项目核心工作
-- 7-8: 高度相关，方法/结论直接可用
-- 4-6: 部分相关，背景或方法有参考价值
-- 1-3: 弱相关，仅一般背景
-- 0: 无关
-
-调用 set_paper 工具，参数：
-- arxivId: ${p.arxivId}
-- projectId: ${projectId}
-- relevanceScore: 0-10 的整数
-- relevanceReason: 一句话简要理由`
-        const response = await agentService.sendMessage(prompt, `score-${p.arxivId}-${projectId}`)
-        // 启发式校验：Agent 响应过短（<10 字）或不包含评分关键词时，标记为可能未实际写入
-        const isSuspicious = response.length < 10 || !/\d/.test(response)
-        return {
-          ok: true,
-          message: isSuspicious
-            ? `[警告] Agent 响应可能未包含评分，请手动检查项目「${projectTitle}」中 arxiv:${p.arxivId} 的评分。\n${response}`
-            : response,
-        }
-      } catch (error) {
-        return { ok: false, message: error instanceof Error ? error.message : 'AI 评分失败' }
-      }
-    }
-  )
-
-  // ─── 组会演示文稿（Meetings）────────────────────────────────────
-  ipcMain.handle('meetings:generate', async (_event, request: GenerateDeckRequest) => {
-    try {
-      const deck = await generateMeetingDeck(request)
-      // 自动沉淀：组会演示文稿生成成功
-      appendLedger({
-        title: `生成组会演示文稿：${deck.title ?? deck.file}`,
-        content: `文件：${deck.file}`,
-        type: 'milestone',
-        auto: { source: 'meeting-deck', refKey: deck.file }
-      })
-      return { ok: true, deck }
-    } catch (error) {
-      return { ok: false, message: error instanceof Error ? error.message : '生成演示文稿失败' }
-    }
-  })
-
-  ipcMain.handle('meetings:list', async () => {
-    try {
-      const decks = await listMeetingDecks()
-      return { ok: true, decks }
-    } catch (error) {
-      return { ok: false, message: error instanceof Error ? error.message : '读取演示文稿失败' }
-    }
-  })
-
-  ipcMain.handle('meetings:delete', async (_event, file: string) => {
-    try {
-      await deleteMeetingDeck(file)
-      return { ok: true }
-    } catch (error) {
-      return { ok: false, message: error instanceof Error ? error.message : '删除失败' }
-    }
-  })
-
-  ipcMain.handle('meetings:reveal', async (_event, file: string) => {
-    const path = meetingDeckPath(file)
-    if (path === null) return { ok: false, message: '非法文件名' }
-    shell.showItemInFolder(path)
-    return { ok: true }
-  })
-
-  ipcMain.handle('meetings:config', async () => {
-    const active = activeMeetingModel()
-    return { ok: true, available: active !== null, modelName: active?.name }
-  })
-
-  // ─── 图表管理（Figures）──────────────────────────────────────────
-  ipcMain.handle('figures:list', async () => {
-    try {
-      const figures = await listFigures()
-      return { ok: true, figures }
-    } catch (error) {
-      return { ok: false, message: error instanceof Error ? error.message : '读取图片失败' }
-    }
-  })
-
-  ipcMain.handle('figures:add', async (_event, name: string, dataUrl: string) => {
-    try {
-      const figure = await importFigure(name, dataUrl)
-      // 自动沉淀：图片入库（按 fileName 幂等）
-      appendLedger({
-        title: `图表入库：${figure.name}`,
-        content: `文件：${figure.fileName}`,
-        type: 'progress',
-        auto: { source: 'figure-import', refKey: figure.fileName }
-      })
-      return { ok: true, figure }
-    } catch (error) {
-      return { ok: false, message: error instanceof Error ? error.message : '保存图片失败' }
-    }
-  })
-
-  ipcMain.handle('figures:remove', async (_event, fileName: string) => {
-    try {
-      await removeFigure(fileName)
-      return { ok: true }
-    } catch (error) {
-      return { ok: false, message: error instanceof Error ? error.message : '删除图片失败' }
-    }
-  })
-
-  ipcMain.handle(
-    'figures:renamePreview',
-    async (_event, oldFile: string, newName: string, projectDirs: string[]) => {
-      try {
-        const plan = await previewFigureRename(oldFile, newName, projectDirs)
-        return { ok: true, ...plan }
-      } catch (error) {
-        return { ok: false, message: error instanceof Error ? error.message : '预览失败' }
-      }
-    }
-  )
-
-  ipcMain.handle(
-    'figures:renameApply',
-    async (_event, oldFile: string, newName: string, projectDirs: string[]) => {
-      try {
-        const result = await applyFigureRename(oldFile, newName, projectDirs)
-        return { ok: true, ...result }
-      } catch (error) {
-        return { ok: false, message: error instanceof Error ? error.message : '改名失败' }
-      }
-    }
-  )
-
-  // ─── 科研空间（Workspaces）─────────────────────────────────────────
-  ipcMain.handle('workspaces:list', async () => {
-    try {
-      const workspaces = listWorkspaces()
-      const activeId = getActiveWorkspace()?.id ?? null
-      const defaultId = getDefaultWorkspace()?.id ?? null
-      return { ok: true, workspaces, activeId, defaultId }
-    } catch (error) {
-      return { ok: false, message: error instanceof Error ? error.message : '读取科研空间失败' }
-    }
-  })
-
-  ipcMain.handle('workspaces:current', async () => {
-    try {
-      const active = getActiveWorkspace()
-      return { ok: true, active: active === null ? null : { ...active } }
-    } catch (error) {
-      return { ok: false, message: error instanceof Error ? error.message : '读取当前空间失败' }
-    }
-  })
-
-  ipcMain.handle('workspaces:create', async (_event, name: string, dir?: string) => {
-    try {
-      const workspace = createWorkspace(name, dir)
-      return { ok: true, workspace: { ...workspace } }
-    } catch (error) {
-      return { ok: false, message: error instanceof Error ? error.message : '创建科研空间失败' }
-    }
-  })
-
-  ipcMain.handle('workspaces:rename', async (_event, id: string, name: string) => {
-    try {
-      const workspace = renameWorkspace(id, name)
-      return { ok: true, workspace: { ...workspace } }
-    } catch (error) {
-      return { ok: false, message: error instanceof Error ? error.message : '重命名失败' }
-    }
-  })
-
-  ipcMain.handle('workspaces:remove', async (_event, id: string) => {
-    try {
-      removeWorkspace(id)
-      return { ok: true }
-    } catch (error) {
-      return { ok: false, message: error instanceof Error ? error.message : '移除科研空间失败' }
-    }
-  })
-
-  ipcMain.handle('workspaces:switch', async (_event, id: string) => {
-    try {
-      const workspace = switchWorkspace(id)
-      return { ok: true, workspace: { ...workspace } }
-    } catch (error) {
-      return { ok: false, message: error instanceof Error ? error.message : '切换科研空间失败' }
-    }
-  })
-
-  ipcMain.handle('workspaces:setDefault', async (_event, id: string) => {
-    try {
-      setDefaultWorkspace(id)
-      return { ok: true }
-    } catch (error) {
-      return { ok: false, message: error instanceof Error ? error.message : '设置默认空间失败' }
-    }
-  })
-
-  // ─── 会议截稿（Venues）───────────────────────────────────────────
-  ipcMain.handle('venues:list', async () => {
-    try {
-      const payload = await listVenueDeadlines()
-      return { ok: true, ...payload }
-    } catch (error) {
-      return { ok: false, message: error instanceof Error ? error.message : '读取截稿目录失败' }
-    }
-  })
-
-  ipcMain.handle('venues:refresh', async () => {
-    try {
-      const fetchedAt = await refreshVenueDeadlines()
-      return { ok: true, fetchedAt }
-    } catch (error) {
-      return { ok: false, message: error instanceof Error ? error.message : '刷新失败（旧缓存已保留）' }
-    }
-  })
-
-  ipcMain.handle('venues:setWatch', async (_event, seriesKey: string, watched: boolean) => {
-    try {
-      setVenueWatch(seriesKey, watched)
-      return { ok: true }
-    } catch (error) {
-      return { ok: false, message: error instanceof Error ? error.message : '更新关注失败' }
-    }
-  })
-
-  // ─── 论文快照（Paper Snapshots）───────────────────────────────────
-  ipcMain.handle('snapshots:capture', async (_event, projectDir: string) => {
-    try {
-      const result = await capturePaperSnapshot(projectDir)
-      return { ok: true, ...result }
-    } catch (error) {
-      return { ok: false, message: error instanceof Error ? error.message : '快照失败' }
-    }
-  })
-
-  ipcMain.handle('snapshots:list', async (_event, projectDir: string) => {
-    try {
-      const snapshots = await listPaperSnapshots(projectDir)
-      return { ok: true, snapshots }
-    } catch (error) {
-      return { ok: false, message: error instanceof Error ? error.message : '读取快照失败' }
-    }
-  })
-
-  ipcMain.handle('snapshots:read', async (_event, projectDir: string, id: string, rel: string) => {
-    try {
-      const content = await readSnapshotFile(projectDir, id, rel)
-      return { ok: true, content }
-    } catch (error) {
-      return { ok: false, message: error instanceof Error ? error.message : '读取快照文件失败' }
-    }
-  })
-
-  ipcMain.handle('snapshots:revert', async (_event, projectDir: string, id: string) => {
-    try {
-      const result = await revertPaperSnapshot(projectDir, id)
-      return { ok: true, ...result }
-    } catch (error) {
-      return { ok: false, message: error instanceof Error ? error.message : '回退失败' }
-    }
-  })
-
-  ipcMain.handle('snapshots:remove', async (_event, projectDir: string, id: string) => {
-    try {
-      await deletePaperSnapshot(projectDir, id)
-      return { ok: true }
-    } catch (error) {
-      return { ok: false, message: error instanceof Error ? error.message : '删除快照失败' }
-    }
-  })
-
-  ipcMain.handle(
-    'paper:aiFix',
-    async (_event, request: { projectDir: string; fileName: string; line: number; message: string }) => {
-      try {
-        const result = await aiFixIssue(request)
-        return { ok: true, ...result }
-      } catch (error) {
-        return { ok: false, message: error instanceof Error ? error.message : 'AI 修复失败' }
-      }
-    }
-  )
-
-  ipcMain.handle('paper:bibRead', async (_event, projectDir: string) => {
-    try {
-      const result = await readPaperBib(projectDir)
-      return { ok: true, entries: result.entries, path: result.path }
-    } catch (error) {
-      return { ok: false, message: error instanceof Error ? error.message : '读取参考文献失败' }
-    }
-  })
-
-  ipcMain.handle('paper:bibWrite', async (_event, projectDir: string, entries: unknown) => {
-    try {
-      await writePaperBib(projectDir, entries as Parameters<typeof writePaperBib>[1])
-      return { ok: true }
-    } catch (error) {
-      return { ok: false, message: error instanceof Error ? error.message : '保存参考文献失败' }
-    }
-  })
-
-  ipcMain.handle('paper:venueTemplates', async () => {
-    try {
-      return { ok: true, templates: VENUE_TEMPLATES }
-    } catch (error) {
-      return { ok: false, message: error instanceof Error ? error.message : '读取会议模板失败' }
-    }
-  })
-
-  ipcMain.handle('paper:applyVenueTemplate', async (_event, projectDir: string, templateId: string) => {
-    try {
-      const path = await applyVenueTemplate(projectDir, templateId)
-      return { ok: true, path }
-    } catch (error) {
-      return { ok: false, message: error instanceof Error ? error.message : '应用会议模板失败' }
-    }
-  })
+  ptyInstances.clear()
+  pickedPaths.clear()
 }

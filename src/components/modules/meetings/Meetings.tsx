@@ -39,7 +39,7 @@ import {
   type MeetingDeckView,
   type PaperRecord,
   type ProjectRecord
-} from './meetingsTypes'
+} from './types'
 
 /** 一份 deck 的论文数量上限（服务端同样限制）。 */
 const DECK_PAPER_CAP = 12

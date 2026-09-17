@@ -325,6 +325,38 @@ export function cancelRun(run: AgentRun): AgentRun {
   }
 }
 
+/**
+ * 这一轮是否仍在进行（决定时间线是否显示「执行中」转圈 / 底部活动行）。
+ *
+ * @param run 该消息的运行记录，`run.status` 是**权威**终态（由主进程 main task 事件驱动，
+ *            见 applyRunEvent）
+ * @param isStreaming 渲染层的会话级流标记，仅作**兜底**
+ *
+ * 为什么改成「run.status 优先」而不是原先的 `run.status === 'running' || isStreaming`
+ * （真实事故）：`isStreaming` 以前是**会话级**信号（`streamingConvIds`），它的清理由
+ * handleSend 的 finally 负责；而 finally 的清理曾带纪元守卫，被新流顶掉的旧回复永远
+ * 不关灯 → 这个 true 会一直传进来，把**已经 done 的 run** 硬撑成运行中。界面表现就是
+ * 用户报的「回复完了还在一直显示思考中」（`activityOf` 的兜底文案正是「正在思考…」），
+ * 且输入区被永久禁用。
+ *
+ * 契约：`run.status` 一旦离开 'running' 就是终态，任何外部标记都不得把它复活——
+ * 终态是「这轮已经结束」的一手事实，而会话级标记只是辅助显示信号。
+ */
+export function isRunActive(run: AgentRun, _isStreaming?: boolean): boolean {
+  // 以 run.status 为唯一判据。
+  //
+  // 为什么不再与 isStreaming 取并集（这正是修掉的 bug）：旧实现是
+  // `run.status === 'running' || isStreaming === true`，那个 `||` 让一个**已经结束**的 run
+  // 只要外部标记残留为 true 就继续显示「执行中」。而外部标记（会话级 streamingConvIds）
+  // 的清理曾被纪元守卫挡掉 → 残留 → 界面永久停在「正在思考…」。
+  //
+  // 注意：`isStreaming` 在这个判据里**并非必需**——run.status 保持 'running' 已覆盖
+  // 「刚发出、还没收到终态」的那段（createRun 初值即 'running'，见上）。参数保留是为了
+  // 调用点签名稳定，以及将来若引入「正文已结束但仍在收尾」之类的新状态时有落点。
+  void _isStreaming
+  return run.status === 'running'
+}
+
 /** 时间线收据（标题行摘要 + 折叠时的信息量）。 */
 export interface RunReceipt {
   /** 工具调用次数（含出错）。 */

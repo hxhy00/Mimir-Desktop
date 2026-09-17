@@ -34,6 +34,7 @@
  */
 import { getStoreValue } from '../library/store'
 import {
+  SUBAGENT_DEPTH,
   assertNoDelegationTools,
   guardSubagentTools,
   type GuardedTool
@@ -44,7 +45,8 @@ import { wikiNoteTool } from './tools/wikiNote'
 import { paperFetchTool, setPaperTool } from './tools/paperTools'
 import { venueSearchTool } from './tools/venue'
 import { experimentTool } from './tools/experiments'
-import { serverStatusTool } from './tools/servers'
+import { projectTool } from './tools/projects'
+import { serverTool, serverStatusTool } from './tools/servers'
 import { latexCompileTool } from './tools/latex'
 import { meetingDeckTool } from './tools/meetings'
 import { ledgerTool } from './tools/ledger'
@@ -86,10 +88,12 @@ export const WORKER_TOOL_CATALOG: WorkerToolMeta[] = [
   { id: 'wiki_search', label: 'Wiki 检索', description: '检索研究笔记片段' },
   { id: 'wiki_note', label: 'Wiki 笔记', description: '创建/追加研究笔记（写操作）' },
   { id: 'read_dir', label: '目录列表', description: '只读列出本地目录内的文件与文件夹（空间外需批准）' },
+  { id: 'project', label: '研究项目', description: '研究项目列出/新建/改标题与论文目录/删除（写操作需批准，删除会级联清理论文关联）' },
   { id: 'experiment', label: '实验记录', description: '实验模块记录/指标/进度操作（写操作需批准）' },
   { id: 'ledger', label: '成长记录', description: '成长/里程碑时间线操作（写操作需批准）' },
   { id: 'meeting_deck', label: '组会 PPT 生成', description: '从论文/实验生成汇报 .pptx（落盘，需批准）' },
-  { id: 'server_status', label: 'GPU 服务器状态', description: '只读查询已注册 GPU 服务器连通性与实时状态' }
+  { id: 'server_status', label: 'GPU 服务器状态', description: '只读查询已注册 GPU 服务器连通性与实时状态' },
+  { id: 'server', label: 'GPU 服务器管理', description: 'GPU 服务器注册表的增删改查（写操作需批准；不接受也不回显密码）' }
 ]
 
 const TOOL_BY_ID: Record<string, unknown> = {
@@ -105,9 +109,11 @@ const TOOL_BY_ID: Record<string, unknown> = {
   wiki_search: wikiSearchTool,
   wiki_note: wikiNoteTool,
   experiment: experimentTool,
+  project: projectTool,
   ledger: ledgerTool,
   meeting_deck: meetingDeckTool,
   server_status: serverStatusTool,
+  server: serverTool,
   read_dir: readDirTool
 }
 
@@ -277,11 +283,13 @@ export const BUILTIN_DOMAINS: CapabilityDomain[] = [
     label: '实验与归档',
     role: '实验管理员',
     description:
-      '操作实验模块（记录/指标/进度）、成长记录（里程碑/论文/实验时间线）、论文归档入库与元数据更新；对「数据管住了没有」负责',
-    guidance: `- **实验与归档**（实验管理员）：用 experiment 操作实验模块（list/create/update/delete），用 ledger 操作成长记录（list/create/delete）；
+      '维护研究项目、操作实验模块（记录/指标/进度）、成长记录（里程碑/论文/实验时间线）、论文归档入库与元数据更新；对「数据管住了没有」负责',
+    guidance: `- **实验与归档**（实验管理员）：用 project 管理研究项目（list/get/create/update/delete），用 experiment 操作实验模块（list/create/update/delete），用 ledger 操作成长记录（list/create/delete）；
   用 paper_fetch 把论文归档进文献库（可关联项目），用 set_paper 更新已有论文的标签/笔记/AI 相关性评分。
-  纪律：先查询再修改；涉及新增/修改/删除等副作用时先向用户说明将要执行的内容并等待批准。`,
-    toolIds: ['experiment', 'ledger', 'paper_fetch', 'set_paper'],
+  纪律：先查询再修改；涉及新增/修改/删除等副作用时先向用户说明将要执行的内容并等待批准。
+  项目纪律：系统**没有「当前项目」概念**——需要项目上下文时先 project(action="list") 看清现状，
+  指代不明（如「那个项目」）时列出候选并请用户确认 projectId，不要凭标题猜；删除项目会级联清理论文关联，务必先说明影响面。`,
+    toolIds: ['project', 'experiment', 'ledger', 'paper_fetch', 'set_paper'],
     rolePrompt: `# 你的身份
 
 你是「**实验管理员**」。你对一个结果负责：**数据管住了没有** —— 记录准、能追溯、不重复、不漏。
@@ -289,6 +297,7 @@ export const BUILTIN_DOMAINS: CapabilityDomain[] = [
 
 # 你精通什么
 
+- 用 project 管理研究项目（列出 / 读详情 / 新建 / 改标题与论文目录 / 删除）；
 - 用 experiment 操作实验模块（记录 / 指标 / 进度）；
 - 用 ledger 操作成长记录（里程碑 / 论文 / 实验时间线）；
 - 用 paper_fetch 把论文归档进文献库（可关联项目），用 set_paper 更新已有论文的标签 / 笔记 / AI 相关性评分。
@@ -296,8 +305,11 @@ export const BUILTIN_DOMAINS: CapabilityDomain[] = [
 # 工作准则
 
 - **先查询再修改**：动手前先 list 看清现状，避免把「更新」做成「新建」。
+- **没有「当前项目」这回事**：系统不保存当前项目状态。需要项目上下文时先 project(action="list")，
+  任务里说「那个项目」而候选不止一个时，列出候选请用户确认 id —— 绝不凭标题猜一个 id 去改。
 - **指涉既有对象必走 update**：任务里说「那个实验」「之前那条」「这篇论文」时，走 update / set_paper，
   不要 create 出重复条目。归档一篇**已在文献库**的论文，用 set_paper 而不是再 paper_fetch 一次。
+- **删除先说影响面**：删除项目会同时把该项目从所有论文的关联中移除。
 - **变更说得清**：交付时逐条说明对象 id / 名称 / 改了哪些字段，主 Agent 据此才能向你追问或纠偏。
 - 入库要带来源：paper_fetch 归档时把 arXiv id 一并落实，不要凭标题猜。
 
@@ -356,22 +368,39 @@ export const BUILTIN_DOMAINS: CapabilityDomain[] = [
     label: '服务器',
     role: '运维工程师',
     description:
-      '查询已注册 GPU 服务器：连通性 + SSH nvidia-smi 实时 GPU/显存状态（只读）；对「机器现在什么状态」负责',
-    guidance: `- **服务器**（运维工程师）：用 server_status 只读查询已注册 GPU 服务器（连通性 + SSH nvidia-smi 实时状态）。
-  纪律：只做只读查询与状态解读，不执行任何远程改动。`,
-    toolIds: ['server_status'],
+      '管理并查询 GPU 服务器：注册表增删改查（server）+ 连通性与 SSH nvidia-smi 实时状态（server_status）；对「有哪些机器、机器现在什么状态」负责',
+    guidance: `- **服务器**（运维工程师）：用 server 管理注册表（list/get/create/update/delete），用 server_status 只读查询连通性与 SSH nvidia-smi 实时状态。
+  纪律：① 只做本机注册表的增删改，**不执行任何远程改动**（重启进程、清显存、改配置一律不做）；
+  ② 凭据纪律：本工具**不接受也不回显密码**，需要密码登录的机器请让用户在「GPU 服务器」界面填写；
+  ③ 删除需批准，先 list 拿到准确 serverId 再操作，不要凭记忆猜 id；
+  ④ **只问必需项，其余自己拍板**：create 的**必填只有 host**。用户已给出 host（含可选的 user/port）时就该直接建，
+  name 缺省自动用「user@host」（如「root@119.3.210.1」）并在结果里说明「显示名我按 user@host 填的，要改告诉我」；
+  keyPath/gpuCount/gpuModel/notes 拿不准就留空，**绝不为此停下分轮追问**。
+  用户说的是「我本地 ssh 文件夹」这类可查证线索时，先用 read_dir 列出（支持 ~ 写法）看清有哪些密钥，再决定填哪个。
+  ⑤ **指定的密钥不存在时，仍要先把服务器建上**（这是「不追问」最容易被违反的一处）：
+  用户说「用 id_rsa」而目录里只有 id_ed25519 这类**指令与事实冲突**的情况，
+  **不要停下等用户拍板**——先按住建，keyPath 取目录里实际存在的那个（若只有一个私钥则用它），
+  若一个都没有就**留空 keyPath**；两条路都在回复里说明「你要的 X 没找到，我按 Y 填的 / 暂时留空，你确认下」。
+  原则：**注册表先有记录**，密钥这种可事后用 update 一条修好的字段，不构成阻塞创建的理由。`,
+    toolIds: ['server', 'server_status'],
     rolePrompt: `# 你的身份
 
-你是「**运维工程师**」。你对一个结果负责：**机器现在到底什么状态**。
+你是「**运维工程师**」。你对两个结果负责：**有哪些机器**、**机器现在到底什么状态**。
 你的职业习惯是逐台看、如实报 —— 连不上就说连不上，绝不把「没查到」粉饰成「空闲」。
 
 # 你精通什么
 
+- 用 server 管理注册表：list / get 查看，create 新增，update 修改，delete 删除；
 - 用 server_status 只读查询已注册 GPU 服务器的连通性与实时状态（SSH + nvidia-smi 的 GPU / 显存占用）。
 
 # 工作准则
 
-- **严格只读**：不执行任何远程改动。你可以解读状态、指出风险，但不越界去改。
+- **改注册表可以，改远端不行**：你只维护本机的服务器清单；不执行任何远程改动。
+- **凭据纪律**：server 工具**不接受也不回显密码**。用户让你「加一台要密码的机器」时，
+  先用 create 建好连接配置，再明确告诉用户「密码请到「GPU 服务器」界面补充」——
+  不要试图让用户把密码发给你。
+- **先 list 再动手**：删除/更新前先用 list 拿到准确的 serverId，不要凭记忆猜 id。
+- 删除需用户批准；说明清楚「只删本机注册记录，不动远端机器」。
 - **逐台如实**：逐台汇报连通性与关键指标。查询失败的机器明确标注为「未取到」，
   并说明可能原因（不通 / 认证失败 / 超时），不要合并成一句「都正常」。
 - 指标要给原始值（GPU 利用率、显存占用 / 总量），不要只给「忙 / 不忙」的模糊结论。
@@ -380,6 +409,7 @@ export const BUILTIN_DOMAINS: CapabilityDomain[] = [
 
 - 不做任何远程写操作（重启进程、清显存、改配置）—— 即使看起来能解决问题，也只提出建议交回主 Agent。
 - 不把拿不到数据当成正常状态。
+- 不索要、不传递密码等凭据。
 
 # 交付格式
 
@@ -396,7 +426,8 @@ export const BUILTIN_DOMAINS: CapabilityDomain[] = [
     guidance: `- **文件整理**（科研助理）：在用户明确给出路径时，把本机磁盘文件纳入处理上下文，或把产出落成文档。
   用 read_dir 列目录先探清结构，用 read_file 读文本文件（.md/.txt/.tex/.py/.json 等），用 write_file 把 Markdown/文本写入用户指定的完整路径
   （read_file/edit_file/write_file/ls/glob/grep/delete 由系统内置文件工具提供，已在 backend 层接入批准卡）。
-  纪律（重要）：绝不臆造或猜测路径——每个路径都必须来自用户明确给出或刚才 read_dir/read_file 的真实返回，拿不准时先向用户确认完整绝对路径；
+  纪律（重要）：绝不臆造或猜测路径——路径必须来自用户明确给出、或刚才 read_dir/read_file 的真实返回；
+  但「用户给的是目录名/相对说法（如『我本地 ssh 文件夹』『~/.ssh』）」不属于臆造：read_dir 支持 ~ 写法且只需目录名即可列出，**先去列一下**（列完拿到的真实条目就是可靠路径来源），不要反过来要求用户改写成绝对路径；
   读取科研空间外的路径会弹批准卡，写入一律弹批准卡，用户拒绝就如实说明并停下；只处理文本/文档，二进制与超大文件不读入。`,
     toolIds: ['read_dir'],
     rolePrompt: `# 你的身份
@@ -629,24 +660,40 @@ export function buildSubagentPrompt(d: DomainRuntime): string {
  *
  * 工具口径（A2）：子代理持有**本域白名单**工具（`d.tools`），而非继承全部工具。
  * 主 Agent 拿全量、子代理拿专域 —— 决策权在主 Agent，专注度在子代理。
+ *
+ * 安全口径（Fail-Closed）：每个子代理在**出场前**必须完整走一遍 {@link assertNoDelegationTools}
+ * ——包括那些「连名字都拿不到、无法核验」的工具：它们与命中的 `task` 一样算违规，
+ * 抛出并中止构建，而不是悄悄把一个可能递归委派的工具集交给 deepagents。
+ * 没有工具的域不再被静默丢弃（`filter` 无声吞掉），而是显式告警留在日志里。
  */
 export function buildDomainSubagents(domains: readonly DomainRuntime[]): DomainSubagentSpec[] {
-  return domains
-    .filter((d) => d.tools.length > 0)
-    .map((d) => {
-      // D1 防火墙（子代理 = depth 1）：域白名单里**不得**出现会再拉起 agent 的嵌套入口
-      // （如 `task`），否则会形成 主 → 子 → 孙… 的递归委派、拓扑与成本失控。
-      // 此前这里直接把 d.tools 交给 deepagents，防火墙只覆盖了主 Agent 的工具集，
-      // 构成「主 Agent 校验了、子代理却没校验」的单边防线。
-      const scoped = d.tools as { name?: string }[]
-      assertNoDelegationTools(`subagent:${d.id}`, scoped, { depth: 1 })
-      return {
-        name: d.id,
-        description: buildSubagentDescription(d),
-        systemPrompt: buildSubagentPrompt(d),
-        // 运行期兜底：即便构建期校验被绕过（工具运行期改名等），调用也会被拒绝。
-        tools: guardSubagentTools(`subagent:${d.id}`, d.tools as GuardedTool[], { depth: 1 }),
-        mode: 'isolated' as const
-      }
+  const specs: DomainSubagentSpec[] = []
+  for (const d of domains) {
+    if (d.tools.length === 0) {
+      // 此前是无声 filter：域被丢掉后主 Agent 的委派选项少一个「同事」，且没有任何提示。
+      console.warn(
+        `[capability-domains] 能力域「${d.id}」没有解析到任何可用工具，已跳过子代理注册` +
+          '（无工具的子代理无法交付，请检查该域的 toolIds 是否都在白名单内）。'
+      )
+      continue
+    }
+    // D1 防火墙（子代理 = depth 1）：域白名单里**不得**出现会再拉起 agent 的嵌套入口
+    // （如 `task`），否则会形成 主 → 子 → 孙… 的递归委派、拓扑与成本失控。
+    // 此前这里直接把 d.tools 交给 deepagents，防火墙只覆盖了主 Agent 的工具集，
+    // 构成「主 Agent 校验了、子代理却没校验」的单边防线。
+    const ownerId = `subagent:${d.id}`
+    assertNoDelegationTools(ownerId, d.tools as { name?: string }[], { depth: SUBAGENT_DEPTH })
+    // 运行期兜底：即便构建期校验被绕过（工具运行期改名等），调用也会被拒绝。
+    const guarded = guardSubagentTools(ownerId, d.tools as GuardedTool[], { depth: SUBAGENT_DEPTH })
+    // 出口复核：确保交出去的确实是上过闸的工具集，防止将来有人改回「直接塞 d.tools」。
+    assertNoDelegationTools(ownerId, guarded, { depth: SUBAGENT_DEPTH })
+    specs.push({
+      name: d.id,
+      description: buildSubagentDescription(d),
+      systemPrompt: buildSubagentPrompt(d),
+      tools: guarded,
+      mode: 'isolated' as const
     })
+  }
+  return specs
 }
