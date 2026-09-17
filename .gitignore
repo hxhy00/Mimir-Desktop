@@ -55,8 +55,8 @@ mimir-desktop/
 
 # TaskFlow：个人规则为本地工作规则，永不提交（TaskFlow 规定）
 # 任务文档（TaskFlowDocs/<task-id>/、todo.md、achieved/）与仓库级索引 index.md 均进 git
-TaskFlowDocs/repository-docs/*.md
-!TaskFlowDocs/repository-docs/index.md
+taskflow/
+TaskFlowDocs/
 
 # Local
 pnpm-workspace.yaml
